@@ -25,6 +25,20 @@ The CLI can now join the platform boundaries into a live desktop stream:
 cargo build --release
 ```
 
+## Releases
+
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `castscreen --version`. Releases use matching annotated Git tags: package version `0.1.0` is released as `v0.1.0`.
+
+After changing the package version and pushing its commit, run:
+
+```sh
+./scripts/release.sh
+```
+
+The helper requires a clean worktree, runs formatting, Clippy, and tests, then pushes the matching tag. GitHub Actions verifies that the tag and package version agree, builds separate Apple Silicon and Intel macOS archives, adds SHA-256 checksum files, and publishes them to the corresponding GitHub Release.
+
+The generated binaries are not Developer-ID signed or notarized. If macOS quarantines a downloaded archive, inspect the checksum first and then remove quarantine explicitly with `xattr -dr com.apple.quarantine <extracted-directory>`.
+
 ## Commands
 
 ```sh

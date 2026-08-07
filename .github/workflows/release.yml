@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package release archive and checksum
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive_root="castscreen-${version}-macos-${{ matrix.arch }}"
+          mkdir -p "package/$archive_root" dist
+          cp target/release/castscreen "package/$archive_root/"
+          cp README.md "package/$archive_root/"
+          tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
+          shasum -a 256 "dist/${archive_root}.tar.gz" > "dist/${archive_root}.tar.gz.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
