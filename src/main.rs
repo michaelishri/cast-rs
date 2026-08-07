@@ -2,8 +2,11 @@ mod capture;
 mod cast;
 mod discovery;
 mod live;
+mod media_server;
 mod mirror;
+mod network;
 mod synthetic;
+mod video;
 
 use std::{net::IpAddr, path::PathBuf, thread, time::Duration};
 
@@ -11,7 +14,10 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(version, about = "Cast a macOS desktop stream to Google Cast devices")]
+#[command(
+    version,
+    about = "Cast local video and a macOS desktop to Google Cast devices"
+)]
 struct Cli {
     /// Increase diagnostic output; use -vv for frame-level tracing.
     #[arg(short, long, action = ArgAction::Count, global = true)]
@@ -50,6 +56,26 @@ enum Command {
         /// Keep the sender connected for this many seconds to log asynchronous receiver status.
         #[arg(long, default_value_t = 0)]
         monitor_seconds: u64,
+    },
+    /// Play a compatible local video file on a Google Cast device.
+    CastVideo {
+        /// Local MP4 or WebM file to play.
+        file: PathBuf,
+        /// Chromecast IP address (shown by `caster devices`).
+        #[arg(long)]
+        host: IpAddr,
+        /// Cast control port.
+        #[arg(long, visible_alias = "port", default_value_t = 8009)]
+        cast_port: u16,
+        /// Local HTTP port; 0 asks macOS to select an available port.
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
+        /// Initial playback position in seconds.
+        #[arg(long, default_value_t = 0.0)]
+        start_at: f64,
+        /// Override automatic MP4/WebM MIME detection.
+        #[arg(long)]
+        content_type: Option<String>,
     },
     /// Capture and hardware-encode a short H.264/AVCC diagnostic sample.
     Capture {
@@ -223,6 +249,21 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_secs(monitor_seconds));
             }
         }
+        Command::CastVideo {
+            file,
+            host,
+            cast_port,
+            http_port,
+            start_at,
+            content_type,
+        } => video::cast_video(video::VideoOptions {
+            cast_host: host,
+            cast_port,
+            http_port,
+            file,
+            start_at,
+            content_type,
+        })?,
         Command::Capture {
             display,
             seconds,

@@ -1,13 +1,14 @@
 # caster
 
-An early, all-Rust macOS CLI for experimenting with desktop-to-Chromecast streaming.
+An early, all-Rust macOS CLI for casting local video and a desktop to Google Cast devices.
 
 End users should start with the bundled [Caster user guide](docs/USER_GUIDE.md). This README also documents the implementation and release process for contributors.
 
-The CLI can now join the platform boundaries into a live desktop stream:
+The CLI currently supports these Cast paths:
 
 - discover Cast devices with mDNS;
 - control Google Cast receivers with `rust-cast`;
+- serve compatible local MP4 and WebM files with seeking and bounded memory use;
 - capture a macOS display with ScreenCaptureKit and hardware-encode it with VideoToolbox;
 - send encrypted H.264 over Cast Streaming RTP with receiver feedback and retransmission;
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
@@ -29,7 +30,7 @@ cargo build --release
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.1.1` is released as `v0.1.1`.
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.2.0` is released as `v0.2.0`.
 
 After changing the package version and pushing its commit, run:
 
@@ -96,6 +97,17 @@ cargo run -- cast-desktop \
 # Prove capture + hardware H.264 encoding for ten seconds
 cargo run -- capture --display 1 --seconds 10 --output capture.avcc
 
+# Play a compatible local video file through the Default Media Receiver
+cargo run --release -- cast-video \
+  --host 192.168.1.50 \
+  ~/Movies/example.mp4
+
+# Begin local video playback at 90 seconds
+cargo run --release -- cast-video \
+  --host 192.168.1.50 \
+  --start-at 90 \
+  ~/Movies/example.mp4
+
 # Play an existing HLS live stream through the Cast Default Media Receiver
 cargo run -- cast-url \
   --host 192.168.1.50 \
@@ -105,6 +117,26 @@ cargo run -- cast-url \
 ```
 
 Run `cargo run -- --help` or add `--help` after a subcommand for every option.
+
+## How local video casting works
+
+`cast-video` opens one local file, selects the Mac's receiver-facing LAN address, and exposes only
+that already-open file at a fresh random URL. It launches Google's Default Media Receiver, loads the
+URL as buffered media, and keeps the local server alive until playback finishes or `Ctrl-C` is
+pressed. On `Ctrl-C`, it stops the media, closes the Cast channels, and terminates the Default Media
+Receiver application. The command does not report success merely because Cast accepted the load
+request: it waits until the receiver reports `PLAYING`.
+
+The local server implements full, open-ended, and suffix HTTP byte ranges, so the receiver can seek
+and can read MP4 metadata stored near the end of a large file. File data is read at explicit offsets
+in fixed-size chunks rather than loaded into memory. The listener binds only to the LAN interface
+used to reach the selected receiver and uses an automatic free port unless `--http-port` is set.
+
+Direct playback preserves the original video and audio without transcoding. Caster recognizes MP4
+and WebM containers, but actual codec, profile, resolution, frame-rate, audio, and HDR support varies
+by receiver model. H.264 with AAC in MP4 is the most broadly compatible starting point. Use
+`--content-type` only to experiment with another format that the receiver supports; Caster does not
+yet remux or transcode incompatible files.
 
 ## How live casting works
 
@@ -120,7 +152,11 @@ The mirroring capture callback never waits for VideoToolbox or the network. It p
 
 The media playlist advertises a short four-second live window for latency, while the HTTP server retains a longer back buffer so delayed receiver requests do not fail as segments roll out of the manifest.
 
-The current live stream is video-only. Desktop audio is not included yet. The low-latency transport is an early implementation of Google's documented Cast Streaming protocol and has so far been exercised against a Nest Hub-class receiver. Use `--transport hls` if another receiver rejects the mirroring offer.
+The current desktop stream is video-only. Desktop audio is not included yet; compatible audio
+already present in a file passed to `cast-video` is sent unchanged. The low-latency transport is an
+early implementation of Google's documented Cast Streaming protocol and has so far been exercised
+against a Nest Hub-class receiver. Use `--transport hls` if another receiver rejects the mirroring
+offer.
 
 ## Latency profiling
 
@@ -191,6 +227,8 @@ ScreenCaptureKit currently composites the cursor into each captured video frame.
 
 - Ensure the Mac and receiver are on the same LAN and client isolation is disabled.
 - Allow incoming connections if the macOS firewall prompts for `caster`.
+- For local files, start with an H.264/AAC MP4; direct playback does not transcode unsupported media.
+- If `cast-video` reports that the receiver never requested the file, check the firewall and guest/client-isolation settings.
 - Try a lower bitrate for congested Wi-Fi: `--bitrate 3000000`.
 - Use `--transport hls --serve-only` to test HLS packaging without contacting a receiver; for safety this mode binds only to loopback.
 - Port 8080 must be available for HLS, or select another one with `--http-port`.

@@ -163,6 +163,17 @@ where
         }
     }
 
+    /// Returns the oldest message buffered by a previous filtered receive without reading from the
+    /// underlying stream.
+    pub(crate) fn receive_buffered(&self) -> Option<CastMessage> {
+        let mut message_buffer = self.message_buffer.borrow_mut();
+        if message_buffer.is_empty() {
+            None
+        } else {
+            Some(message_buffer.remove(0))
+        }
+    }
+
     /// Waits for the next `CastMessage` for which `f` returns valid mapped value. Messages in which
     /// `f` is not interested are placed into internal message buffer and can be later retrieved
     /// with `receive`. This method always reads from the stream.
@@ -343,5 +354,44 @@ mod tests {
             .received_message(0)
             .expect("expected a message to have been received");
         assert_eq!(expected_message, tcp_message.message());
+    }
+
+    #[test]
+    fn returns_messages_buffered_by_a_filtered_receive_without_reading_again() {
+        let mut stream = MockTcpStream::new();
+        for payload in [r#"{"type":"PING"}"#, r#"{"type":"PONG"}"#] {
+            stream.add_message(cast_channel::CastMessage {
+                protocol_version: Some(EnumOrUnknown::new(ProtocolVersion::CASTV2_1_2)),
+                source_id: Some(DEFAULT_RECEIVER_ID.to_string()),
+                destination_id: Some(DEFAULT_SENDER_ID.to_string()),
+                namespace: Some(crate::channels::heartbeat::CHANNEL_NAMESPACE.to_string()),
+                payload_type: Some(EnumOrUnknown::new(PayloadType::STRING)),
+                payload_utf8: Some(payload.to_string()),
+                payload_binary: None,
+                continued: None,
+                remaining_length: None,
+                special_fields: Default::default(),
+            });
+        }
+        let message_manager = MessageManager::new(stream);
+        let pong = message_manager
+            .receive_find_map(|message| match &message.payload {
+                CastMessagePayload::String(payload) if payload.contains("PONG") => {
+                    Ok(Some(message.clone()))
+                }
+                _ => Ok(None),
+            })
+            .unwrap();
+        assert!(matches!(
+            pong.payload,
+            CastMessagePayload::String(payload) if payload.contains("PONG")
+        ));
+
+        let buffered = message_manager.receive_buffered().unwrap();
+        assert!(matches!(
+            buffered.payload,
+            CastMessagePayload::String(payload) if payload.contains("PING")
+        ));
+        assert!(message_manager.receive_buffered().is_none());
     }
 }
