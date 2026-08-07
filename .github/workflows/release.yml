@@ -44,9 +44,13 @@ jobs:
           archive_root="caster-${version}-macos-${{ matrix.arch }}"
           mkdir -p "package/$archive_root" dist
           cp target/release/caster "package/$archive_root/"
+          cp docs/USER_GUIDE.md "package/$archive_root/"
           cp README.md "package/$archive_root/"
           tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
-          shasum -a 256 "dist/${archive_root}.tar.gz" > "dist/${archive_root}.tar.gz.sha256"
+          (
+            cd dist
+            shasum -a 256 "${archive_root}.tar.gz" > "${archive_root}.tar.gz.sha256"
+          )
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7

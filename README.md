@@ -2,6 +2,8 @@
 
 An early, all-Rust macOS CLI for experimenting with desktop-to-Chromecast streaming.
 
+End users should start with the bundled [Caster user guide](docs/USER_GUIDE.md). This README also documents the implementation and release process for contributors.
+
 The CLI can now join the platform boundaries into a live desktop stream:
 
 - discover Cast devices with mDNS;
