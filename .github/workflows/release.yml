@@ -46,6 +46,7 @@ jobs:
           cp target/release/cast "package/$archive_root/"
           cp docs/USER_GUIDE.md "package/$archive_root/"
           cp README.md "package/$archive_root/"
+          cp LICENSE "package/$archive_root/"
           tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
           (
             cd dist

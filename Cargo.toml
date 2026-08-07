@@ -2,8 +2,11 @@
 name = "cast"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Cast local video and a macOS desktop to Google Cast devices"
 license = "MIT"
+homepage = "https://github.com/michaelishri/cast-rs"
+repository = "https://github.com/michaelishri/cast-rs"
 
 [dependencies]
 aes = "0.8"
