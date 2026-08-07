@@ -45,7 +45,12 @@ cargo build --release
 
 `Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `cast --version`. Releases use matching annotated Git tags: package version `0.3.0` is released as `v0.3.0`.
 
-After changing the package version and pushing its commit, run:
+Follow the [release checklist](docs/RELEASE_CHECKLIST.md) for the complete, handoff-ready process:
+version bump and validation, annotated tagging, GitHub release verification, Homebrew formula update,
+bottle publication, installation testing, and failure recovery.
+
+After the version pull request is merged, check out that exact `origin/main` commit in a clean
+worktree and run:
 
 ```sh
 ./scripts/release.sh
