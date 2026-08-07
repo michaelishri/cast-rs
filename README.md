@@ -1,4 +1,4 @@
-# castscreen
+# caster
 
 An early, all-Rust macOS CLI for experimenting with desktop-to-Chromecast streaming.
 
@@ -27,7 +27,7 @@ cargo build --release
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `castscreen --version`. Releases use matching annotated Git tags: package version `0.1.0` is released as `v0.1.0`.
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.1.1` is released as `v0.1.1`.
 
 After changing the package version and pushing its commit, run:
 
@@ -112,7 +112,7 @@ By default, `cast-desktop` launches the receiver's built-in Chrome Mirroring app
 
 Live output defaults to aspect-preserved 1280x720 H.264 Baseline Level 3.1 for compatibility with Google Nest Hub receivers. The mirroring path selects the minimum valid H.264 level from resolution, frame rate, and bitrate: 720p60 uses Level 3.2 rather than incorrectly advertising Level 3.1. If the Cast `ANSWER` selects a lower display frame rate than requested, capture and encoding are capped to the receiver's rate instead of wasting bandwidth on frames it cannot display. ScreenCaptureKit presentation timestamps drive the HLS timeline even when macOS emits metadata-only samples between video frames.
 
-ScreenCaptureKit may omit the pixel buffer when nothing on the display changed. On those idle capture ticks, `castscreen` retains and re-encodes the most recent IOSurface so VideoToolbox continues producing a steady timeline and periodic keyframes. The HLS transport uses keyframes roughly half a second apart; the mirroring transport uses a one-second recovery interval.
+ScreenCaptureKit may omit the pixel buffer when nothing on the display changed. On those idle capture ticks, `caster` retains and re-encodes the most recent IOSurface so VideoToolbox continues producing a steady timeline and periodic keyframes. The HLS transport uses keyframes roughly half a second apart; the mirroring transport uses a one-second recovery interval.
 
 The mirroring capture callback never waits for VideoToolbox or the network. It publishes into a one-frame mailbox: if encoding is busy, a newer raw IOSurface replaces the pending one. Frames that exceed the raw-frame deadline are dropped before encoding, while already encoded H.264 reference frames are never discarded arbitrarily. By default the deadline is two frame periods; override it with `--max-frame-age-ms`, or pass `0` to retain the mailbox but disable deadline expiry.
 
@@ -188,7 +188,7 @@ ScreenCaptureKit currently composites the cursor into each captured video frame.
 ## Troubleshooting
 
 - Ensure the Mac and receiver are on the same LAN and client isolation is disabled.
-- Allow incoming connections if the macOS firewall prompts for `castscreen`.
+- Allow incoming connections if the macOS firewall prompts for `caster`.
 - Try a lower bitrate for congested Wi-Fi: `--bitrate 3000000`.
 - Use `--transport hls --serve-only` to test HLS packaging without contacting a receiver; for safety this mode binds only to loopback.
 - Port 8080 must be available for HLS, or select another one with `--http-port`.

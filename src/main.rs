@@ -32,7 +32,7 @@ enum Command {
     Displays,
     /// Ask a Cast device to play an existing media URL.
     CastUrl {
-        /// Chromecast IP address (shown by `castscreen devices`).
+        /// Chromecast IP address (shown by `caster devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -68,7 +68,7 @@ enum Command {
     },
     /// Measure the mirroring path and recommend receiver latency settings.
     Profile {
-        /// Chromecast IP address (shown by `castscreen devices`).
+        /// Chromecast IP address (shown by `caster devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -111,7 +111,7 @@ enum Command {
     },
     /// Capture this Mac's desktop and cast it to a Google Cast receiver.
     CastDesktop {
-        /// Chromecast IP address (shown by `castscreen devices`).
+        /// Chromecast IP address (shown by `caster devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -339,7 +339,7 @@ fn init_logging(verbosity: u8) {
     };
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Warn)
-        .filter_module("castscreen", level)
+        .filter_module("caster", level)
         .filter_module("rust_cast", level)
         .format_timestamp_millis()
         .init();

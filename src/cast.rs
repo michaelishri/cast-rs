@@ -74,7 +74,7 @@ fn cast_url_with_options(
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("castscreen-cast-control".into())
+        .name("caster-cast-control".into())
         .spawn(move || {
             let result = cast_url_inner(host, port, &media_load, &sender);
             if let Err(error) = result {

@@ -1,6 +1,6 @@
 [package]
-name = "castscreen"
-version = "0.1.0"
+name = "caster"
+version = "0.1.1"
 edition = "2024"
 description = "Cast a macOS desktop stream to Google Cast devices"
 license = "MIT"
