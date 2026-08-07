@@ -30,7 +30,7 @@ cargo build --release
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.2.0` is released as `v0.2.0`.
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.2.1` is released as `v0.2.1`.
 
 After changing the package version and pushing its commit, run:
 

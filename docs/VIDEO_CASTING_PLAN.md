@@ -1,7 +1,7 @@
 # Local video casting plan
 
 - Status: implemented; physical receiver validation pending
-- Target release: `v0.2.0`
+- Target release: `v0.2.1`
 - Planning branch: `codex/video-casting`
 
 ## Scope assumption
