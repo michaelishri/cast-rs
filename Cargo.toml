@@ -1,6 +1,6 @@
 [package]
-name = "caster"
-version = "0.2.1"
+name = "cast"
+version = "0.3.0"
 edition = "2024"
 description = "Cast local video and a macOS desktop to Google Cast devices"
 license = "MIT"

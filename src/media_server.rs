@@ -112,7 +112,7 @@ impl MediaFileServer {
 
         log::debug!("local video server listening on {address}");
         let listener_thread = thread::Builder::new()
-            .name("caster-video-http".into())
+            .name("cast-http-video".into())
             .spawn(move || {
                 while !listener_stop.load(Ordering::SeqCst) {
                     reap_finished_clients(&listener_clients);
@@ -120,7 +120,7 @@ impl MediaFileServer {
                         Ok((stream, peer)) => {
                             let state = Arc::clone(&listener_state);
                             match thread::Builder::new()
-                                .name("caster-video-http-client".into())
+                                .name("cast-http-video-client".into())
                                 .spawn(move || {
                                     if let Err(error) = handle_client(stream, peer, &state) {
                                         if is_expected_client_disconnect(&error) {

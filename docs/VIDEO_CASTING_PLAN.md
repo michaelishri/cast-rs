@@ -1,13 +1,13 @@
 # Local video casting plan
 
 - Status: implemented; physical receiver validation pending
-- Target release: `v0.2.1`
+- Target release: `v0.3.0`
 - Planning branch: `codex/video-casting`
 
 ## Scope assumption
 
-In this plan, “casting video” means playing a video file stored on the Mac. Caster already has
-`cast-url` for media that is available at a receiver-accessible URL. The new feature should make a
+In this plan, “casting video” means playing a video file stored on the Mac. Cast already has
+`url` for media that is available at a receiver-accessible URL. The new feature should make a
 local file receiver-accessible, load it as buffered media, and keep serving it for the lifetime of
 playback.
 
@@ -19,18 +19,18 @@ session behavior that every later compatibility mode will also need.
 
 ```sh
 # Play a compatible local file
-caster cast-video \
+cast video \
   --host 192.168.1.50 \
   ~/Movies/example.mp4
 
 # Begin at a particular position
-caster cast-video \
+cast video \
   --host 192.168.1.50 \
   --start-at 90 \
   ~/Movies/example.mp4
 
 # Select a fixed HTTP port for firewall or diagnostic purposes
-caster cast-video \
+cast video \
   --host 192.168.1.50 \
   --http-port 8080 \
   ~/Movies/example.mp4
@@ -39,7 +39,7 @@ caster cast-video \
 Recommended CLI shape:
 
 ```text
-caster cast-video [OPTIONS] <FILE>
+cast video [OPTIONS] <FILE>
 
 Arguments:
   <FILE>                    Local video file
@@ -52,12 +52,12 @@ Options:
   --content-type <TYPE>     Override automatic MIME detection
 ```
 
-`--port` can remain an alias for `--cast-port` so the option is compatible with `cast-url`. The
+`--port` can remain an alias for `--cast-port` so the option is compatible with `url`. The
 default output should show the selected file, advertised media type, receiver state transitions,
 and a `Ctrl-C` instruction. HTTP request details belong under `-v`; headers and Cast protocol
 details belong under `-vv`.
 
-Caster should continue running while the receiver can fetch the file. It should stop when any of
+Cast should continue running while the receiver can fetch the file. It should stop when any of
 these occur:
 
 - the receiver reports that playback finished;
@@ -65,14 +65,14 @@ these occur:
 - another sender replaces the media session;
 - the user presses `Ctrl-C`.
 
-On `Ctrl-C`, Caster should send a best-effort media `STOP`, close the Cast session, and then stop
+On `Ctrl-C`, Cast should send a best-effort media `STOP`, close the Cast session, and then stop
 the file server.
 
 ## Why this design fits Google Cast
 
 Google’s Default Media Web Receiver is explicitly designed to load an audio or video URL supplied
 by the sender. Its media description contains a content URL/ID, MIME type, stream type, and optional
-duration. A local filesystem path is not meaningful to a Chromecast, so Caster must expose the file
+duration. A local filesystem path is not meaningful to a Chromecast, so Cast must expose the file
 over the LAN and load the resulting HTTP URL.
 
 Google documents MP4 and WebM among the supported containers, but actual codec, profile,
@@ -115,7 +115,7 @@ The important gaps are:
 
 ```mermaid
 flowchart LR
-    CLI["caster cast-video"] --> PREP["Validate file and choose MIME type"]
+    CLI["cast video"] --> PREP["Validate file and choose MIME type"]
     PREP --> SERVER["Private LAN file server"]
     CLI --> CAST["Cast control session"]
     CAST --> RECEIVER["Default Media Receiver"]
@@ -173,7 +173,7 @@ Milestone one should support passthrough for these documented container families
 | WebM | `video/webm` | Supported, receiver decides codec compatibility |
 | Other or unidentified containers | User override only | Fail before casting with actionable guidance |
 
-An extension is not proof that its codecs are supported. At minimum, Caster should inspect the file
+An extension is not proof that its codecs are supported. At minimum, Cast should inspect the file
 signature so a renamed or clearly invalid file fails early. A later inspection slice can parse track
 metadata and add codec parameters such as H.264/AAC to the advertised MIME type.
 
@@ -210,9 +210,9 @@ The exact API can differ, but it needs these properties:
 - typed status, error, and terminal events travel back to the caller;
 - the initial media session ID and receiver transport ID are retained for stop and future controls;
 - `Drop` cannot silently leave a joinable thread or deadlock on a blocking receive;
-- existing `cast-url` and HLS callers retain their current behavior.
+- existing `url` and HLS callers retain their current behavior.
 
-Reaching `PLAYING` is the success boundary for `cast-video`; receiving the synchronous `LOAD`
+Reaching `PLAYING` is the success boundary for `video`; receiving the synchronous `LOAD`
 response is only an acknowledgement. A 20-second startup timeout is a reasonable initial default,
 and its failure should include whether the receiver ever requested the file.
 
@@ -242,12 +242,12 @@ unknown routes, unsupported methods, CORS headers, and a file larger than the tr
 - Generalize `MediaLoad` so messages say “buffered media” or “live media” correctly.
 - Return typed receiver events from the Cast control thread.
 - Wait for `PLAYING`, surface asynchronous errors, and support best-effort `STOP`.
-- Preserve `cast-url` and `cast-desktop --transport hls` behavior.
+- Preserve `url` and `desktop --transport hls` behavior.
 
 Exit criterion: mocked/channel-level tests prove acknowledgement, playing, terminal error, finished,
 replacement, timeout, and shutdown paths.
 
-### 4. `cast-video` orchestration and CLI
+### 4. `video` orchestration and CLI
 
 - Add the subcommand and options proposed above.
 - Canonicalize and open the file before contacting the receiver.
@@ -257,13 +257,13 @@ replacement, timeout, and shutdown paths.
 - Print a concise final transfer summary.
 
 Exit criterion: a known-good H.264/AAC MP4 starts, seeks, resumes, completes, and stops cleanly on a
-physical receiver without loading the complete file into Caster’s memory.
+physical receiver without loading the complete file into Cast’s memory.
 
 ### 5. Compatibility diagnostics and documentation
 
 - Map Cast detailed errors to actionable CLI messages.
 - Document the direct-play matrix and receiver-dependent codec limits.
-- Add `cast-video` to the end-user guide, README, help snapshots, and release archive checks.
+- Add `video` to the end-user guide, README, help snapshots, and release archive checks.
 - Document macOS firewall prompts and why the Mac and receiver must share a reachable LAN.
 
 Exit criterion: an incompatible file fails with guidance rather than a false “accepted” success.
@@ -311,7 +311,7 @@ Manual receiver coverage should include:
 
 ## Acceptance criteria for the first release
 
-- `caster cast-video --host <ip> <file.mp4>` plays a compatible local file through the Default
+- `cast video --host <ip> <file.mp4>` plays a compatible local file through the Default
   Media Receiver.
 - Startup is not reported as successful until the receiver reaches `PLAYING`.
 - Seeking works through valid HTTP byte-range responses.
@@ -319,7 +319,7 @@ Manual receiver coverage should include:
 - Only the selected file is reachable, on one random route bound to the receiver-facing interface.
 - Terminal receiver errors produce a non-zero exit and an actionable message.
 - `Ctrl-C` stops playback and shuts down both network threads promptly.
-- Existing `cast-url`, mirroring, HLS, profiling, CI, and release packaging continue to pass.
+- Existing `url`, mirroring, HLS, profiling, CI, and release packaging continue to pass.
 - The feature is covered in the bundled end-user guide.
 
 ## Deferred features

@@ -37,8 +37,8 @@ enum Command {
     /// List displays visible to macOS ScreenCaptureKit.
     Displays,
     /// Ask a Cast device to play an existing media URL.
-    CastUrl {
-        /// Chromecast IP address (shown by `caster devices`).
+    Url {
+        /// Chromecast IP address (shown by `cast devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -58,10 +58,10 @@ enum Command {
         monitor_seconds: u64,
     },
     /// Play a compatible local video file on a Google Cast device.
-    CastVideo {
+    Video {
         /// Local MP4 or WebM file to play.
         file: PathBuf,
-        /// Chromecast IP address (shown by `caster devices`).
+        /// Chromecast IP address (shown by `cast devices`).
         #[arg(long)]
         host: IpAddr,
         /// Cast control port.
@@ -94,7 +94,7 @@ enum Command {
     },
     /// Measure the mirroring path and recommend receiver latency settings.
     Profile {
-        /// Chromecast IP address (shown by `caster devices`).
+        /// Chromecast IP address (shown by `cast devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -136,8 +136,8 @@ enum Command {
         quality_priority: bool,
     },
     /// Capture this Mac's desktop and cast it to a Google Cast receiver.
-    CastDesktop {
-        /// Chromecast IP address (shown by `caster devices`).
+    Desktop {
+        /// Chromecast IP address (shown by `cast devices`).
         #[arg(long)]
         host: IpAddr,
         #[arg(long, default_value_t = 8009)]
@@ -219,7 +219,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Displays => capture::list_displays()?,
-        Command::CastUrl {
+        Command::Url {
             host,
             port,
             url,
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_secs(monitor_seconds));
             }
         }
-        Command::CastVideo {
+        Command::Video {
             file,
             host,
             cast_port,
@@ -310,7 +310,7 @@ fn main() -> Result<()> {
             },
             auto_tune,
         )?,
-        Command::CastDesktop {
+        Command::Desktop {
             host,
             cast_port,
             transport,
@@ -380,7 +380,7 @@ fn init_logging(verbosity: u8) {
     };
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Warn)
-        .filter_module("caster", level)
+        .filter_module("cast", level)
         .filter_module("rust_cast", level)
         .format_timestamp_millis()
         .init();
