@@ -2559,7 +2559,7 @@ impl CastRtpSender {
             }
             if let Some((packets_per_burst, interval)) = pacing
                 && position + 1 < packet_ids.len()
-                && (position + 1).is_multiple_of(packets_per_burst)
+                && (position + 1) % packets_per_burst == 0
             {
                 thread::sleep(interval);
                 pacing_sleep = pacing_sleep.saturating_add(interval);
@@ -3417,7 +3417,7 @@ impl MirrorFrameHandler {
         reason: &str,
     ) {
         let count = self.repeated_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count.is_multiple_of(120) {
+        if count == 1 || count % 120 == 0 {
             log::debug!(
                 "encoded {count} idle mirroring samples by reusing the last frame (latest status={status:?}: {reason})"
             );
@@ -3426,7 +3426,7 @@ impl MirrorFrameHandler {
 
     fn record_skipped_sample(&self, status: Option<screencapturekit::SCFrameStatus>, reason: &str) {
         let count = self.skipped_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count.is_multiple_of(120) {
+        if count == 1 || count % 120 == 0 {
             log::debug!(
                 "skipped {count} non-video mirroring samples (latest status={status:?}: {reason})"
             );
@@ -3517,7 +3517,7 @@ impl MirrorPipeline {
         )?;
         drop(sender);
         self.frame_index += 1;
-        if keyframe || self.frame_index.is_multiple_of(self.fps as u64) {
+        if keyframe || self.frame_index % self.fps as u64 == 0 {
             log::debug!(
                 "sent mirroring frame {}: {} Annex-B bytes, keyframe={keyframe}, rtp_timestamp={timestamp}",
                 self.frame_index,
