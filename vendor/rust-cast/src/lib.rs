@@ -1,6 +1,12 @@
 #![deny(warnings)]
 
-use std::{borrow::Cow, net::TcpStream, sync::Arc};
+use std::{
+    borrow::Cow,
+    io,
+    net::{Shutdown, TcpStream, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, StreamOwned,
@@ -30,6 +36,19 @@ mod utils;
 const DEFAULT_SENDER_ID: &str = "sender-0";
 const DEFAULT_RECEIVER_ID: &str = "receiver-0";
 
+/// A handle that can interrupt a Cast connection blocked on network I/O.
+#[derive(Debug)]
+pub struct CastConnectionInterrupt {
+    stream: TcpStream,
+}
+
+impl CastConnectionInterrupt {
+    /// Shuts down both directions of the underlying Cast TCP connection.
+    pub fn interrupt(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)
+    }
+}
+
 #[cfg(feature = "thread_safe")]
 type Lrc<T> = std::sync::Arc<T>;
 #[cfg(not(feature = "thread_safe"))]
@@ -54,6 +73,7 @@ pub enum ChannelMessage {
 /// Structure that manages connection to a cast device.
 pub struct CastDevice<'a> {
     message_manager: Lrc<MessageManager<StreamOwned<ClientConnection, TcpStream>>>,
+    connection_interrupt: CastConnectionInterrupt,
 
     /// Channel that manages connection responses/requests.
     pub connection: ConnectionChannel<'a, StreamOwned<ClientConnection, TcpStream>>,
@@ -122,11 +142,15 @@ impl<'a> CastDevice<'a> {
             config.into(),
             ServerName::try_from(host.as_ref())?.to_owned(),
         )?;
-        let stream = StreamOwned::new(conn, TcpStream::connect((host.as_ref(), port))?);
+        let tcp_stream = TcpStream::connect((host.as_ref(), port))?;
+        let connection_interrupt = CastConnectionInterrupt {
+            stream: tcp_stream.try_clone()?,
+        };
+        let stream = StreamOwned::new(conn, tcp_stream);
 
         log::debug!("Connection with {host}:{port} successfully established.");
 
-        CastDevice::connect_to_device(stream)
+        CastDevice::connect_to_device(stream, connection_interrupt)
     }
 
     /// Connects to the cast device using host name and port _without_ host verification. Use on
@@ -167,17 +191,67 @@ impl<'a> CastDevice<'a> {
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_no_client_auth();
         config.key_log = Arc::new(rustls::KeyLogFile::new());
+        let tcp_stream = TcpStream::connect((host.as_ref(), port))?;
+        let connection_interrupt = CastConnectionInterrupt {
+            stream: tcp_stream.try_clone()?,
+        };
         let stream = StreamOwned::new(
             ClientConnection::new(
                 Arc::new(config),
                 ServerName::try_from(host.as_ref())?.to_owned(),
             )?,
-            TcpStream::connect((host.as_ref(), port))?,
+            tcp_stream,
         );
 
         log::debug!("Connection with {host}:{port} successfully established.");
 
-        CastDevice::connect_to_device(stream)
+        CastDevice::connect_to_device(stream, connection_interrupt)
+    }
+
+    /// Connects without host verification while bounding the initial TCP connection attempt.
+    pub fn connect_without_host_verification_timeout<S>(
+        host: S,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<CastDevice<'a>, Error>
+    where
+        S: Into<Cow<'a, str>>,
+    {
+        let host = host.into();
+        log::debug!(
+            "Establishing timeout-bounded non-verified connection with cast device at {host}:{port}…"
+        );
+        let address = (host.as_ref(), port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other(format!("could not resolve {host}:{port}")))?;
+        let tcp_stream = TcpStream::connect_timeout(&address, timeout)?;
+        let connection_interrupt = CastConnectionInterrupt {
+            stream: tcp_stream.try_clone()?,
+        };
+
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
+            .with_no_client_auth();
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        let stream = StreamOwned::new(
+            ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from(host.as_ref())?.to_owned(),
+            )?,
+            tcp_stream,
+        );
+
+        log::debug!("Connection with {host}:{port} successfully established.");
+        CastDevice::connect_to_device(stream, connection_interrupt)
+    }
+
+    /// Returns a handle that can wake this device if it becomes blocked on network I/O.
+    pub fn connection_interrupt(&self) -> Result<CastConnectionInterrupt, Error> {
+        Ok(CastConnectionInterrupt {
+            stream: self.connection_interrupt.stream.try_clone()?,
+        })
     }
 
     /// Waits for any message returned by cast device (e.g. Chromecast) and returns its parsed
@@ -209,7 +283,18 @@ impl<'a> CastDevice<'a> {
     /// Parsed channel message.
     pub fn receive(&self) -> Result<ChannelMessage, Error> {
         let cast_message = self.message_manager.receive()?;
+        self.parse_message(cast_message)
+    }
 
+    /// Returns a message retained by a previous filtered receive without waiting on the network.
+    pub fn receive_buffered(&self) -> Result<Option<ChannelMessage>, Error> {
+        self.message_manager
+            .receive_buffered()
+            .map(|message| self.parse_message(message))
+            .transpose()
+    }
+
+    fn parse_message(&self, cast_message: CastMessage) -> Result<ChannelMessage, Error> {
         if self.connection.can_handle(&cast_message) {
             return Ok(ChannelMessage::Connection(
                 self.connection.parse(&cast_message)?,
@@ -246,6 +331,7 @@ impl<'a> CastDevice<'a> {
     /// Instance of `CastDevice` that allows you to manage connection.
     fn connect_to_device(
         ssl_stream: StreamOwned<ClientConnection, TcpStream>,
+        connection_interrupt: CastConnectionInterrupt,
     ) -> Result<CastDevice<'a>, Error> {
         let message_manager_rc = Lrc::new(MessageManager::new(ssl_stream));
 
@@ -264,6 +350,7 @@ impl<'a> CastDevice<'a> {
 
         Ok(CastDevice {
             message_manager: message_manager_rc,
+            connection_interrupt,
             heartbeat,
             connection,
             receiver,

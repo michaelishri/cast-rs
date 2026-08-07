@@ -1431,8 +1431,28 @@ where
     where
         S: Into<Cow<'a, str>>,
     {
-        let request_id = self.message_manager.generate_request_id().get();
+        let request_id = self.send_stop(destination, media_session_id)?;
+        self.receive_status_entry(request_id, media_session_id)
+    }
 
+    /// Requests that playback stop without waiting for the resulting media status.
+    ///
+    /// This is useful during receiver application teardown, where waiting for a media entry can
+    /// block after `STOP` invalidates the media session. Messages sent afterwards on the same Cast
+    /// connection remain ordered after this request.
+    pub fn stop_without_wait<S>(&self, destination: S, media_session_id: i32) -> Result<(), Error>
+    where
+        S: Into<Cow<'a, str>>,
+    {
+        self.send_stop(destination, media_session_id)?;
+        Ok(())
+    }
+
+    fn send_stop<S>(&self, destination: S, media_session_id: i32) -> Result<u32, Error>
+    where
+        S: Into<Cow<'a, str>>,
+    {
+        let request_id = self.message_manager.generate_request_id().get();
         let payload = serde_json::to_string(&proxies::media::PlaybackGenericRequest {
             request_id,
             media_session_id,
@@ -1447,7 +1467,7 @@ where
             payload: CastMessagePayload::String(payload),
         })?;
 
-        self.receive_status_entry(request_id, media_session_id)
+        Ok(request_id)
     }
 
     /// Sets the current position in the stream. Triggers a STATUS event notification to all sender
@@ -1736,6 +1756,26 @@ mod tests {
             assert_eq!(1.0, entry.playback_rate);
             assert_eq!(2300, entry.supported_media_commands);
         }
+    }
+
+    #[test]
+    fn test_stop_without_wait_sends_stop_request_without_reading() {
+        let stream = MockTcpStream::new();
+        let channel = MediaChannel {
+            sender: Cow::from(DEFAULT_SENDER_ID),
+            message_manager: Lrc::new(MessageManager::new(stream.clone())),
+        };
+
+        channel.stop_without_wait("web-42", 9).unwrap();
+
+        let message = stream.received_message(0).unwrap().message();
+        assert_eq!(message.namespace(), CHANNEL_NAMESPACE);
+        assert_eq!(message.source_id(), DEFAULT_SENDER_ID);
+        assert_eq!(message.destination_id(), "web-42");
+        let payload: serde_json::Value = serde_json::from_str(message.payload_utf8()).unwrap();
+        assert_eq!(payload["type"], MESSAGE_TYPE_STOP);
+        assert_eq!(payload["mediaSessionId"], 9);
+        assert!(payload["requestId"].is_number());
     }
 
     #[test]

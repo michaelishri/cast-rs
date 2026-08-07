@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     ffi::c_void,
     io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -21,7 +21,10 @@ use screencapturekit::prelude::*;
 use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
-use crate::cast;
+use crate::{
+    cast,
+    network::{http_url, local_ip_for, private_route},
+};
 
 const TIMESCALE: u64 = 90_000;
 const PLAYLIST_WINDOW_SEGMENTS: usize = 8;
@@ -56,7 +59,7 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     } else {
         lan_ip
     };
-    let route = stream_route()?;
+    let route = private_route()?;
     log::debug!(
         "route to receiver uses local address {lan_ip}; HTTP listener address is {serve_ip}:{}",
         options.http_port
@@ -172,9 +175,9 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
     }
 
-    let url = format!(
-        "http://{serve_ip}:{}/{route}/master.m3u8",
-        options.http_port
+    let url = http_url(
+        SocketAddr::new(serve_ip, options.http_port),
+        &format!("/{route}/master.m3u8"),
     );
     println!("Live stream ready at {url}");
     if !options.serve_only {
@@ -214,19 +217,6 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         stats.playlists, stats.init_segments, stats.media_segments
     );
     Ok(())
-}
-
-fn local_ip_for(host: IpAddr, port: u16) -> Result<IpAddr> {
-    let bind = if host.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).context("could not create route probe socket")?;
-    socket
-        .connect(SocketAddr::new(host, port))
-        .with_context(|| format!("could not find a network route to {host}"))?;
-    Ok(socket.local_addr()?.ip())
 }
 
 struct LiveFrameHandler {
@@ -848,12 +838,6 @@ fn h264_parameter_sets(sample: *mut c_void) -> Result<(Vec<u8>, Vec<u8>)> {
     };
 
     Ok((read(0)?, read(1)?))
-}
-
-fn stream_route() -> Result<String> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).context("could not generate a private stream URL")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn take_failure(failure: &Mutex<Option<String>>) -> Result<Option<String>> {

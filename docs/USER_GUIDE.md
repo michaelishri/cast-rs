@@ -1,6 +1,7 @@
 # Caster user guide
 
-Caster sends a macOS display to a Google Cast device such as Chromecast or Google Nest Hub. It is a command-line app for macOS 13 or newer.
+Caster plays local video files and sends a macOS display to a Google Cast device such as Chromecast
+or Google Nest Hub. It is a command-line app for macOS 13 or newer.
 
 ## Before you start
 
@@ -8,7 +9,7 @@ Caster sends a macOS display to a Google Cast device such as Chromecast or Googl
 - Download the archive that matches the Mac:
   - `macos-arm64` for Apple Silicon (M1, M2, M3, M4, and later);
   - `macos-x86_64` for Intel Macs.
-- Caster streams video only. Desktop audio is not included.
+- Desktop casting is video-only. Audio already present in a compatible local video file is played.
 
 ## Install
 
@@ -58,6 +59,43 @@ xattr -dr com.apple.quarantine .
 4. Press `Ctrl-C` in Terminal to stop casting.
 
 Caster uses its low-latency mirroring transport by default. The first connection can take a few seconds while the receiver starts.
+
+## Cast a local video
+
+Play a local MP4 or WebM file by passing its path and the receiver address:
+
+```sh
+./caster cast-video \
+  --host 192.168.1.50 \
+  ~/Movies/example.mp4
+```
+
+Keep Caster running while the video plays. The Chromecast fetches the file directly from the Mac,
+so both devices must remain on the same reachable network. Press `Ctrl-C` to stop playback, close
+the Cast session, and return the receiver to its home screen.
+
+Begin at a particular position, in seconds:
+
+```sh
+./caster cast-video \
+  --host 192.168.1.50 \
+  --start-at 90 \
+  ~/Movies/example.mp4
+```
+
+Caster serves the original file without changing its quality. H.264 video with AAC audio in an MP4
+container is the most broadly compatible choice. WebM and newer codecs depend on the exact receiver
+model. Caster does not yet convert incompatible video files.
+
+The local server normally selects an available port automatically. If a firewall rule requires a
+fixed port, set one explicitly:
+
+```sh
+./caster cast-video \
+  --host 192.168.1.50 \
+  --http-port 8080 \
+  ~/Movies/example.mp4
+```
 
 ## Everyday commands
 
@@ -131,6 +169,19 @@ Try the compatibility fallback:
 ```sh
 ./caster cast-desktop --host 192.168.1.50 --transport hls
 ```
+
+**A local video does not start**
+
+If Caster says the receiver never requested the video, allow incoming connections through the
+macOS firewall and confirm that guest/client isolation is disabled. If the receiver requested the
+file but rejected or could not decode it, try an H.264/AAC MP4. MP4 or WebM describes the container;
+the codecs inside it must also be supported by that receiver model.
+
+**Seeking in a local video fails**
+
+Run `./caster -v cast-video ...` and look for `206 Partial Content` range responses. A fixed
+firewall port can be chosen with `--http-port`, but no port forwarding is needed on a normal home
+LAN.
 
 **Need more detail**
 
