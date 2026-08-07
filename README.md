@@ -14,13 +14,26 @@ The CLI currently supports these Cast paths:
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
 - retain fragmented-MP4 HLS as a compatibility fallback.
 
+## Install
+
+Install the current stable release with Homebrew:
+
+```sh
+brew install michaelishri/tap/cast
+cast --version
+```
+
+Architecture-specific archives remain available from the GitHub Releases page. See the
+[Cast user guide](docs/USER_GUIDE.md) for manual installation and first-use instructions.
+
 ## Requirements
 
 - macOS 13 or newer;
-- Rust 1.85 or newer (edition 2024);
-- Xcode (the native capture bindings use Apple's Swift runtime);
 - Mac and Chromecast on the same network;
 - Screen Recording permission for your terminal when using capture commands.
+
+Building from source additionally requires Rust 1.85 or newer and Xcode 15 or newer because the
+native capture bindings use Apple's Swift toolchain.
 
 ## Build
 
