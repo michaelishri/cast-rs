@@ -1,0 +1,5 @@
+/target
+*.h264
+*.avcc
+*.m3u8
+*.m4s
