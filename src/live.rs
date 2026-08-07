@@ -532,7 +532,7 @@ impl HlsStore {
             .lock()
             .map_err(|_| anyhow!("HLS store lock was poisoned"))?;
         match path {
-            "/" => Ok(Some(HttpBody::text("caster is running\n"))),
+            "/" => Ok(Some(HttpBody::text("cast is running\n"))),
             "/master.m3u8" => {
                 self.playlist_requests.fetch_add(1, Ordering::Relaxed);
                 Ok(state.master.as_ref().map(|data| HttpBody {
@@ -660,7 +660,7 @@ impl HttpServer {
         log::debug!("HTTP server listening on {address}");
         let server_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("caster-http".into())
+            .name("cast-http".into())
             .spawn(move || {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {

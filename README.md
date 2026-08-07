@@ -1,8 +1,8 @@
-# caster
+# cast
 
 An early, all-Rust macOS CLI for casting local video and a desktop to Google Cast devices.
 
-End users should start with the bundled [Caster user guide](docs/USER_GUIDE.md). This README also documents the implementation and release process for contributors.
+End users should start with the bundled [Cast user guide](docs/USER_GUIDE.md). This README also documents the implementation and release process for contributors.
 
 The CLI currently supports these Cast paths:
 
@@ -30,7 +30,7 @@ cargo build --release
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `caster --version`. Releases use matching annotated Git tags: package version `0.2.1` is released as `v0.2.1`.
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `cast --version`. Releases use matching annotated Git tags: package version `0.3.0` is released as `v0.3.0`.
 
 After changing the package version and pushing its commit, run:
 
@@ -52,7 +52,7 @@ cargo run -- devices
 cargo run -- displays
 
 # Cast the first display over the default low-latency mirroring transport
-cargo run --release -- cast-desktop --host 192.168.1.50
+cargo run --release -- desktop --host 192.168.1.50
 
 # Profile the real capture/network path for one minute and recommend a delay
 cargo run --release -- profile --host 192.168.1.50
@@ -67,29 +67,29 @@ cargo run --release -- profile --host 192.168.1.50 --synthetic --auto-tune
 cargo run --release -- profile --host 192.168.1.50 --synthetic --fps 60
 
 # Reduce or increase the requested receiver playout buffer (default: 200 ms)
-cargo run --release -- cast-desktop \
+cargo run --release -- desktop \
   --host 192.168.1.50 \
   --target-delay-ms 150
 
 # Use the fragmented-MP4 HLS compatibility path instead
-cargo run --release -- cast-desktop \
+cargo run --release -- desktop \
   --host 192.168.1.50 \
   --transport hls
 
 # Include Cast, transport, and skipped-sample diagnostics
-cargo run -- -v cast-desktop --host 192.168.1.50
+cargo run -- -v desktop --host 192.168.1.50
 
 # Include trace-level Cast and encoder diagnostics
-cargo run -- -vv cast-desktop --host 192.168.1.50
+cargo run -- -vv desktop --host 192.168.1.50
 
 # Cast a particular display for 30 seconds
-cargo run -- cast-desktop \
+cargo run -- desktop \
   --host 192.168.1.50 \
   --display 1 \
   --seconds 30
 
 # Override the default 1280x720 compatibility output for a more capable receiver
-cargo run -- cast-desktop \
+cargo run -- desktop \
   --host 192.168.1.50 \
   --width 1920 \
   --height 1080
@@ -98,18 +98,18 @@ cargo run -- cast-desktop \
 cargo run -- capture --display 1 --seconds 10 --output capture.avcc
 
 # Play a compatible local video file through the Default Media Receiver
-cargo run --release -- cast-video \
+cargo run --release -- video \
   --host 192.168.1.50 \
   ~/Movies/example.mp4
 
 # Begin local video playback at 90 seconds
-cargo run --release -- cast-video \
+cargo run --release -- video \
   --host 192.168.1.50 \
   --start-at 90 \
   ~/Movies/example.mp4
 
 # Play an existing HLS live stream through the Cast Default Media Receiver
-cargo run -- cast-url \
+cargo run -- url \
   --host 192.168.1.50 \
   --url http://192.168.1.20:8080/master.m3u8 \
   --hls-video-segment-format fmp4 \
@@ -120,7 +120,7 @@ Run `cargo run -- --help` or add `--help` after a subcommand for every option.
 
 ## How local video casting works
 
-`cast-video` opens one local file, selects the Mac's receiver-facing LAN address, and exposes only
+`video` opens one local file, selects the Mac's receiver-facing LAN address, and exposes only
 that already-open file at a fresh random URL. It launches Google's Default Media Receiver, loads the
 URL as buffered media, and keeps the local server alive until playback finishes or `Ctrl-C` is
 pressed. On `Ctrl-C`, it stops the media, closes the Cast channels, and terminates the Default Media
@@ -132,35 +132,35 @@ and can read MP4 metadata stored near the end of a large file. File data is read
 in fixed-size chunks rather than loaded into memory. The listener binds only to the LAN interface
 used to reach the selected receiver and uses an automatic free port unless `--http-port` is set.
 
-Direct playback preserves the original video and audio without transcoding. Caster recognizes MP4
+Direct playback preserves the original video and audio without transcoding. Cast recognizes MP4
 and WebM containers, but actual codec, profile, resolution, frame-rate, audio, and HDR support varies
 by receiver model. H.264 with AAC in MP4 is the most broadly compatible starting point. Use
-`--content-type` only to experiment with another format that the receiver supports; Caster does not
+`--content-type` only to experiment with another format that the receiver supports; Cast does not
 yet remux or transcode incompatible files.
 
 ## How live casting works
 
-By default, `cast-desktop` launches the receiver's built-in Chrome Mirroring application and performs the Cast Streaming `OFFER`/`ANSWER` exchange. It converts VideoToolbox's AVCC output to Annex B, prepends SPS/PPS to keyframes, encrypts each frame with session-specific AES-128-CTR material, and sends it as Cast RTP over UDP. RTCP sender reports establish the media clock; receiver checkpoints and loss fields drive history cleanup and packet retransmission. The default offer requests a 200 ms receiver playout delay. Actual glass-to-glass latency also includes capture, encode, Wi-Fi, decode, and display time.
+By default, `desktop` launches the receiver's built-in Chrome Mirroring application and performs the Cast Streaming `OFFER`/`ANSWER` exchange. It converts VideoToolbox's AVCC output to Annex B, prepends SPS/PPS to keyframes, encrypts each frame with session-specific AES-128-CTR material, and sends it as Cast RTP over UDP. RTCP sender reports establish the media clock; receiver checkpoints and loss fields drive history cleanup and packet retransmission. The default offer requests a 200 ms receiver playout delay. Actual glass-to-glass latency also includes capture, encode, Wi-Fi, decode, and display time.
 
 `--transport hls` uses the earlier compatibility path. It determines the Mac's LAN address from the route to the receiver, binds an HTTP server only to that address, generates a random session path, and serves a rolling fragmented-MP4 HLS stream through the Default Media Receiver. Its one-second HLS target duration typically leaves playback roughly three seconds behind the encoder's live edge.
 
 Live output defaults to aspect-preserved 1280x720 H.264 Baseline Level 3.1 for compatibility with Google Nest Hub receivers. The mirroring path selects the minimum valid H.264 level from resolution, frame rate, and bitrate: 720p60 uses Level 3.2 rather than incorrectly advertising Level 3.1. If the Cast `ANSWER` selects a lower display frame rate than requested, capture and encoding are capped to the receiver's rate instead of wasting bandwidth on frames it cannot display. ScreenCaptureKit presentation timestamps drive the HLS timeline even when macOS emits metadata-only samples between video frames.
 
-ScreenCaptureKit may omit the pixel buffer when nothing on the display changed. On those idle capture ticks, `caster` retains and re-encodes the most recent IOSurface so VideoToolbox continues producing a steady timeline and periodic keyframes. The HLS transport uses keyframes roughly half a second apart; the mirroring transport uses a one-second recovery interval.
+ScreenCaptureKit may omit the pixel buffer when nothing on the display changed. On those idle capture ticks, `cast` retains and re-encodes the most recent IOSurface so VideoToolbox continues producing a steady timeline and periodic keyframes. The HLS transport uses keyframes roughly half a second apart; the mirroring transport uses a one-second recovery interval.
 
 The mirroring capture callback never waits for VideoToolbox or the network. It publishes into a one-frame mailbox: if encoding is busy, a newer raw IOSurface replaces the pending one. Frames that exceed the raw-frame deadline are dropped before encoding, while already encoded H.264 reference frames are never discarded arbitrarily. By default the deadline is two frame periods; override it with `--max-frame-age-ms`, or pass `0` to retain the mailbox but disable deadline expiry.
 
 The media playlist advertises a short four-second live window for latency, while the HTTP server retains a longer back buffer so delayed receiver requests do not fail as segments roll out of the manifest.
 
 The current desktop stream is video-only. Desktop audio is not included yet; compatible audio
-already present in a file passed to `cast-video` is sent unchanged. The low-latency transport is an
+already present in a file passed to `video` is sent unchanged. The low-latency transport is an
 early implementation of Google's documented Cast Streaming protocol and has so far been exercised
 against a Nest Hub-class receiver. Use `--transport hls` if another receiver rejects the mirroring
 offer.
 
 ## Latency profiling
 
-`profile` runs the same ScreenCaptureKit, VideoToolbox, encrypted RTP, and receiver-feedback path as `cast-desktop`, using a deliberately small 10 ms receiver probe buffer by default. For 60 seconds it redraws a terminal graph of the most recent per-second p95 latency and displays cumulative p50, p95, p99, and packet-loss measurements. Use the desktop normally—especially scrolling, animation, and window changes—so keyframe and bitrate pressure resemble the intended workload.
+`profile` runs the same ScreenCaptureKit, VideoToolbox, encrypted RTP, and receiver-feedback path as `desktop`, using a deliberately small 10 ms receiver probe buffer by default. For 60 seconds it redraws a terminal graph of the most recent per-second p95 latency and displays cumulative p50, p95, p99, and packet-loss measurements. Use the desktop normally—especially scrolling, animation, and window changes—so keyframe and bitrate pressure resemble the intended workload.
 
 Add `--synthetic` for repeatable comparisons between encoder or transport settings. This bypasses ScreenCaptureKit and writes deterministic `420v` content into a small reusable IOSurface pool, then follows the same latest-frame queue, VideoToolbox, encryption, RTP, feedback, and receiver path as normal mirroring. Reports identify this stable workload as `synthetic-v1`. Its ten-second cycle contains four equal 2.5-second phases:
 
@@ -173,7 +173,7 @@ The live graph names the current phase. The final report breaks down acknowledge
 
 The final report separates screen-composite age, raw queue wait, VideoToolbox encode, H.264 preparation, sender-lock wait, UDP send, and receiver feedback. It also reports raw-frame replacements/expiry, frames and bytes in flight, packet pacing, adaptive-bitrate changes, and which VideoToolbox latency controls the hardware accepted. The report still provides aggressive, balanced, and resilient receiver-delay settings; balanced covers the measured p99 plus one frame of decode headroom and an additional margin when packet loss occurred.
 
-Add `--auto-tune` alongside `--synthetic` to compare the sender latency controls automatically. The default 60-second budget is divided into six ten-second trials: defaults, fixed bitrate, VideoToolbox quality priority, a one-frame raw deadline, deadline expiry disabled, and a final combined validation trial. Each trial starts the same complete `synthetic-v1` cycle and relaunches the receiver; negotiation time is not counted against `--seconds`. The final table ranks the trials and emits a `cast-desktop` command containing the measured winner's `--max-frame-age-ms`, `--fixed-bitrate`, and `--quality-priority` switches when applicable.
+Add `--auto-tune` alongside `--synthetic` to compare the sender latency controls automatically. The default 60-second budget is divided into six ten-second trials: defaults, fixed bitrate, VideoToolbox quality priority, a one-frame raw deadline, deadline expiry disabled, and a final combined validation trial. Each trial starts the same complete `synthetic-v1` cycle and relaunches the receiver; negotiation time is not counted against `--seconds`. The final table ranks the trials and emits a `desktop` command containing the measured winner's `--max-frame-age-ms`, `--fixed-bitrate`, and `--quality-priority` switches when applicable.
 
 The auto-tune score favors a low p95/p99 latency tail while penalizing retransmissions, raw-frame drops, and failure to sustain the negotiated frame rate. A candidate must improve the score by more than 5 ms before the tuner prefers it over a less customized configuration. This deliberately prevents small run-to-run differences from turning into fragile recommendations. Use a larger `--seconds` value for more confidence; the tuner optimizes sender latency and transport reliability, not image quality or camera-measured glass-to-glass delay.
 
@@ -226,9 +226,9 @@ ScreenCaptureKit currently composites the cursor into each captured video frame.
 ## Troubleshooting
 
 - Ensure the Mac and receiver are on the same LAN and client isolation is disabled.
-- Allow incoming connections if the macOS firewall prompts for `caster`.
+- Allow incoming connections if the macOS firewall prompts for `cast`.
 - For local files, start with an H.264/AAC MP4; direct playback does not transcode unsupported media.
-- If `cast-video` reports that the receiver never requested the file, check the firewall and guest/client-isolation settings.
+- If `video` reports that the receiver never requested the file, check the firewall and guest/client-isolation settings.
 - Try a lower bitrate for congested Wi-Fi: `--bitrate 3000000`.
 - Use `--transport hls --serve-only` to test HLS packaging without contacting a receiver; for safety this mode binds only to loopback.
 - Port 8080 must be available for HLS, or select another one with `--http-port`.

@@ -98,7 +98,7 @@ impl BufferedMediaSession {
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
         let (done_sender, done_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
-            .name("caster-buffered-cast-control".into())
+            .name("cast-buffered-cast-control".into())
             .spawn(move || {
                 eprintln!("Connecting to Cast receiver at {host}:{port}...");
                 let device = match CastDevice::connect_without_host_verification_timeout(
@@ -299,7 +299,7 @@ fn cast_url_with_options(
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("caster-cast-control".into())
+        .name("cast-cast-control".into())
         .spawn(move || {
             let result = cast_url_inner(host, port, &media_load, &sender);
             if let Err(error) = result {

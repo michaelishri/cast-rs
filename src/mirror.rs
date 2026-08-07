@@ -472,7 +472,7 @@ fn print_auto_tune_report(base: &MirrorOptions, trials: &[AutoTuneTrial]) {
         winner.result.recommendations.balanced_ms,
     );
     println!(
-        "\nUse: caster cast-desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
+        "\nUse: cast desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
         base.cast_host,
         base.cast_port,
         winner.result.recommendations.balanced_ms,
@@ -1361,7 +1361,7 @@ fn print_profile_report(
         tuning_arguments.push_str(" --quality-priority");
     }
     println!(
-        "\nUse: caster cast-desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
+        "\nUse: cast desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
         options.cast_host,
         options.cast_port,
         recommendations.balanced_ms,
@@ -1810,7 +1810,7 @@ fn negotiate_cast_streaming(
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let thread_control_close_expected = Arc::new(AtomicBool::new(false));
     thread::Builder::new()
-        .name("caster-mirror-control".into())
+        .name("cast-mirror-control".into())
         .spawn(move || {
             let result = negotiate_cast_streaming_inner(
                 host,
@@ -2913,7 +2913,7 @@ impl FeedbackThread {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("caster-mirror-rtcp".into())
+            .name("cast-mirror-rtcp".into())
             .spawn(move || {
                 let mut buffer = [0_u8; 2048];
                 while !thread_stop.load(Ordering::SeqCst) {
@@ -3067,7 +3067,7 @@ impl EncoderWorker {
         });
         let thread_queue = Arc::clone(&queue);
         let thread = thread::Builder::new()
-            .name("caster-mirror-encoder".into())
+            .name("cast-mirror-encoder".into())
             .spawn(move || {
                 loop {
                     let frame = {
@@ -3184,7 +3184,7 @@ impl SyntheticFrameSource {
         let stop_signal = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop_signal);
         let thread = thread::Builder::new()
-            .name("caster-synthetic-frames".into())
+            .name("cast-synthetic-frames".into())
             .spawn(move || {
                 let (recycle_sender, recycle_receiver) = mpsc::channel();
                 let started = Instant::now();

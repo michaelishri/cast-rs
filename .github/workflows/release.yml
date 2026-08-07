@@ -41,9 +41,9 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive_root="caster-${version}-macos-${{ matrix.arch }}"
+          archive_root="cast-${version}-macos-${{ matrix.arch }}"
           mkdir -p "package/$archive_root" dist
-          cp target/release/caster "package/$archive_root/"
+          cp target/release/cast "package/$archive_root/"
           cp docs/USER_GUIDE.md "package/$archive_root/"
           cp README.md "package/$archive_root/"
           tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
