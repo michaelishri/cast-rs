@@ -54,7 +54,7 @@ archives include these libraries, so end users do not need FFmpeg or Homebrew in
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `cast --version`. Releases use matching annotated Git tags: package version `0.5.0` is released as `v0.5.0`.
+`Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `cast --version`. Releases use matching annotated Git tags: package version `0.6.0` is released as `v0.6.0`.
 
 Follow the [release checklist](docs/RELEASE_CHECKLIST.md) for the complete, handoff-ready process:
 version bump and validation, annotated tagging, GitHub release verification, Homebrew formula update,
