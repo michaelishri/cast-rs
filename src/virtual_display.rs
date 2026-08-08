@@ -19,13 +19,19 @@ unsafe extern "C" {
         error_buffer: *mut c_char,
         error_buffer_length: usize,
     ) -> u32;
-    fn cast_virtual_display_destroy();
+    fn cast_virtual_display_destroy(
+        companion_display_id: *mut u32,
+        error_buffer: *mut c_char,
+        error_buffer_length: usize,
+    ) -> bool;
     fn cast_virtual_display_is_online(display_id: u32) -> bool;
 }
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHAREABLE_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
+// Teardown may spend up to five seconds registering the companion display and
+// another five waiting for WindowServer to remove the pair.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub struct VirtualDisplaySession {
     display_id: u32,
@@ -203,6 +209,9 @@ impl VirtualDisplaySession {
         if self.stopped {
             return Ok(());
         }
+        // Closing the lifetime pipe commits this session to shutdown. Mark it
+        // before doing fallible work so Drop cannot repeat a timed-out teardown.
+        self.stopped = true;
         if announce {
             println!("Removing temporary extended display {}...", self.display_id);
         }
@@ -228,18 +237,27 @@ impl VirtualDisplaySession {
             }
             thread::sleep(Duration::from_millis(50));
         };
+        log::debug!(
+            "virtual display helper for display {} exited with {status} after {:.1} ms",
+            self.display_id,
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
 
         let offline_started = Instant::now();
         while native_is_online(self.display_id) {
             if offline_started.elapsed() >= SHAREABLE_TIMEOUT {
                 bail!(
-                    "temporary virtual display {} is still online after its helper stopped",
-                    self.display_id
+                    "temporary virtual display {} is still online after its helper stopped with {status}",
+                    self.display_id,
                 );
             }
             thread::sleep(Duration::from_millis(100));
         }
-        self.stopped = true;
+        log::debug!(
+            "temporary virtual display {} went offline {:.1} ms after its helper stopped",
+            self.display_id,
+            offline_started.elapsed().as_secs_f64() * 1_000.0
+        );
         if !status.success() {
             log::warn!(
                 "virtual display helper exited with {status}, but display {} is offline",
@@ -281,7 +299,7 @@ pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
         bail!(message);
     }
 
-    let guard = NativeDisplayGuard;
+    let guard = NativeDisplayGuard { armed: true };
     println!("READY {display_id}");
     io::stdout()
         .flush()
@@ -303,10 +321,17 @@ pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
         Ok(())
     })();
 
-    drop(guard);
+    let companion_display_id = guard
+        .release()
+        .context("could not apply the virtual display teardown workaround")?;
     let started = Instant::now();
-    while native_is_online(display_id) {
+    while display_pair_is_online(display_id, companion_display_id, native_is_online) {
         if started.elapsed() >= SHAREABLE_TIMEOUT {
+            if companion_display_id != 0 && native_is_online(companion_display_id) {
+                bail!(
+                    "virtual display {display_id} or its teardown companion {companion_display_id} remained online after release"
+                );
+            }
             bail!("virtual display {display_id} remained online after release");
         }
         thread::sleep(Duration::from_millis(100));
@@ -314,11 +339,30 @@ pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
     read_result
 }
 
-struct NativeDisplayGuard;
+fn display_pair_is_online(
+    display_id: u32,
+    companion_display_id: u32,
+    mut is_online: impl FnMut(u32) -> bool,
+) -> bool {
+    is_online(display_id) || (companion_display_id != 0 && is_online(companion_display_id))
+}
+
+struct NativeDisplayGuard {
+    armed: bool,
+}
+
+impl NativeDisplayGuard {
+    fn release(mut self) -> Result<u32> {
+        self.armed = false;
+        native_destroy()
+    }
+}
 
 impl Drop for NativeDisplayGuard {
     fn drop(&mut self) {
-        native_destroy();
+        if self.armed {
+            let _ = native_destroy();
+        }
     }
 }
 
@@ -377,14 +421,36 @@ fn native_create(_width: u32, _height: u32, _fps: u32, error_buffer: &mut [c_cha
 }
 
 #[cfg(target_os = "macos")]
-fn native_destroy() {
-    // SAFETY: the helper owns at most one display and the native function is
-    // deliberately idempotent.
-    unsafe { cast_virtual_display_destroy() }
+fn native_destroy() -> Result<u32> {
+    let mut companion_display_id = 0;
+    let mut error_buffer = [0 as c_char; 512];
+    // SAFETY: the helper owns at most one Cast display. Both output pointers
+    // remain valid and writable for the duration of this idempotent call.
+    let destroyed = unsafe {
+        cast_virtual_display_destroy(
+            &mut companion_display_id,
+            error_buffer.as_mut_ptr(),
+            error_buffer.len(),
+        )
+    };
+    if !destroyed {
+        let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let message = if message.is_empty() {
+            "macOS did not release the temporary virtual display".to_owned()
+        } else {
+            single_line(&message)
+        };
+        bail!(message);
+    }
+    Ok(companion_display_id)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_destroy() {}
+fn native_destroy() -> Result<u32> {
+    Ok(0)
+}
 
 #[cfg(target_os = "macos")]
 fn native_is_online(display_id: u32) -> bool {
@@ -399,7 +465,7 @@ fn native_is_online(_display_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_startup_message, single_line};
+    use super::{display_pair_is_online, parse_startup_message, single_line};
 
     #[test]
     fn parses_ready_message() {
@@ -424,5 +490,16 @@ mod tests {
     #[test]
     fn helper_protocol_messages_stay_on_one_line() {
         assert_eq!(single_line("one\ntwo\rthree"), "one two three");
+    }
+
+    #[test]
+    fn teardown_waits_for_both_virtual_displays() {
+        assert!(display_pair_is_online(41, 42, |id| id == 41));
+        assert!(display_pair_is_online(41, 42, |id| id == 42));
+        assert!(!display_pair_is_online(41, 42, |_| false));
+        assert!(!display_pair_is_online(41, 0, |id| {
+            assert_ne!(id, 0);
+            false
+        }));
     }
 }
