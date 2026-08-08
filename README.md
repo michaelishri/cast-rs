@@ -1,6 +1,6 @@
 # cast
 
-An early, all-Rust macOS CLI for casting local video and a desktop to Google Cast devices.
+An early Rust macOS CLI for casting local video and a desktop to Google Cast devices.
 
 End users should start with the bundled [Cast user guide](docs/USER_GUIDE.md). This README also documents the implementation and release process for contributors.
 
@@ -8,7 +8,7 @@ The CLI currently supports these Cast paths:
 
 - discover Cast devices with mDNS;
 - control Google Cast receivers with `rust-cast`;
-- serve compatible local MP4 and WebM files with seeking and bounded memory use;
+- inspect, remux, or transcode local media through linked FFmpeg libraries;
 - capture a macOS display with ScreenCaptureKit and hardware-encode it with VideoToolbox;
 - send encrypted H.264 over Cast Streaming RTP with receiver feedback and retransmission;
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
@@ -19,14 +19,21 @@ The CLI currently supports these Cast paths:
 - macOS 13 or newer;
 - Rust 1.85 or newer (edition 2024);
 - Xcode (the native capture bindings use Apple's Swift runtime);
+- `pkg-config`, plus either FFmpeg 8 development libraries or the bundled-library build helper;
 - Mac and Chromecast on the same network;
 - Screen Recording permission for your terminal when using capture commands.
 
 ## Build
 
 ```sh
-cargo build --release
+brew install nasm pkg-config
+./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+PKG_CONFIG_PATH="$PWD/.build/ffmpeg-dist/lib/pkgconfig" \
+  cargo build --release
 ```
+
+The helper builds pinned FFmpeg 8.0.1 shared libraries without its command-line programs. Release
+archives include these libraries, so end users do not need FFmpeg or Homebrew installed.
 
 ## Releases
 
@@ -97,7 +104,7 @@ cargo run -- desktop \
 # Prove capture + hardware H.264 encoding for ten seconds
 cargo run -- capture --display 1 --seconds 10 --output capture.avcc
 
-# Play a compatible local video file through the Default Media Receiver
+# Play a local video, automatically converting it when necessary
 cargo run --release -- video \
   --host 192.168.1.50 \
   ~/Movies/example.mp4
@@ -132,11 +139,17 @@ and can read MP4 metadata stored near the end of a large file. File data is read
 in fixed-size chunks rather than loaded into memory. The listener binds only to the LAN interface
 used to reach the selected receiver and uses an automatic free port unless `--http-port` is set.
 
-Direct playback preserves the original video and audio without transcoding. Cast recognizes MP4
-and WebM containers, but actual codec, profile, resolution, frame-rate, audio, and HDR support varies
-by receiver model. H.264 with AAC in MP4 is the most broadly compatible starting point. Use
-`--content-type` only to experiment with another format that the receiver supports; Cast does not
-yet remux or transcode incompatible files.
+Cast inspects the selected container and its best video and audio streams through linked FFmpeg
+libraries. Conservative H.264/AAC MP4 and VP8/VP9 WebM inputs are served directly. Compatible
+H.264/AAC streams in another container are remuxed losslessly. Other decodable inputs are converted
+to an at-most-1080p H.264 Main/AAC stereo MP4 using VideoToolbox for video encoding. Preparation is
+completed before playback so the existing byte-range server retains reliable seeking and
+`--start-at` behavior.
+
+Use `--transcode never` to reject anything outside the direct-play set, or `--transcode always` to
+normalize even directly playable input. `--content-type` remains an expert direct-play override and
+bypasses automatic preparation unless `--transcode always` is also supplied. DRM-protected or
+corrupt inputs cannot be converted.
 
 ## How live casting works
 
@@ -152,8 +165,8 @@ The mirroring capture callback never waits for VideoToolbox or the network. It p
 
 The media playlist advertises a short four-second live window for latency, while the HTTP server retains a longer back buffer so delayed receiver requests do not fail as segments roll out of the manifest.
 
-The current desktop stream is video-only. Desktop audio is not included yet; compatible audio
-already present in a file passed to `video` is sent unchanged. The low-latency transport is an
+The current desktop stream is video-only. Desktop audio is not included yet; audio already present
+in a file passed to `video` is either sent unchanged or converted to AAC. The low-latency transport is an
 early implementation of Google's documented Cast Streaming protocol and has so far been exercised
 against a Nest Hub-class receiver. Use `--transport hls` if another receiver rejects the mirroring
 offer.

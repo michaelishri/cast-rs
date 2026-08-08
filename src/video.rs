@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     net::SocketAddr,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,13 +16,13 @@ use crate::{
         BufferedMediaSession, MediaFailure, MediaFailureKind, MediaSessionEvent, PlaybackEnd,
         PlaybackState,
     },
+    media::{self, CompatibilityMode, PreparationPlan},
     media_server::MediaFileServer,
     network::{local_ip_for, private_route},
 };
 
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MEDIA_PROBE_BYTES: usize = 4096;
 
 pub struct VideoOptions {
     pub cast_host: std::net::IpAddr,
@@ -32,6 +31,7 @@ pub struct VideoOptions {
     pub file: PathBuf,
     pub start_at: f64,
     pub content_type: Option<String>,
+    pub compatibility_mode: CompatibilityMode,
 }
 
 pub fn cast_video(options: VideoOptions) -> Result<()> {
@@ -40,9 +40,9 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         .file
         .canonicalize()
         .with_context(|| format!("could not resolve local video {}", options.file.display()))?;
-    let file = File::open(&path)
+    let source_file = File::open(&path)
         .with_context(|| format!("could not open local video {}", path.display()))?;
-    let metadata = file
+    let metadata = source_file
         .metadata()
         .with_context(|| format!("could not inspect local video {}", path.display()))?;
     if !metadata.is_file() {
@@ -51,9 +51,99 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
     if metadata.len() == 0 {
         bail!("local video file is empty: {}", path.display());
     }
-    let content_type = match options.content_type {
-        Some(content_type) => content_type,
-        None => detect_content_type(&file, &path, metadata.len())?,
+    drop(source_file);
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
+        .context("could not install Ctrl-C handler")?;
+
+    let (info, plan) = if let Some(content_type) = options.content_type.as_deref()
+        && options.compatibility_mode != CompatibilityMode::Always
+    {
+        (
+            None,
+            PreparationPlan::Direct {
+                content_type: content_type.to_owned(),
+            },
+        )
+    } else {
+        let info = media::inspect(&path)?;
+        if let Some(duration) = info.duration
+            && options.start_at > duration
+        {
+            bail!(
+                "--start-at {:.1}s is beyond the media duration of {:.1}s",
+                options.start_at,
+                duration
+            );
+        }
+        let plan = media::plan(&info, options.compatibility_mode)?;
+        (Some(info), plan)
+    };
+    if let Some(info) = &info {
+        println!(
+            "Input: {} video {}x{}{}{} in {}{}.",
+            info.video.codec_name,
+            info.video.width,
+            info.video.height,
+            info.video
+                .frame_rate
+                .map(|fps| format!(" at {fps:.2} fps"))
+                .unwrap_or_default(),
+            info.audio
+                .as_ref()
+                .map(|audio| format!(
+                    ", {} {} Hz {}-channel audio",
+                    audio.codec_name, audio.sample_rate, audio.channels
+                ))
+                .unwrap_or_else(|| ", no audio".to_owned()),
+            info.container,
+            info.duration
+                .map(|duration| format!(", {duration:.1}s"))
+                .unwrap_or_default(),
+        );
+    }
+    println!("Compatibility plan: {}.", plan.description());
+
+    let mut temporary = None;
+    let (file, content_type, served_size) = match plan {
+        PreparationPlan::Direct { content_type } => (
+            File::open(&path)
+                .with_context(|| format!("could not reopen local video {}", path.display()))?,
+            options.content_type.unwrap_or(content_type),
+            metadata.len(),
+        ),
+        PreparationPlan::Remux { .. } => {
+            let info = info
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing media information for remux"))?;
+            let (directory, output_path) = media::temporary_mp4_path()?;
+            println!("Remuxing compatible streams into MP4...");
+            if let Err(error) = media::remux_to_mp4(&path, &output_path, info, &interrupted) {
+                if interrupted.load(Ordering::SeqCst) {
+                    return Err(error);
+                }
+                println!("Lossless remux was not safe ({error}); transcoding instead...");
+                transcode_with_progress(&path, &output_path, info, &interrupted)?;
+            }
+            let file = File::open(&output_path).context("could not open the prepared MP4")?;
+            let size = file.metadata()?.len();
+            temporary = Some(directory);
+            (file, "video/mp4".to_owned(), size)
+        }
+        PreparationPlan::Transcode { .. } => {
+            let info = info
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing media information for transcode"))?;
+            let (directory, output_path) = media::temporary_mp4_path()?;
+            println!("Transcoding to receiver-compatible H.264/AAC MP4...");
+            transcode_with_progress(&path, &output_path, info, &interrupted)?;
+            let file = File::open(&output_path).context("could not open the transcoded MP4")?;
+            let size = file.metadata()?.len();
+            temporary = Some(directory);
+            (file, "video/mp4".to_owned(), size)
+        }
     };
 
     let lan_ip = local_ip_for(options.cast_host, options.cast_port)?;
@@ -69,14 +159,9 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         "Preparing {} ({}, {}).",
         path.display(),
         content_type,
-        human_bytes(metadata.len())
+        human_bytes(served_size)
     );
     println!("Serving the selected video at {url}");
-
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&interrupted);
-    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
-        .context("could not install Ctrl-C handler")?;
 
     let mut session = BufferedMediaSession::start(
         options.cast_host,
@@ -87,6 +172,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
     )?;
     let playback = monitor_playback(&session, &server, &interrupted);
     let stop = session.stop();
+    drop(temporary);
     let stats = server.stats();
     println!(
         "Stopped. Served {} requests ({} ranges) and {}.",
@@ -104,6 +190,22 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn transcode_with_progress(
+    input: &Path,
+    output: &Path,
+    info: &media::MediaInfo,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    let mut last_printed = -5_i32;
+    media::transcode_to_mp4(input, output, info, interrupted, |percent| {
+        let whole = percent.floor() as i32;
+        if whole >= last_printed + 5 || whole == 100 {
+            println!("Transcoding: {whole}%");
+            last_printed = whole;
+        }
+    })
 }
 
 fn monitor_playback(
@@ -213,74 +315,6 @@ fn validate_start_at(start_at: f64) -> Result<()> {
     Ok(())
 }
 
-fn detect_content_type(file: &File, path: &Path, length: u64) -> Result<String> {
-    let probe_length = usize::try_from(length.min(MEDIA_PROBE_BYTES as u64)).unwrap();
-    let mut probe = vec![0_u8; probe_length];
-    let mut offset = 0;
-    while offset < probe.len() {
-        let size = file.read_at(&mut probe[offset..], offset as u64)?;
-        if size == 0 {
-            break;
-        }
-        offset += size;
-    }
-    probe.truncate(offset);
-
-    if is_mp4(&probe) {
-        return Ok("video/mp4".to_owned());
-    }
-    if is_webm(&probe) {
-        return Ok("video/webm".to_owned());
-    }
-
-    bail!(
-        "could not identify {} as MP4 or WebM; use --content-type to try an experimental receiver-supported format",
-        path.display()
-    )
-}
-
-fn is_mp4(probe: &[u8]) -> bool {
-    if probe.len() < 16 || &probe[4..8] != b"ftyp" {
-        return false;
-    }
-    let box_length = u32::from_be_bytes(probe[0..4].try_into().unwrap()) as usize;
-    if box_length < 16 {
-        return false;
-    }
-    let end = box_length.min(probe.len());
-    is_mp4_brand(&probe[8..12]) || probe[16..end].chunks_exact(4).any(is_mp4_brand)
-}
-
-fn is_mp4_brand(brand: &[u8]) -> bool {
-    matches!(
-        brand,
-        b"isom"
-            | b"iso2"
-            | b"iso3"
-            | b"iso4"
-            | b"iso5"
-            | b"iso6"
-            | b"iso8"
-            | b"iso9"
-            | b"mp41"
-            | b"mp42"
-            | b"mp71"
-            | b"avc1"
-            | b"M4V "
-            | b"M4VH"
-            | b"F4V "
-            | b"dash"
-            | b"cmfc"
-            | b"cmfs"
-            | b"MSNV"
-    )
-}
-
-fn is_webm(probe: &[u8]) -> bool {
-    probe.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
-        && probe.windows(7).any(|window| window == b"\x42\x82\x84webm")
-}
-
 fn human_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -299,37 +333,7 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use tempfile::NamedTempFile;
-
     use super::*;
-
-    fn detected_type(data: &[u8], suffix: &str) -> Result<String> {
-        let mut file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
-        file.write_all(data).unwrap();
-        file.flush().unwrap();
-        let opened = File::open(file.path()).unwrap();
-        detect_content_type(&opened, file.path(), data.len() as u64)
-    }
-
-    #[test]
-    fn identifies_iso_bmff_as_mp4_without_trusting_extension() {
-        let data = b"\0\0\0\x18ftypisom\0\0\0\0isomiso2";
-        assert_eq!(detected_type(data, ".wrong").unwrap(), "video/mp4");
-    }
-
-    #[test]
-    fn identifies_webm_ebml_doctype() {
-        let data = b"\x1a\x45\xdf\xa3\x9f\x42\x82\x84webm";
-        assert_eq!(detected_type(data, ".webm").unwrap(), "video/webm");
-    }
-
-    #[test]
-    fn rejects_unknown_and_matroska_files() {
-        assert!(detected_type(b"not a media file", ".mp4").is_err());
-        assert!(detected_type(b"\x1a\x45\xdf\xa3\x9f\x42\x82\x88matroska", ".mkv").is_err());
-    }
 
     #[test]
     fn validates_start_position() {
@@ -346,25 +350,5 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.00 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
-    }
-
-    #[test]
-    fn detection_reads_from_a_stable_open_file() {
-        let mut temporary = NamedTempFile::new().unwrap();
-        temporary.write_all(b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
-        temporary.flush().unwrap();
-        let file = File::open(temporary.path()).unwrap();
-        let length = file.metadata().unwrap().len();
-        std::fs::remove_file(temporary.path()).unwrap();
-        assert_eq!(
-            detect_content_type(&file, Path::new("removed.mp4"), length).unwrap(),
-            "video/mp4"
-        );
-    }
-
-    #[test]
-    fn does_not_misidentify_quicktime_or_image_brands_as_mp4_video() {
-        assert!(detected_type(b"\0\0\0\x14ftypqt  \0\0\0\0qt  ", ".mov").is_err());
-        assert!(detected_type(b"\0\0\0\x18ftypavif\0\0\0\0avifmif1", ".avif").is_err());
     }
 }

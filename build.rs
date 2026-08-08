@@ -5,5 +5,7 @@ fn main() {
         // Swift-built ScreenCaptureKit bindings reference @rpath libraries.
         // Modern macOS supplies these through the dyld shared cache here.
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+        // Release archives place the linked FFmpeg libraries next to the executable.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
     }
 }

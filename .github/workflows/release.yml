@@ -34,6 +34,20 @@ jobs:
       - name: Use stable Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          brew install nasm pkg-config
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --locked --release
 
@@ -44,8 +58,12 @@ jobs:
           archive_root="cast-${version}-macos-${{ matrix.arch }}"
           mkdir -p "package/$archive_root" dist
           cp target/release/cast "package/$archive_root/"
+          mkdir -p "package/$archive_root/lib"
+          cp -R .build/ffmpeg-dist/lib/*.dylib "package/$archive_root/lib/"
           cp docs/USER_GUIDE.md "package/$archive_root/"
           cp README.md "package/$archive_root/"
+          cp THIRD_PARTY_NOTICES.md "package/$archive_root/"
+          cp .build/ffmpeg-8.0.1/COPYING.LGPLv2.1 "package/$archive_root/FFMPEG-LICENSE-LGPL-2.1.txt"
           tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
           (
             cd dist

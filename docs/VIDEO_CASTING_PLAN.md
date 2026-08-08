@@ -268,21 +268,21 @@ physical receiver without loading the complete file into Cast’s memory.
 
 Exit criterion: an incompatible file fails with guidance rather than a false “accepted” success.
 
-### 6. Follow-up compatibility pipeline
+### 6. Compatibility pipeline
 
-After direct playback is reliable, design a separate `--transcode auto|never|always` milestone:
+Implemented as a separate `--transcode auto|never|always` milestone:
 
 1. inspect container, video, and audio tracks;
 2. direct-serve compatible files;
 3. remux compatible elementary streams when only the container is unsuitable;
 4. decode and hardware-transcode incompatible video through VideoToolbox;
 5. encode incompatible audio as AAC through a macOS hardware/native path where available;
-6. package the output as buffered fMP4 HLS using the existing HLS foundation.
+6. write a complete fast-start MP4 before playback so seeking and range serving remain reliable.
 
-This remains all-Rust application code and should use VideoToolbox where possible. It is explicitly
-outside the first milestone because reliable demuxing, timestamps, audio, seeking, and cancellation
-are each larger than the local HTTP/Cast work. The first five slices are useful regardless of which
-demuxer or codec libraries are selected later.
+The pipeline links pinned FFmpeg libraries directly for probing, demuxing, decoding, scaling,
+resampling, and muxing; it does not launch FFmpeg command-line programs. H.264 output uses
+VideoToolbox. Incremental buffered fMP4 HLS remains a future optimization for starting playback
+before a long transcode completes.
 
 ## Test matrix
 
