@@ -2,11 +2,13 @@ mod capture;
 mod cast;
 mod discovery;
 mod live;
+mod media;
 mod media_server;
 mod mirror;
 mod network;
 mod synthetic;
 mod video;
+mod vod_hls;
 
 use std::{net::IpAddr, path::PathBuf, thread, time::Duration};
 
@@ -57,9 +59,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         monitor_seconds: u64,
     },
-    /// Play a compatible local video file on a Google Cast device.
+    /// Play a local video, converting it when needed for Cast compatibility.
     Video {
-        /// Local MP4 or WebM file to play.
+        /// Local video file to play.
         file: PathBuf,
         /// Chromecast IP address (shown by `cast devices`).
         #[arg(long)]
@@ -73,9 +75,15 @@ enum Command {
         /// Initial playback position in seconds.
         #[arg(long, default_value_t = 0.0)]
         start_at: f64,
-        /// Override automatic MP4/WebM MIME detection.
+        /// Expert MIME override; bypasses auto preparation unless transcoding is forced.
         #[arg(long)]
         content_type: Option<String>,
+        /// Convert incompatible containers/codecs using linked media libraries.
+        #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
+        transcode: TranscodeMode,
+        /// Deliver transcoded media as it is prepared or after a complete MP4 is ready.
+        #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
+        transcode_delivery: TranscodeDeliveryMode,
     },
     /// Capture and hardware-encode a short H.264/AVCC diagnostic sample.
     Capture {
@@ -200,6 +208,19 @@ enum DesktopTransport {
     Hls,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TranscodeMode {
+    Auto,
+    Never,
+    Always,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TranscodeDeliveryMode {
+    Complete,
+    Incremental,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -256,6 +277,8 @@ fn main() -> Result<()> {
             http_port,
             start_at,
             content_type,
+            transcode,
+            transcode_delivery,
         } => video::cast_video(video::VideoOptions {
             cast_host: host,
             cast_port,
@@ -263,6 +286,15 @@ fn main() -> Result<()> {
             file,
             start_at,
             content_type,
+            compatibility_mode: match transcode {
+                TranscodeMode::Auto => media::CompatibilityMode::Auto,
+                TranscodeMode::Never => media::CompatibilityMode::Never,
+                TranscodeMode::Always => media::CompatibilityMode::Always,
+            },
+            transcode_delivery: match transcode_delivery {
+                TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
+                TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
+            },
         })?,
         Command::Capture {
             display,

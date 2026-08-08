@@ -79,7 +79,7 @@ Cast uses its low-latency mirroring transport by default. The first connection c
 
 ## Cast a local video
 
-Play a local MP4 or WebM file by passing its path and the receiver address:
+Play a local video by passing its path and the receiver address:
 
 ```sh
 cast video \
@@ -100,9 +100,34 @@ cast video \
   ~/Movies/example.mp4
 ```
 
-Cast serves the original file without changing its quality. H.264 video with AAC audio in an MP4
-container is the most broadly compatible choice. WebM and newer codecs depend on the exact receiver
-model. Cast does not yet convert incompatible video files.
+Cast first inspects the container, video, and audio. Conservative H.264/AAC MP4 and VP8/VP9 WebM
+files are served unchanged. H.264/AAC in another container is remuxed without quality loss. Other
+decodable codecs are converted to an at-most-1080p H.264/AAC MP4 using the Mac's VideoToolbox
+encoder. Compatible tracks are copied when only video or audio needs conversion, so an H.264 movie
+with E-AC-3 audio keeps its original video and converts only the audio to AAC. Cast normally starts
+after the first fragmented-MP4 segment is ready and keeps converting in the background while the
+receiver plays. For `--start-at`, it first prepares enough segments to cover the requested position.
+Progress is printed in the terminal and `Ctrl-C` cancels preparation.
+Background conversion stays at most about two minutes ahead of the receiver. It pauses when that
+lookahead is full—including while receiver playback is paused—and resumes as playback advances or
+seeks forward. Already prepared segments remain available for backward seeking until Cast exits,
+when the temporary media directory is removed.
+
+To reject media that would require preparation, or to normalize every input, use:
+
+```sh
+./cast video --host 192.168.1.50 --transcode never movie.mp4
+./cast video --host 192.168.1.50 --transcode always movie.mkv
+```
+
+If a receiver rejects incremental fragmented-MP4 HLS, use the full-file compatibility path:
+
+```sh
+./cast video --host 192.168.1.50 --transcode-delivery complete movie.mkv
+```
+
+DRM-protected and corrupt files cannot be converted. Only the best video stream and best audio
+stream are selected; embedded subtitles and alternate audio tracks are not included yet.
 
 The local server normally selects an available port automatically. If a firewall rule requires a
 fixed port, set one explicitly:
@@ -191,8 +216,9 @@ cast desktop --host 192.168.1.50 --transport hls
 
 If Cast says the receiver never requested the video, allow incoming connections through the
 macOS firewall and confirm that guest/client isolation is disabled. If the receiver requested the
-file but rejected or could not decode it, try an H.264/AAC MP4. MP4 or WebM describes the container;
-the codecs inside it must also be supported by that receiver model.
+file but rejected or could not decode a prepared H.264/AAC MP4, run with `-v` and report the receiver
+model and error. Use `--transcode always` to normalize a file that was initially selected for direct
+playback.
 
 **Seeking in a local video fails**
 

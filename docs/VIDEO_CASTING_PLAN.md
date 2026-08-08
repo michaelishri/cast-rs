@@ -1,8 +1,8 @@
 # Local video casting plan
 
-- Status: implemented; physical receiver validation pending
+- Status: implementation slices complete; incremental track-selective delivery validated on a physical receiver
 - Target release: `v0.3.0`
-- Planning branch: `codex/video-casting`
+- Implementation branch: `codex/video-codecs`
 
 ## Scope assumption
 
@@ -268,21 +268,68 @@ physical receiver without loading the complete file into Cast’s memory.
 
 Exit criterion: an incompatible file fails with guidance rather than a false “accepted” success.
 
-### 6. Follow-up compatibility pipeline
+### 6. Compatibility pipeline
 
-After direct playback is reliable, design a separate `--transcode auto|never|always` milestone:
+Implemented as a separate `--transcode auto|never|always` milestone:
 
 1. inspect container, video, and audio tracks;
 2. direct-serve compatible files;
 3. remux compatible elementary streams when only the container is unsuitable;
 4. decode and hardware-transcode incompatible video through VideoToolbox;
 5. encode incompatible audio as AAC through a macOS hardware/native path where available;
-6. package the output as buffered fMP4 HLS using the existing HLS foundation.
+6. write a complete fast-start MP4 before playback so seeking and range serving remain reliable.
 
-This remains all-Rust application code and should use VideoToolbox where possible. It is explicitly
-outside the first milestone because reliable demuxing, timestamps, audio, seeking, and cancellation
-are each larger than the local HTTP/Cast work. The first five slices are useful regardless of which
-demuxer or codec libraries are selected later.
+The pipeline links pinned FFmpeg libraries directly for probing, demuxing, decoding, scaling,
+resampling, and muxing; it does not launch FFmpeg command-line programs. H.264 output uses
+VideoToolbox.
+
+### 7. Incremental compatibility delivery
+
+Implemented as the default transcoded-media delivery mode:
+
+1. encode closed-GOP H.264/AAC into two-second fragmented-MP4 HLS segments;
+2. atomically publish completed segments and the growing event playlist from a private directory;
+3. start buffered receiver playback after the first segment, or after enough media exists for
+   `--start-at`;
+4. continue transcoding in a cancellable background worker and surface worker failures to the CLI;
+5. finish the playlist with `EXT-X-ENDLIST`, then remove all temporary media on shutdown;
+6. retain `--transcode-delivery complete` as a receiver-compatibility fallback.
+
+This slice also terminates the Default Media Receiver after natural end-of-media instead of letting
+the control thread exit before application cleanup.
+
+### 8. Track-selective compatibility conversion
+
+Implemented after validating incremental delivery with long-form H.264/E-AC-3 media:
+
+1. classify video and audio compatibility independently;
+2. copy compatible H.264 video while converting incompatible audio to AAC;
+3. copy compatible AAC audio while converting incompatible video to H.264;
+4. reconstruct leading decode timestamps commonly omitted by Matroska H.264 with B-frames;
+5. preserve source keyframe boundaries for copied video and omit the HLS independent-segments claim;
+6. normalize tiny backward encoder timestamp jumps before fragmented-MP4 muxing.
+
+Full conversion remains available through `--transcode always`; automatic mode avoids unnecessary
+quality loss and substantially reduces CPU use when only one track is incompatible.
+
+### 9. Incremental delivery resource pacing
+
+Implemented after long-form receiver logs showed the preparation worker running much farther ahead
+than playback required:
+
+1. cap background preparation at two minutes beyond the receiver's current playback position;
+2. wake preparation as playback advances or the receiver seeks forward;
+3. hold the requested `--start-at` position as the initial pacing floor;
+4. keep preparation paused while receiver playback is paused instead of consuming CPU and temporary
+   storage as fast as possible;
+5. reduce explicit Cast media-status polling to once per second while retaining prompt stop commands
+   and unsolicited receiver status handling;
+6. carry repeated receiver positions as silent control events so pacing updates do not produce
+   repetitive terminal messages.
+
+The preparation directory still retains already-published media for backward seeking and is removed
+on shutdown. The lookahead limit bounds how quickly CPU and temporary-storage use can get ahead of
+actual playback without discarding seekable content.
 
 ## Test matrix
 
@@ -298,6 +345,8 @@ Automated tests should not require a receiver:
 - start position validation, including negative, non-finite, and beyond-duration values where the
   duration is known;
 - correct buffered `Media` and `LoadOptions` construction.
+- incremental lookahead blocking, playback-position wakeups, nonzero-start floors, and cancellation;
+- state-transition events plus silent repeated-position updates for preparation pacing.
 
 Manual receiver coverage should include:
 
@@ -324,7 +373,6 @@ Manual receiver coverage should include:
 
 ## Deferred features
 
-- automatic remuxing or transcoding;
 - local subtitles and alternate audio-track selection;
 - playlists, queues, repeat, and autoplay-next;
 - an interactive terminal controller for pause/seek/volume;
