@@ -364,13 +364,12 @@ fn parse_startup_message(line: &str) -> Result<u32> {
 }
 
 fn single_line(message: &str) -> String {
-    message.replace('\r', " ").replace('\n', " ")
+    message.replace(['\r', '\n'], " ")
 }
 
 fn terminate_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) | Err(_) => {}
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
     }
     let _ = child.kill();
     let _ = child.wait();
