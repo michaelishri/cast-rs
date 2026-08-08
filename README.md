@@ -55,7 +55,9 @@ The examples below assume a Homebrew installation. Use `./cast` instead of `cast
    cast devices
    ```
 
-   Copy the address in the `ADDRESS` column for the device you want to use.
+   Copy the address in the `ADDRESS` column for the device you want to use. The
+   `CAPABILITY` column identifies audio-only receivers and receivers that can
+   display video.
 
 2. Start mirroring:
 
