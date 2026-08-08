@@ -24,6 +24,7 @@ use videotoolbox::prelude::*;
 use crate::{
     cast,
     network::{http_url, local_ip_for, private_route},
+    virtual_display::VirtualDisplaySession,
 };
 
 const TIMESCALE: u64 = 90_000;
@@ -35,6 +36,7 @@ pub struct LiveOptions {
     pub cast_host: IpAddr,
     pub cast_port: u16,
     pub display_id: Option<u32>,
+    pub extend: bool,
     pub http_port: u16,
     pub fps: u32,
     pub width: u32,
@@ -44,9 +46,23 @@ pub struct LiveOptions {
     pub serve_only: bool,
 }
 
-pub fn cast_desktop(options: LiveOptions) -> Result<()> {
+pub fn cast_desktop(mut options: LiveOptions) -> Result<()> {
     if options.bitrate <= 0 {
         bail!("bitrate must be greater than zero");
+    }
+    if options.extend && options.display_id.is_some() {
+        bail!("--extend cannot be combined with --display");
+    }
+
+    let width = even(options.width);
+    let height = even(options.height);
+    let mut virtual_display = if options.extend {
+        Some(VirtualDisplaySession::start(width, height, options.fps)?)
+    } else {
+        None
+    };
+    if let Some(session) = virtual_display.as_ref() {
+        options.display_id = Some(session.display_id());
     }
 
     let lan_ip = local_ip_for(options.cast_host, options.cast_port)?;
@@ -88,8 +104,6 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     };
     let source_width = display.width();
     let source_height = display.height();
-    let width = even(options.width);
-    let height = even(options.height);
     log::debug!(
         "scaling source display {}x{} into H.264 output {}x{} with aspect ratio preserved",
         source_width,
@@ -167,12 +181,22 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         .start_capture()
         .context("could not start screen capture")?;
 
-    if !store.wait_until_ready(Duration::from_secs(12), STARTUP_SEGMENTS) {
-        stream.stop_capture().ok();
+    let startup_started = Instant::now();
+    loop {
+        if store.wait_until_ready(Duration::from_millis(100), STARTUP_SEGMENTS) {
+            break;
+        }
         if let Some(error) = take_failure(&failure)? {
+            stream.stop_capture().ok();
             bail!("live encoder failed: {error}");
         }
-        bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
+        if let Some(session) = virtual_display.as_mut() {
+            session.ensure_alive()?;
+        }
+        if startup_started.elapsed() >= Duration::from_secs(12) {
+            stream.stop_capture().ok();
+            bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
+        }
     }
 
     let url = http_url(
@@ -203,12 +227,23 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         if let Some(error) = take_failure(&failure)? {
             bail!("live encoder failed: {error}");
         }
+        if let Some(session) = virtual_display.as_mut() {
+            session.ensure_alive()?;
+        }
         thread::sleep(Duration::from_millis(100));
     }
 
     stream
         .stop_capture()
         .context("could not stop screen capture")?;
+    // SCStream retains its content filter after capture stops. Release the
+    // complete capture graph before removing a virtual source display.
+    drop(stream);
+    drop(filter);
+    drop(config);
+    drop(displays);
+    drop(content);
+    log::debug!("released desktop capture resources before display teardown");
     stop.store(true, Ordering::SeqCst);
     drop(server);
     let stats = store.stats();
@@ -216,6 +251,9 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         "Stopped. Served {} playlists, {} init segments, and {} media segments.",
         stats.playlists, stats.init_segments, stats.media_segments
     );
+    if let Some(session) = virtual_display.as_mut() {
+        session.stop()?;
+    }
     Ok(())
 }
 

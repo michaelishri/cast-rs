@@ -36,6 +36,7 @@ use crate::synthetic::{
     SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticFrameGenerator, SyntheticPhase,
     phase_for_frame,
 };
+use crate::virtual_display::VirtualDisplaySession;
 
 const CAST_STREAMING_APP_ID: &str = "0F5096E8";
 const CAST_STREAMING_NAMESPACE: &str = "urn:x-cast:com.google.cast.webrtc";
@@ -62,6 +63,7 @@ pub struct MirrorOptions {
     pub cast_host: IpAddr,
     pub cast_port: u16,
     pub display_id: Option<u32>,
+    pub extend: bool,
     pub fps: u32,
     pub width: u32,
     pub height: u32,
@@ -229,6 +231,9 @@ fn auto_tune_profile(base: MirrorOptions, interrupted: &AtomicBool) -> Result<()
     }
     if base.display_id.is_some() {
         bail!("--display cannot be combined with --synthetic or --auto-tune");
+    }
+    if base.extend {
+        bail!("--extend cannot be combined with --synthetic or --auto-tune");
     }
     if base.max_frame_age.is_some() || !base.adaptive_bitrate || !base.prioritize_encoding_speed {
         bail!(
@@ -505,6 +510,12 @@ fn run_desktop(
     if options.synthetic && options.display_id.is_some() {
         bail!("--display cannot be combined with --synthetic");
     }
+    if options.extend && options.display_id.is_some() {
+        bail!("--extend cannot be combined with --display");
+    }
+    if options.extend && options.synthetic {
+        bail!("--extend cannot be combined with --synthetic");
+    }
 
     let width = even(options.width);
     let height = even(options.height);
@@ -517,6 +528,14 @@ fn run_desktop(
         height,
         options.fps
     );
+    let mut virtual_display = if options.extend {
+        Some(VirtualDisplaySession::start(width, height, options.fps)?)
+    } else {
+        None
+    };
+    if let Some(session) = virtual_display.as_ref() {
+        options.display_id = Some(session.display_id());
+    }
     let negotiation = negotiate_cast_streaming(
         options.cast_host,
         options.cast_port,
@@ -624,7 +643,7 @@ fn run_desktop(
     } else {
         log::debug!("latest-frame-wins queue enabled without a raw-frame deadline");
     }
-    let mut input = if options.synthetic {
+    let input = if options.synthetic {
         println!(
             "Profiling {SYNTHETIC_WORKLOAD_NAME} deterministic 420v frames at {}x{}, {} fps, probe delay {} ms...",
             width,
@@ -750,6 +769,9 @@ fn run_desktop(
         if let Some(error) = take_failure(&negotiation.control.failure)? {
             bail!("Cast Streaming control connection failed: {error}");
         }
+        if let Some(session) = virtual_display.as_mut() {
+            session.ensure_alive()?;
+        }
         if let Some(graph) = graph.as_mut() {
             graph.draw_if_due(&stats, started.elapsed())?;
         }
@@ -761,7 +783,11 @@ fn run_desktop(
     }
     let sampled_for = started.elapsed();
 
-    input.stop()?;
+    input.stop_and_release()?;
+    // Stopping an SCStream does not release the stream or its content filter.
+    // Drop the capture graph before removing a virtual source display so
+    // ScreenCaptureKit cannot keep that display registered with WindowServer.
+    log::debug!("released desktop capture resources before display teardown");
     drop(feedback);
     negotiation
         .control
@@ -787,6 +813,9 @@ fn run_desktop(
             Some(result)
         }
     };
+    if let Some(session) = virtual_display.as_mut() {
+        session.stop()?;
+    }
     Ok(profile_result)
 }
 
@@ -1364,10 +1393,12 @@ fn print_profile_report(
     if !options.prioritize_encoding_speed {
         tuning_arguments.push_str(" --quality-priority");
     }
+    let source_argument = source_command_argument(options.extend, options.display_id);
     println!(
-        "\nUse: cast desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
+        "\nUse: cast desktop --host {} --cast-port {}{} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
         options.cast_host,
         options.cast_port,
+        source_argument,
         recommendations.balanced_ms,
         options.fps,
         even(options.width),
@@ -1384,6 +1415,16 @@ fn print_profile_report(
         );
     }
     Ok(())
+}
+
+fn source_command_argument(extend: bool, display_id: Option<u32>) -> String {
+    if extend {
+        " --extend".to_owned()
+    } else if let Some(display_id) = display_id {
+        format!(" --display {display_id}")
+    } else {
+        String::new()
+    }
 }
 
 fn print_synthetic_breakdown(stats: &MirrorStats, samples: &[LatencySample]) -> Result<()> {
@@ -2995,8 +3036,8 @@ enum RunningInput {
 }
 
 impl RunningInput {
-    fn stop(&mut self) -> Result<()> {
-        match self {
+    fn stop_and_release(mut self) -> Result<()> {
+        match &mut self {
             Self::Screen(stream, encoder) => {
                 let capture_result = stream
                     .stop_capture()
@@ -3803,6 +3844,7 @@ mod tests {
         answer_display_frame_rate, auto_tune_score, avcc_to_annex_b, combined_tuning_config,
         encrypt_frame, expand_frame_id_after, expand_frame_id_at_or_before, frame_pacing,
         rate_window_is_congested, recommend_latency, round_target_delay, select_tuning_winner,
+        source_command_argument,
     };
     use serde_json::json;
     use std::{net::UdpSocket, sync::Arc, time::Duration};
@@ -3819,6 +3861,13 @@ mod tests {
                 0x41,
             ]
         );
+    }
+
+    #[test]
+    fn profile_recommendation_preserves_the_capture_source() {
+        assert_eq!(source_command_argument(true, Some(42)), " --extend");
+        assert_eq!(source_command_argument(false, Some(42)), " --display 42");
+        assert_eq!(source_command_argument(false, None), "");
     }
 
     #[test]

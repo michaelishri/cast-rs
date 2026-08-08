@@ -77,6 +77,43 @@ archive, replace `cast` with `./cast`.
 
 Cast uses its low-latency mirroring transport by default. The first connection can take a few seconds while the receiver starts.
 
+## Use the receiver as a second display
+
+Create an independent desktop space instead of casting an existing display:
+
+```sh
+cast desktop --host 192.168.1.50 --extend
+```
+
+Cast creates a temporary display, places it to the right of the existing desktop, and sends that
+display to the receiver. Move a window past the right edge of the Mac's desktop to put it on the
+receiver. The display defaults to 1280x720 at 30 fps; choose another mode with `--width`, `--height`,
+and `--fps`:
+
+```sh
+cast desktop \
+  --host 192.168.1.50 \
+  --extend \
+  --width 1920 \
+  --height 1080 \
+  --fps 30
+```
+
+This mode does not install a display driver or system extension. A helper process owns the virtual
+display only while the cast is active, and Cast removes it during normal or error shutdown. The mode
+uses a private macOS API, however, so it is experimental and could stop working after a macOS
+update. Screen Recording permission is still required. `--extend` cannot be combined with
+`--display`.
+
+The temporary display works with the HLS fallback as well:
+
+```sh
+cast desktop --host 192.168.1.50 --extend --transport hls
+```
+
+Profile this exact path with `cast profile --host 192.168.1.50 --extend`. Synthetic profiling and
+`--auto-tune` do not use a display and therefore cannot be combined with `--extend`.
+
 ## Cast a local video
 
 Play a local video by passing its path and the receiver address:
@@ -208,6 +245,13 @@ Confirm that both devices are on the same LAN, disable guest/client isolation, a
 **macOS asks for permission or the display is blank**
 
 Grant Screen Recording permission to the terminal app. Quit and reopen Terminal after changing the permission if macOS does not apply it immediately.
+
+**The temporary second display cannot be created**
+
+The `--extend` switch relies on a private macOS API that is detected at runtime. If Cast reports
+that `CGVirtualDisplay` is unavailable, use an existing display without `--extend`. If creation
+succeeds but capture does not, re-check Screen Recording permission and restart the terminal after
+granting it.
 
 **The receiver connects but playback stutters**
 
