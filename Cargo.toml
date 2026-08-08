@@ -2,7 +2,7 @@
 name = "cast"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Cast local video and a macOS desktop to Google Cast devices"
 license = "MIT"
 homepage = "https://github.com/michaelishri/cast-rs"
@@ -21,12 +21,15 @@ getrandom = "0.4"
 log = "0.4"
 mdns-sd = "0.20"
 muxide = "0.2.5"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 rust_cast = { path = "vendor/rust-cast" }
-screencapturekit = { version = "8.0", features = ["macos_13_0"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-videotoolbox = { version = "0.18", features = ["compression"] }
 tempfile = "3.20"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "8.0", features = ["macos_13_0"] }
+videotoolbox = { version = "0.18", features = ["compression"] }
 
 [dev-dependencies]
 

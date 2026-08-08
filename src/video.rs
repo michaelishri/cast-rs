@@ -518,6 +518,7 @@ fn monitor_playback(
                     print_plain_status(status, &mut plain_state, &mut plain_started);
                 }
             }
+            Ok(MediaSessionEvent::ReceiverVolume(_)) => {}
             Ok(MediaSessionEvent::ControlError { control, detail }) => {
                 let message = format!("{}: {detail}", control_label(control));
                 if terminal.is_some() {
@@ -911,6 +912,8 @@ fn control_label(control: MediaControl) -> &'static str {
     match control {
         MediaControl::PlayPause => "Play/pause failed",
         MediaControl::Seek => "Seek failed",
+        MediaControl::Volume => "Volume failed",
+        MediaControl::Mute => "Mute failed",
     }
 }
 
