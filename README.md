@@ -142,10 +142,12 @@ used to reach the selected receiver and uses an automatic free port unless `--ht
 Cast inspects the selected container and its best video and audio streams through linked FFmpeg
 libraries. Conservative H.264/AAC MP4 and VP8/VP9 WebM inputs are served directly. Compatible
 H.264/AAC streams in another container are remuxed losslessly. Other decodable inputs are converted
-to at-most-1080p H.264 Main/AAC stereo using VideoToolbox for video encoding. By default Cast
-publishes two-second fragmented-MP4 HLS segments atomically and starts the receiver as soon as the
-first segment—or the segment covering `--start-at`—is ready. Conversion continues in the background
-while the video plays and the playlist becomes a finished VOD playlist at end of input.
+to at-most-1080p H.264 Main/AAC stereo using VideoToolbox for video encoding. If only one selected
+track is incompatible, Cast converts that track and copies the other without quality loss; for
+example, H.264/E-AC-3 becomes copied H.264 with AAC audio. By default Cast publishes fragmented-MP4
+HLS segments atomically and starts the receiver as soon as the first segment—or the segment covering
+`--start-at`—is ready. Conversion continues in the background while the video plays and the playlist
+becomes a finished VOD playlist at end of input.
 
 Use `--transcode never` to reject anything outside the direct-play set, or `--transcode always` to
 normalize even directly playable input. `--content-type` remains an expert direct-play override and

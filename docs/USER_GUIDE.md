@@ -86,10 +86,11 @@ Begin at a particular position, in seconds:
 Cast first inspects the container, video, and audio. Conservative H.264/AAC MP4 and VP8/VP9 WebM
 files are served unchanged. H.264/AAC in another container is remuxed without quality loss. Other
 decodable codecs are converted to an at-most-1080p H.264/AAC MP4 using the Mac's VideoToolbox
-encoder. Cast normally starts after the first two-second fragmented-MP4 segment is ready and keeps
-converting in the background while the receiver plays. For `--start-at`, it first prepares enough
-segments to cover the requested position. Progress is printed in the terminal and `Ctrl-C` cancels
-preparation.
+encoder. Compatible tracks are copied when only video or audio needs conversion, so an H.264 movie
+with E-AC-3 audio keeps its original video and converts only the audio to AAC. Cast normally starts
+after the first fragmented-MP4 segment is ready and keeps converting in the background while the
+receiver plays. For `--start-at`, it first prepares enough segments to cover the requested position.
+Progress is printed in the terminal and `Ctrl-C` cancels preparation.
 
 To reject media that would require preparation, or to normalize every input, use:
 

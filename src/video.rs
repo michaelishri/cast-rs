@@ -44,6 +44,14 @@ pub struct VideoOptions {
     pub transcode_delivery: TranscodeDelivery,
 }
 
+#[derive(Clone, Copy)]
+struct IncrementalCastTarget {
+    cast_host: std::net::IpAddr,
+    cast_port: u16,
+    http_port: u16,
+    start_at: f64,
+}
+
 pub fn cast_video(options: VideoOptions) -> Result<()> {
     validate_start_at(options.start_at)?;
     let path = options
@@ -115,6 +123,12 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         );
     }
     println!("Compatibility plan: {}.", plan.description());
+    let incremental_target = IncrementalCastTarget {
+        cast_host: options.cast_host,
+        cast_port: options.cast_port,
+        http_port: options.http_port,
+        start_at: options.start_at,
+    };
 
     let mut temporary = None;
     let (file, content_type, served_size) = match plan {
@@ -137,7 +151,13 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
                 println!("Lossless remux was not safe ({error}); transcoding instead...");
                 if options.transcode_delivery == TranscodeDelivery::Complete {
                     println!("Transcoding a complete compatibility MP4...");
-                    transcode_with_progress(&path, &output_path, info, &interrupted)?;
+                    transcode_with_progress(
+                        &path,
+                        &output_path,
+                        info,
+                        media::TranscodeTracks::all(info.audio.is_some()),
+                        &interrupted,
+                    )?;
                     let file = File::open(&output_path)
                         .context("could not open the transcoded compatibility MP4")?;
                     let size = file.metadata()?.len();
@@ -148,10 +168,8 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
                     return cast_incremental_video(
                         &path,
                         info,
-                        options.cast_host,
-                        options.cast_port,
-                        options.http_port,
-                        options.start_at,
+                        media::TranscodeTracks::all(info.audio.is_some()),
+                        incremental_target,
                         interrupted,
                     );
                 }
@@ -162,7 +180,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
                 (file, "video/mp4".to_owned(), size)
             }
         }
-        PreparationPlan::Transcode { .. } => {
+        PreparationPlan::Transcode { tracks, .. } => {
             let info = info
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing media information for transcode"))?;
@@ -170,16 +188,14 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
                 return cast_incremental_video(
                     &path,
                     info,
-                    options.cast_host,
-                    options.cast_port,
-                    options.http_port,
-                    options.start_at,
+                    tracks,
+                    incremental_target,
                     interrupted,
                 );
             }
             let (directory, output_path) = media::temporary_mp4_path()?;
             println!("Transcoding a complete receiver-compatible H.264/AAC MP4...");
-            transcode_with_progress(&path, &output_path, info, &interrupted)?;
+            transcode_with_progress(&path, &output_path, info, tracks, &interrupted)?;
             let file = File::open(&output_path).context("could not open the transcoded MP4")?;
             let size = file.metadata()?.len();
             temporary = Some(directory);
@@ -242,10 +258,11 @@ fn transcode_with_progress(
     input: &Path,
     output: &Path,
     info: &media::MediaInfo,
+    tracks: media::TranscodeTracks,
     interrupted: &AtomicBool,
 ) -> Result<()> {
     let mut last_printed = -5_i32;
-    media::transcode_to_mp4(input, output, info, interrupted, |percent| {
+    media::transcode_to_mp4_with_tracks(input, output, info, tracks, interrupted, |percent| {
         let whole = percent.floor() as i32;
         if whole >= last_printed + 5 || whole == 100 {
             println!("Transcoding: {whole}%");
@@ -257,20 +274,19 @@ fn transcode_with_progress(
 fn cast_incremental_video(
     path: &Path,
     info: &media::MediaInfo,
-    cast_host: std::net::IpAddr,
-    cast_port: u16,
-    http_port: u16,
-    start_at: f64,
+    tracks: media::TranscodeTracks,
+    target: IncrementalCastTarget,
     interrupted: Arc<AtomicBool>,
 ) -> Result<()> {
-    let lan_ip = local_ip_for(cast_host, cast_port)?;
+    let lan_ip = local_ip_for(target.cast_host, target.cast_port)?;
     let route = private_route()?;
     println!("Preparing receiver-compatible H.264/AAC fMP4 segments...");
     let mut last_printed = -5_i32;
     let mut preparation = IncrementalHlsPreparation::start(
         path.to_owned(),
         info.clone(),
-        SocketAddr::new(lan_ip, http_port),
+        tracks,
+        SocketAddr::new(lan_ip, target.http_port),
         route,
         move |percent| {
             let whole = percent.floor() as i32;
@@ -280,12 +296,21 @@ fn cast_incremental_video(
             }
         },
     )?;
-    preparation.wait_until_playable(start_at, &interrupted, INCREMENTAL_PREPARATION_TIMEOUT)?;
+    preparation.wait_until_playable(
+        target.start_at,
+        &interrupted,
+        INCREMENTAL_PREPARATION_TIMEOUT,
+    )?;
     let url = preparation.url();
     println!("Incremental stream ready at {url}");
 
-    let mut session =
-        BufferedMediaSession::start_fmp4_hls(cast_host, cast_port, url, start_at, info.duration)?;
+    let mut session = BufferedMediaSession::start_fmp4_hls(
+        target.cast_host,
+        target.cast_port,
+        url,
+        target.start_at,
+        info.duration,
+    )?;
     let playback = monitor_playback(
         &session,
         &interrupted,

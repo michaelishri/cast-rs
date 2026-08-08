@@ -14,14 +14,15 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
-    media::{self, MediaInfo},
+    media::{self, MediaInfo, TranscodeTracks},
     network::http_url,
 };
 
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const HLS_PEAK_BANDWIDTH: u64 = 6_500_000;
+const TRANSCODED_HLS_PEAK_BANDWIDTH: u64 = 6_500_000;
+const COPIED_HLS_PEAK_BANDWIDTH: u64 = 25_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HlsServerStats {
@@ -71,6 +72,7 @@ struct SharedPreparationStatus {
 
 #[derive(Clone, Copy)]
 struct HlsRendition {
+    bandwidth: u64,
     width: u32,
     height: u32,
     frame_rate: Option<f64>,
@@ -90,6 +92,7 @@ impl IncrementalHlsPreparation {
     pub fn start(
         input_path: PathBuf,
         info: MediaInfo,
+        tracks: TranscodeTracks,
         bind_address: SocketAddr,
         route: String,
         mut progress_callback: impl FnMut(f64) + Send + 'static,
@@ -101,8 +104,17 @@ impl IncrementalHlsPreparation {
         let server = HlsDirectoryServer::start(bind_address, directory.path().to_owned(), route)?;
         let playlist_path = directory.path().join("index.m3u8");
         let segment_pattern = directory.path().join("segment-%06d.m4s");
-        let (width, height) = media::compatible_dimensions(info.video.width, info.video.height);
+        let (width, height) = if tracks.video {
+            media::compatible_dimensions(info.video.width, info.video.height)
+        } else {
+            (info.video.width, info.video.height)
+        };
         let rendition = HlsRendition {
+            bandwidth: if tracks.video {
+                TRANSCODED_HLS_PEAK_BANDWIDTH
+            } else {
+                COPIED_HLS_PEAK_BANDWIDTH
+            },
             width,
             height,
             frame_rate: info.video.frame_rate,
@@ -115,11 +127,12 @@ impl IncrementalHlsPreparation {
         let worker = thread::Builder::new()
             .name("cast-hls-transcode".into())
             .spawn(move || {
-                let result = media::transcode_to_hls(
+                let result = media::transcode_to_hls_with_tracks(
                     &input_path,
                     &playlist_path,
                     &segment_pattern,
                     &info,
+                    tracks,
                     &worker_cancel,
                     |progress| {
                         if let Ok(mut state) = worker_status.status.lock() {
@@ -296,8 +309,8 @@ fn publish_master_playlist(directory: &Path, rendition: HlsRendition) -> Result<
         video_codec
     };
     let mut attributes = format!(
-        "BANDWIDTH={HLS_PEAK_BANDWIDTH},CODECS=\"{codecs}\",RESOLUTION={}x{}",
-        rendition.width, rendition.height
+        "BANDWIDTH={},CODECS=\"{codecs}\",RESOLUTION={}x{}",
+        rendition.bandwidth, rendition.width, rendition.height
     );
     if let Some(frame_rate) = rendition
         .frame_rate
@@ -662,6 +675,7 @@ mod tests {
         publish_master_playlist(
             directory.path(),
             HlsRendition {
+                bandwidth: TRANSCODED_HLS_PEAK_BANDWIDTH,
                 width: 480,
                 height: 270,
                 frame_rate: Some(30.0),

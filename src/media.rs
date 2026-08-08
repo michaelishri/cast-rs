@@ -59,11 +59,33 @@ pub enum ContainerFamily {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscodeTracks {
+    pub video: bool,
+    pub audio: bool,
+}
+
+impl TranscodeTracks {
+    pub const fn all(has_audio: bool) -> Self {
+        Self {
+            video: true,
+            audio: has_audio,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreparationPlan {
-    Direct { content_type: String },
-    Remux { reason: String },
-    Transcode { reasons: Vec<String> },
+    Direct {
+        content_type: String,
+    },
+    Remux {
+        reason: String,
+    },
+    Transcode {
+        reasons: Vec<String>,
+        tracks: TranscodeTracks,
+    },
 }
 
 impl PreparationPlan {
@@ -71,9 +93,19 @@ impl PreparationPlan {
         match self {
             Self::Direct { .. } => "direct playback".to_owned(),
             Self::Remux { reason } => format!("lossless MP4 remux ({reason})"),
-            Self::Transcode { reasons } => {
-                format!("H.264/AAC compatibility transcode ({})", reasons.join(", "))
-            }
+            Self::Transcode { reasons, tracks } => match (tracks.video, tracks.audio) {
+                (true, true) => {
+                    format!("H.264/AAC compatibility transcode ({})", reasons.join(", "))
+                }
+                (true, false) => {
+                    format!("H.264 video compatibility transcode ({})", reasons.join(", "))
+                }
+                (false, true) => format!(
+                    "AAC audio transcode with H.264 video copy ({})",
+                    reasons.join(", ")
+                ),
+                (false, false) => "lossless track copy".to_owned(),
+            },
         }
     }
 }
@@ -147,6 +179,7 @@ pub fn plan(info: &MediaInfo, mode: CompatibilityMode) -> Result<PreparationPlan
     match mode {
         CompatibilityMode::Always => Ok(PreparationPlan::Transcode {
             reasons: vec!["requested by --transcode=always".to_owned()],
+            tracks: TranscodeTracks::all(info.audio.is_some()),
         }),
         CompatibilityMode::Never => direct
             .map(|content_type| PreparationPlan::Direct {
@@ -180,19 +213,34 @@ pub fn plan(info: &MediaInfo, mode: CompatibilityMode) -> Result<PreparationPlan
                 });
             }
 
+            let transcode_video =
+                info.video.codec != codec::Id::H264 || !conservative_video_properties(&info.video);
+            let transcode_audio = info.audio.as_ref().is_some_and(|audio| {
+                audio.codec != codec::Id::AAC || !conservative_audio_properties(audio)
+            });
+            let tracks = TranscodeTracks {
+                video: transcode_video,
+                audio: transcode_audio,
+            };
             let mut reasons = Vec::new();
             if info.video.codec != codec::Id::H264 {
                 reasons.push(format!("{} video", info.video.codec_name));
+            } else if !conservative_video_properties(&info.video) {
+                reasons.push("video dimensions or pixel format".to_owned());
             }
             if let Some(audio) = &info.audio
                 && audio.codec != codec::Id::AAC
             {
                 reasons.push(format!("{} audio", audio.codec_name));
+            } else if let Some(audio) = &info.audio
+                && !conservative_audio_properties(audio)
+            {
+                reasons.push("audio layout or sample rate".to_owned());
             }
             if reasons.is_empty() {
-                reasons.push("video dimensions, pixel format, or audio layout".to_owned());
+                reasons.push("container compatibility".to_owned());
             }
-            Ok(PreparationPlan::Transcode { reasons })
+            Ok(PreparationPlan::Transcode { reasons, tracks })
         }
     }
 }
@@ -224,14 +272,22 @@ fn direct_content_type(info: &MediaInfo, family: ContainerFamily) -> Option<&'st
 }
 
 fn conservative_stream_properties(info: &MediaInfo) -> bool {
-    let video = info.video.width <= MAX_OUTPUT_WIDTH
-        && info.video.height <= MAX_OUTPUT_HEIGHT
-        && matches!(info.video.pixel_format, Pixel::YUV420P | Pixel::NV12);
+    let video = conservative_video_properties(&info.video);
     let audio = info
         .audio
         .as_ref()
-        .is_none_or(|audio| audio.channels <= 2 && audio.sample_rate <= AUDIO_RATE);
+        .is_none_or(conservative_audio_properties);
     video && audio
+}
+
+fn conservative_video_properties(video: &VideoInfo) -> bool {
+    video.width <= MAX_OUTPUT_WIDTH
+        && video.height <= MAX_OUTPUT_HEIGHT
+        && matches!(video.pixel_format, Pixel::YUV420P | Pixel::NV12)
+}
+
+fn conservative_audio_properties(audio: &AudioInfo) -> bool {
+    audio.channels <= 2 && audio.sample_rate <= AUDIO_RATE
 }
 
 pub fn container_family(name: &str) -> ContainerFamily {
@@ -332,7 +388,6 @@ const AUDIO_BIT_RATE: usize = 192_000;
 const AUDIO_RATE: u32 = 48_000;
 
 struct VideoTranscoder {
-    input_index: usize,
     output_index: usize,
     input_time_base: Rational,
     decoder: decoder::Video,
@@ -342,6 +397,7 @@ struct VideoTranscoder {
     output_width: u32,
     output_height: u32,
     frame_duration: i64,
+    last_output_dts: Option<i64>,
 }
 
 impl VideoTranscoder {
@@ -437,7 +493,6 @@ impl VideoTranscoder {
         )
         .context("could not create the video scaler")?;
         Ok(Self {
-            input_index: input_stream.index(),
             output_index,
             input_time_base: input_stream.time_base(),
             decoder,
@@ -447,6 +502,7 @@ impl VideoTranscoder {
             output_width,
             output_height,
             frame_duration,
+            last_output_dts: None,
         })
     }
 
@@ -521,6 +577,16 @@ impl VideoTranscoder {
             }
             packet.set_stream(self.output_index);
             packet.rescale_ts(self.input_time_base, output_time_base);
+            if packet.duration() <= 0 {
+                packet.set_duration(1);
+            }
+            let (dts, pts) = monotonic_packet_timestamps(
+                packet.dts(),
+                packet.pts(),
+                &mut self.last_output_dts,
+            );
+            packet.set_dts(dts);
+            packet.set_pts(pts);
             packet.set_position(-1);
             packet
                 .write_interleaved(output)
@@ -543,6 +609,27 @@ impl VideoTranscoder {
             .context("could not flush the H.264 encoder")?;
         self.drain_encoder(output, output_time_base)
     }
+}
+
+fn monotonic_packet_timestamps(
+    dts: Option<i64>,
+    pts: Option<i64>,
+    last_dts: &mut Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let Some(mut dts) = dts else {
+        return (None, pts);
+    };
+    let mut pts = pts;
+    if let Some(previous_dts) = *last_dts
+        && dts <= previous_dts
+    {
+        let minimum_dts = previous_dts.saturating_add(1);
+        let adjustment = minimum_dts.saturating_sub(dts);
+        dts = minimum_dts;
+        pts = pts.map(|pts| pts.saturating_add(adjustment));
+    }
+    *last_dts = Some(dts);
+    (Some(dts), pts)
 }
 
 struct AudioTranscoder {
@@ -834,10 +921,138 @@ fn receive_finished(error: ffmpeg::Error) -> bool {
     )
 }
 
+struct CopiedStream {
+    input_index: usize,
+    output_index: usize,
+    input_time_base: Rational,
+    last_output_dts: Option<i64>,
+    next_missing_dts: Option<i64>,
+    pending_packets: Vec<Packet>,
+}
+
+impl CopiedStream {
+    fn new(
+        input_stream: &format::stream::Stream<'_>,
+        output: &mut format::context::Output,
+        description: &str,
+    ) -> Result<Self> {
+        let mut output_stream = output
+            .add_stream(codec::encoder::find(codec::Id::None))
+            .with_context(|| format!("could not add the copied {description} stream"))?;
+        output_stream.set_parameters(input_stream.parameters());
+        unsafe {
+            (*output_stream.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+        Ok(Self {
+            input_index: input_stream.index(),
+            output_index: output_stream.index(),
+            input_time_base: input_stream.time_base(),
+            last_output_dts: None,
+            next_missing_dts: None,
+            pending_packets: Vec::new(),
+        })
+    }
+
+    fn write_packet(
+        &mut self,
+        mut packet: Packet,
+        output: &mut format::context::Output,
+        output_time_base: Rational,
+        description: &str,
+    ) -> Result<()> {
+        if packet.pts().is_none() {
+            bail!("{description} stream omits presentation timestamps required for track copying");
+        }
+        packet.rescale_ts(self.input_time_base, output_time_base);
+        if packet.duration() <= 0 {
+            packet.set_duration(1);
+        }
+        if packet.dts().is_none() {
+            if let Some(dts) = self.next_missing_dts {
+                packet.set_dts(Some(dts));
+            } else {
+                self.pending_packets.push(packet);
+                return Ok(());
+            }
+        }
+        if !self.pending_packets.is_empty() {
+            let mut dts = packet
+                .dts()
+                .ok_or_else(|| anyhow!("copied {description} packet lost its decode timestamp"))?;
+            for pending in self.pending_packets.iter_mut().rev() {
+                dts = dts.saturating_sub(pending.duration().max(1));
+                pending.set_dts(Some(dts));
+            }
+            let pending_packets = std::mem::take(&mut self.pending_packets);
+            for pending in pending_packets {
+                self.write_rescaled_packet(pending, output, description)?;
+            }
+        }
+        self.write_rescaled_packet(packet, output, description)
+    }
+
+    fn write_rescaled_packet(
+        &mut self,
+        mut packet: Packet,
+        output: &mut format::context::Output,
+        description: &str,
+    ) -> Result<()> {
+        let (dts, pts) = monotonic_packet_timestamps(
+            packet.dts(),
+            packet.pts(),
+            &mut self.last_output_dts,
+        );
+        packet.set_dts(dts);
+        packet.set_pts(pts);
+        self.next_missing_dts = dts.map(|dts| dts.saturating_add(packet.duration().max(1)));
+        packet.set_position(-1);
+        packet.set_stream(self.output_index);
+        packet
+            .write_interleaved(output)
+            .with_context(|| format!("could not write copied {description}"))
+    }
+
+    fn finish_pending(
+        &mut self,
+        output: &mut format::context::Output,
+        description: &str,
+    ) -> Result<()> {
+        let Some(first_pts) = self.pending_packets.first().and_then(Packet::pts) else {
+            return Ok(());
+        };
+        let mut dts = first_pts;
+        let pending_packets = std::mem::take(&mut self.pending_packets);
+        for mut packet in pending_packets {
+            packet.set_dts(Some(dts));
+            dts = dts.saturating_add(packet.duration().max(1));
+            self.write_rescaled_packet(packet, output, description)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn transcode_to_mp4(
     input_path: &Path,
     output_path: &Path,
     info: &MediaInfo,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(f64),
+) -> Result<()> {
+    transcode_to_mp4_with_tracks(
+        input_path,
+        output_path,
+        info,
+        TranscodeTracks::all(info.audio.is_some()),
+        cancelled,
+        progress,
+    )
+}
+
+pub fn transcode_to_mp4_with_tracks(
+    input_path: &Path,
+    output_path: &Path,
+    info: &MediaInfo,
+    tracks: TranscodeTracks,
     cancelled: &AtomicBool,
     progress: impl FnMut(f64),
 ) -> Result<()> {
@@ -848,11 +1063,11 @@ pub fn transcode_to_mp4(
     transcode_to_output(
         input_path,
         info,
+        tracks,
         cancelled,
         progress,
         &mut output,
         options,
-        "temporary MP4",
     )
 }
 
@@ -861,6 +1076,26 @@ pub fn transcode_to_hls(
     playlist_path: &Path,
     segment_pattern: &Path,
     info: &MediaInfo,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(f64),
+) -> Result<()> {
+    transcode_to_hls_with_tracks(
+        input_path,
+        playlist_path,
+        segment_pattern,
+        info,
+        TranscodeTracks::all(info.audio.is_some()),
+        cancelled,
+        progress,
+    )
+}
+
+pub fn transcode_to_hls_with_tracks(
+    input_path: &Path,
+    playlist_path: &Path,
+    segment_pattern: &Path,
+    info: &MediaInfo,
+    tracks: TranscodeTracks,
     cancelled: &AtomicBool,
     progress: impl FnMut(f64),
 ) -> Result<()> {
@@ -880,47 +1115,66 @@ pub fn transcode_to_hls(
     options.set("hls_playlist_type", "event");
     options.set("hls_fmp4_init_filename", "init.mp4");
     options.set("hls_segment_filename", segment_pattern);
-    options.set("hls_flags", "independent_segments+temp_file");
+    options.set(
+        "hls_flags",
+        if tracks.video {
+            "independent_segments+temp_file"
+        } else {
+            "temp_file"
+        },
+    );
     transcode_to_output(
         input_path,
         info,
+        tracks,
         cancelled,
         progress,
         &mut output,
         options,
-        "incremental HLS stream",
     )
 }
 
 fn transcode_to_output(
     input_path: &Path,
     info: &MediaInfo,
+    tracks: TranscodeTracks,
     cancelled: &AtomicBool,
     mut progress: impl FnMut(f64),
     output: &mut format::context::Output,
     options: Dictionary<'_>,
-    output_description: &str,
 ) -> Result<()> {
     let mut input = format::input(input_path)
         .with_context(|| format!("could not open {} for transcoding", input_path.display()))?;
     let video_stream = input
         .stream(info.video.stream_index)
         .ok_or_else(|| anyhow!("selected video stream disappeared"))?;
-    let mut video = VideoTranscoder::new(&video_stream, output)?;
-    let mut audio = match &info.audio {
+    let video_input_time_base = video_stream.time_base();
+    let (mut video, mut copied_video) = if tracks.video {
+        (Some(VideoTranscoder::new(&video_stream, output)?), None)
+    } else {
+        (
+            None,
+            Some(CopiedStream::new(&video_stream, output, "H.264 video")?),
+        )
+    };
+    let (mut audio, mut copied_audio) = match &info.audio {
         Some(audio) => {
             let stream = input
                 .stream(audio.stream_index)
                 .ok_or_else(|| anyhow!("selected audio stream disappeared"))?;
-            Some(AudioTranscoder::new(&stream, output)?)
+            if tracks.audio {
+                (Some(AudioTranscoder::new(&stream, output)?), None)
+            } else {
+                (None, Some(CopiedStream::new(&stream, output, "AAC audio")?))
+            }
         }
-        None => None,
+        None => (None, None),
     };
 
     output.set_metadata(input.metadata().to_owned());
     output
         .write_header_with(options)
-        .with_context(|| format!("could not write the {output_description} header"))?;
+        .context("could not write the compatibility media header")?;
     let output_time_bases = output
         .streams()
         .map(|stream| stream.time_base())
@@ -931,20 +1185,25 @@ fn transcode_to_output(
         if cancelled.load(Ordering::SeqCst) {
             bail!("media preparation was cancelled");
         }
-        if stream.index() == video.input_index {
+        if stream.index() == info.video.stream_index {
             if let Some(timestamp) = packet.pts().or_else(|| packet.dts())
                 && let Some(duration) = info.duration
             {
-                let seconds = timestamp as f64 * video.input_time_base.numerator() as f64
-                    / video.input_time_base.denominator() as f64;
+                let seconds = timestamp as f64 * video_input_time_base.numerator() as f64
+                    / video_input_time_base.denominator() as f64;
                 let percent = (seconds / duration * 100.0).clamp(0.0, 100.0);
                 if percent - last_progress >= 1.0 {
                     progress(percent);
                     last_progress = percent;
                 }
             }
-            let time_base = output_time_bases[video.output_index];
-            video.process_packet(&packet, output, time_base)?;
+            if let Some(video) = &mut video {
+                let time_base = output_time_bases[video.output_index];
+                video.process_packet(&packet, output, time_base)?;
+            } else if let Some(video) = &mut copied_video {
+                let time_base = output_time_bases[video.output_index];
+                video.write_packet(packet, output, time_base, "H.264 video")?;
+            }
         } else if let Some(audio) = &mut audio
             && stream.index() == audio.input_index
         {
@@ -952,18 +1211,31 @@ fn transcode_to_output(
             packet.rescale_ts(stream.time_base(), audio.decoder_time_base);
             let time_base = output_time_bases[audio.output_index];
             audio.process_packet(&packet, output, time_base)?;
+        } else if let Some(audio) = &mut copied_audio
+            && stream.index() == audio.input_index
+        {
+            let time_base = output_time_bases[audio.output_index];
+            audio.write_packet(packet, output, time_base, "AAC audio")?;
         }
     }
 
-    let video_time_base = output_time_bases[video.output_index];
-    video.finish(output, video_time_base)?;
+    if let Some(video) = &mut video {
+        let video_time_base = output_time_bases[video.output_index];
+        video.finish(output, video_time_base)?;
+    }
+    if let Some(video) = &mut copied_video {
+        video.finish_pending(output, "H.264 video")?;
+    }
     if let Some(audio) = &mut audio {
         let audio_time_base = output_time_bases[audio.output_index];
         audio.finish(output, audio_time_base)?;
     }
+    if let Some(audio) = &mut copied_audio {
+        audio.finish_pending(output, "AAC audio")?;
+    }
     output
         .write_trailer()
-        .with_context(|| format!("could not finish the {output_description}"))?;
+        .context("could not finish the compatibility media output")?;
     progress(100.0);
     Ok(())
 }
@@ -1069,14 +1341,76 @@ mod tests {
 
     #[test]
     fn transcodes_incompatible_video_or_audio() {
-        assert!(matches!(
-            plan(
-                &media("matroska", codec::Id::HEVC, Some(codec::Id::OPUS)),
-                CompatibilityMode::Auto
-            )
-            .unwrap(),
-            PreparationPlan::Transcode { .. }
-        ));
+        let PreparationPlan::Transcode { tracks, .. } = plan(
+            &media("matroska", codec::Id::HEVC, Some(codec::Id::OPUS)),
+            CompatibilityMode::Auto,
+        )
+        .unwrap()
+        else {
+            panic!("incompatible media was not selected for transcoding");
+        };
+        assert_eq!(tracks, TranscodeTracks::all(true));
+    }
+
+    #[test]
+    fn transcodes_only_the_incompatible_track() {
+        let PreparationPlan::Transcode {
+            tracks: audio_only,
+            ..
+        } = plan(
+            &media("matroska", codec::Id::H264, Some(codec::Id::EAC3)),
+            CompatibilityMode::Auto,
+        )
+        .unwrap()
+        else {
+            panic!("incompatible audio was not selected for transcoding");
+        };
+        assert_eq!(
+            audio_only,
+            TranscodeTracks {
+                video: false,
+                audio: true,
+            }
+        );
+
+        let PreparationPlan::Transcode {
+            tracks: video_only,
+            ..
+        } = plan(
+            &media("matroska", codec::Id::HEVC, Some(codec::Id::AAC)),
+            CompatibilityMode::Auto,
+        )
+        .unwrap()
+        else {
+            panic!("incompatible video was not selected for transcoding");
+        };
+        assert_eq!(
+            video_only,
+            TranscodeTracks {
+                video: true,
+                audio: false,
+            }
+        );
+    }
+
+    #[test]
+    fn repairs_small_backward_encoder_timestamp_jumps() {
+        let mut last_dts = None;
+        assert_eq!(
+            monotonic_packet_timestamps(Some(100), Some(100), &mut last_dts),
+            (Some(100), Some(100))
+        );
+        assert_eq!(last_dts, Some(100));
+        assert_eq!(
+            monotonic_packet_timestamps(Some(84), Some(84), &mut last_dts),
+            (Some(101), Some(101))
+        );
+        assert_eq!(last_dts, Some(101));
+        assert_eq!(
+            monotonic_packet_timestamps(Some(220), Some(225), &mut last_dts),
+            (Some(220), Some(225))
+        );
+        assert_eq!(last_dts, Some(220));
     }
 
     #[test]

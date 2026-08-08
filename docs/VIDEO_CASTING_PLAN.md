@@ -298,6 +298,20 @@ Implemented as the default transcoded-media delivery mode:
 This slice also terminates the Default Media Receiver after natural end-of-media instead of letting
 the control thread exit before application cleanup.
 
+### 8. Track-selective compatibility conversion
+
+Implemented after validating incremental delivery with long-form H.264/E-AC-3 media:
+
+1. classify video and audio compatibility independently;
+2. copy compatible H.264 video while converting incompatible audio to AAC;
+3. copy compatible AAC audio while converting incompatible video to H.264;
+4. reconstruct leading decode timestamps commonly omitted by Matroska H.264 with B-frames;
+5. preserve source keyframe boundaries for copied video and omit the HLS independent-segments claim;
+6. normalize tiny backward encoder timestamp jumps before fragmented-MP4 muxing.
+
+Full conversion remains available through `--transcode always`; automatic mode avoids unnecessary
+quality loss and substantially reduces CPU use when only one track is incompatible.
+
 ## Test matrix
 
 Automated tests should not require a receiver:
@@ -338,7 +352,6 @@ Manual receiver coverage should include:
 
 ## Deferred features
 
-- automatic remuxing or transcoding;
 - local subtitles and alternate audio-track selection;
 - playlists, queues, repeat, and autoplay-next;
 - an interactive terminal controller for pause/seek/volume;
