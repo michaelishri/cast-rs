@@ -12,8 +12,9 @@ use rust_cast::{
         connection::ConnectionResponse,
         heartbeat::HeartbeatResponse,
         media::{
-            HlsSegmentFormat, IdleReason, LoadOptions, Media, MediaDetailedErrorCode,
-            MediaResponse, PlayerState, ResumeState, Status, StatusEntry, StreamType,
+            GenericMediaMetadata, HlsSegmentFormat, IdleReason, LoadOptions, Media,
+            MediaDetailedErrorCode, MediaResponse, Metadata, PlayerState, ResumeState, Status,
+            StatusEntry, StreamType,
         },
         receiver::CastDeviceApp,
     },
@@ -99,6 +100,11 @@ struct BufferedPlaybackSnapshot {
     supported_media_commands: u32,
 }
 
+pub struct BufferedMediaDescription {
+    pub title: String,
+    pub duration: Option<f64>,
+}
+
 pub struct BufferedMediaSession {
     commands: Sender<MediaSessionCommand>,
     events: Receiver<MediaSessionEvent>,
@@ -119,6 +125,7 @@ struct BufferedMediaLoad {
     url: String,
     content_type: String,
     start_at: f64,
+    title: String,
     duration: Option<f64>,
     fmp4_hls: bool,
     interactive: bool,
@@ -131,6 +138,7 @@ impl BufferedMediaSession {
         url: String,
         content_type: String,
         start_at: f64,
+        description: BufferedMediaDescription,
         interactive: bool,
     ) -> Result<Self> {
         Self::start_with_options(
@@ -140,7 +148,8 @@ impl BufferedMediaSession {
                 url,
                 content_type,
                 start_at,
-                duration: None,
+                title: description.title,
+                duration: description.duration,
                 fmp4_hls: false,
                 interactive,
             },
@@ -152,7 +161,7 @@ impl BufferedMediaSession {
         port: u16,
         url: String,
         start_at: f64,
-        duration: Option<f64>,
+        description: BufferedMediaDescription,
         interactive: bool,
     ) -> Result<Self> {
         Self::start_with_options(
@@ -162,7 +171,8 @@ impl BufferedMediaSession {
                 url,
                 content_type: "application/x-mpegURL".to_owned(),
                 start_at,
-                duration,
+                title: description.title,
+                duration: description.duration,
                 fmp4_hls: true,
                 interactive,
             },
@@ -481,7 +491,10 @@ fn run_buffered_media_session(
         "Cast buffered LOAD response selected media session {media_session_id}: {status:?}"
     );
 
-    let mut snapshot = BufferedPlaybackSnapshot::default();
+    let mut snapshot = BufferedPlaybackSnapshot {
+        duration: normalized_duration(media_load.duration),
+        ..BufferedPlaybackSnapshot::default()
+    };
     if drain_buffered_messages(device, media_session_id, &mut snapshot, events)? {
         return stop_buffered_cast_session(
             device,
@@ -586,9 +599,18 @@ fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
         content_type: media_load.content_type.clone(),
         hls_segment_format: media_load.fmp4_hls.then_some(HlsSegmentFormat::Fmp4),
         hls_video_segment_format: media_load.fmp4_hls.then_some(HlsVideoSegmentFormat::Fmp4),
-        metadata: None,
-        duration: media_load.duration.map(|duration| duration as f32),
+        metadata: Some(Metadata::Generic(GenericMediaMetadata {
+            title: Some(media_load.title.clone()),
+            ..GenericMediaMetadata::default()
+        })),
+        duration: normalized_duration(media_load.duration),
     }
+}
+
+fn normalized_duration(duration: Option<f64>) -> Option<f32> {
+    duration
+        .map(|duration| duration as f32)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
 }
 
 fn toggle_buffered_playback(
@@ -1020,13 +1042,12 @@ fn emit_playback_status(
     {
         snapshot.current_time = Some(current_time);
     }
-    if let Some(duration) = entry
-        .media
-        .as_ref()
-        .and_then(|media| media.duration)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-    {
-        snapshot.duration = Some(duration);
+    if snapshot.duration.is_none() {
+        snapshot.duration = entry
+            .media
+            .as_ref()
+            .and_then(|media| media.duration)
+            .filter(|value| value.is_finite() && *value > 0.0);
     }
     snapshot.playback_rate = if entry.playback_rate.is_finite() {
         entry.playback_rate
@@ -1307,6 +1328,31 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_source_duration_instead_of_a_receiver_buffer_window() {
+        let (sender, receiver) = mpsc::channel();
+        let mut snapshot = BufferedPlaybackSnapshot {
+            duration: normalized_duration(Some(600.0)),
+            ..BufferedPlaybackSnapshot::default()
+        };
+        let mut entry = status_entry(PlayerState::Playing, None);
+        entry.media = Some(Media {
+            content_id: "video".to_owned(),
+            stream_type: StreamType::Buffered,
+            content_type: "application/x-mpegURL".to_owned(),
+            hls_segment_format: Some(HlsSegmentFormat::Fmp4),
+            hls_video_segment_format: Some(HlsVideoSegmentFormat::Fmp4),
+            metadata: None,
+            duration: Some(30.0),
+        });
+
+        assert!(!emit_status_entry(entry, &mut snapshot, &sender));
+        let MediaSessionEvent::Status(status) = receiver.recv().unwrap() else {
+            panic!("expected playback status");
+        };
+        assert_eq!(status.duration, Some(600.0));
+    }
+
+    #[test]
     fn maps_idle_reasons_to_terminal_events() {
         for (reason, expected) in [
             (
@@ -1339,12 +1385,17 @@ mod tests {
             url: "http://127.0.0.1/private/index.m3u8".to_owned(),
             content_type: "application/x-mpegURL".to_owned(),
             start_at: 12.0,
+            title: "Example video".to_owned(),
             duration: Some(90.0),
             fmp4_hls: true,
             interactive: false,
         });
         assert_eq!(media.stream_type, StreamType::Buffered);
         assert_eq!(media.duration, Some(90.0));
+        let Some(Metadata::Generic(metadata)) = media.metadata else {
+            panic!("expected generic media metadata");
+        };
+        assert_eq!(metadata.title.as_deref(), Some("Example video"));
         assert_eq!(media.hls_segment_format, Some(HlsSegmentFormat::Fmp4));
         assert_eq!(
             media.hls_video_segment_format,
