@@ -8,6 +8,7 @@ mod mirror;
 mod network;
 mod synthetic;
 mod video;
+mod virtual_display;
 mod vod_hls;
 
 use std::{
@@ -108,14 +109,20 @@ enum Command {
     },
     /// Measure the mirroring path and recommend receiver latency settings.
     Profile {
-        /// Chromecast IP address (shown by `cast devices`).
-        #[arg(long)]
-        host: IpAddr,
+        /// Chromecast IP address; repeat --host to profile a receiver group.
+        #[arg(long, required = true, action = ArgAction::Append)]
+        host: Vec<IpAddr>,
         #[arg(long, default_value_t = 8009)]
         cast_port: u16,
         /// CoreGraphics display ID; defaults to the first display.
         #[arg(long)]
         display: Option<u32>,
+        /// Create one temporary extended display per receiver using an experimental private macOS API.
+        #[arg(
+            long,
+            conflicts_with_all = ["display", "synthetic", "auto_tune"]
+        )]
+        extend: bool,
         /// Profiling duration; with --auto-tune this is divided across all trials.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(10..=3600))]
         seconds: u64,
@@ -149,11 +156,11 @@ enum Command {
         #[arg(long)]
         quality_priority: bool,
     },
-    /// Capture this Mac's desktop and cast it to a Google Cast receiver.
+    /// Capture this Mac's desktop and cast it to one or more Google Cast receivers.
     Desktop {
-        /// Chromecast IP address (shown by `cast devices`).
-        #[arg(long)]
-        host: IpAddr,
+        /// Chromecast IP address; repeat --host to cast to multiple receivers.
+        #[arg(long, required = true, action = ArgAction::Append)]
+        host: Vec<IpAddr>,
         #[arg(long, default_value_t = 8009)]
         cast_port: u16,
         /// Transport to use; mirror targets sub-second latency, HLS is the compatibility fallback.
@@ -162,6 +169,9 @@ enum Command {
         /// CoreGraphics display ID; defaults to the first display.
         #[arg(long)]
         display: Option<u32>,
+        /// Create one temporary extended display per receiver using an experimental private macOS API.
+        #[arg(long, conflicts_with = "display")]
+        extend: bool,
         /// Receiver playout buffer for the mirroring transport, in milliseconds.
         #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..=5000))]
         target_delay_ms: u64,
@@ -190,9 +200,23 @@ enum Command {
         /// Stop automatically after this many seconds; otherwise run until Ctrl-C.
         #[arg(long)]
         seconds: Option<u64>,
-        /// Start capture and HLS serving without sending a command to the receiver (HLS only).
+        /// Start capture and HLS serving without contacting the sole receiver (HLS only).
         #[arg(long)]
         serve_only: bool,
+    },
+    /// Internal owner process for a temporary virtual display.
+    #[command(name = "__virtual-display-helper", hide = true)]
+    VirtualDisplayHelper {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(2..=3840))]
+        width: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(2..=2160))]
+        height: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        serial: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        ordinal: u32,
     },
 }
 
@@ -325,6 +349,7 @@ fn main() -> Result<()> {
             host,
             cast_port,
             display,
+            extend,
             seconds,
             probe_delay_ms,
             synthetic,
@@ -338,9 +363,10 @@ fn main() -> Result<()> {
             quality_priority,
         } => mirror::profile_desktop(
             mirror::MirrorOptions {
-                cast_host: host,
+                cast_hosts: host,
                 cast_port,
                 display_id: display,
+                extend,
                 fps,
                 width,
                 height,
@@ -359,6 +385,7 @@ fn main() -> Result<()> {
             cast_port,
             transport,
             display,
+            extend,
             target_delay_ms,
             http_port,
             fps,
@@ -376,9 +403,10 @@ fn main() -> Result<()> {
                     anyhow::bail!("--serve-only is available only with --transport hls");
                 }
                 mirror::cast_desktop(mirror::MirrorOptions {
-                    cast_host: host,
+                    cast_hosts: host,
                     cast_port,
                     display_id: display,
+                    extend,
                     fps,
                     width,
                     height,
@@ -398,9 +426,10 @@ fn main() -> Result<()> {
                     );
                 }
                 live::cast_desktop(live::LiveOptions {
-                    cast_host: host,
+                    cast_hosts: host,
                     cast_port,
                     display_id: display,
+                    extend,
                     http_port,
                     fps,
                     width,
@@ -411,6 +440,15 @@ fn main() -> Result<()> {
                 })?;
             }
         },
+        Command::VirtualDisplayHelper {
+            width,
+            height,
+            fps,
+            serial,
+            ordinal,
+        } => {
+            virtual_display::run_helper(width, height, fps, serial, ordinal)?;
+        }
     }
 
     Ok(())
@@ -436,7 +474,9 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 
 #[cfg(test)]
 mod tests {
-    use super::interactive_video_output;
+    use super::{Cli, Command, interactive_video_output};
+    use clap::{Parser, error::ErrorKind};
+    use std::net::IpAddr;
 
     #[test]
     fn interactive_video_requires_default_verbosity_and_terminal_io() {
@@ -445,5 +485,83 @@ mod tests {
         assert!(!interactive_video_output(2, true, true));
         assert!(!interactive_video_output(0, false, true));
         assert!(!interactive_video_output(0, true, false));
+    }
+
+    #[test]
+    fn desktop_accepts_extend_as_a_switch() {
+        let cli =
+            Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--extend"]).unwrap();
+        assert!(matches!(cli.command, Command::Desktop { extend: true, .. }));
+    }
+
+    #[test]
+    fn extend_conflicts_with_an_explicit_display() {
+        let result = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.1",
+            "--extend",
+            "--display",
+            "42",
+        ]);
+        let error = result.err().expect("conflicting arguments were accepted");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn profile_extend_conflicts_with_synthetic_input() {
+        let result = Cli::try_parse_from([
+            "cast",
+            "profile",
+            "--host",
+            "192.0.2.1",
+            "--extend",
+            "--synthetic",
+        ]);
+        let error = result.err().expect("conflicting arguments were accepted");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn desktop_preserves_repeated_host_order() {
+        let cli = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.10",
+            "--host",
+            "192.0.2.20",
+        ])
+        .unwrap();
+        let Command::Desktop { host, .. } = cli.command else {
+            panic!("desktop command was not parsed");
+        };
+        assert_eq!(
+            host,
+            [
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "192.0.2.20".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_accepts_a_receiver_group() {
+        let cli = Cli::try_parse_from([
+            "cast",
+            "profile",
+            "--host",
+            "2001:db8::10",
+            "--host",
+            "2001:db8::20",
+        ])
+        .unwrap();
+        let Command::Profile { host, .. } = cli.command else {
+            panic!("profile command was not parsed");
+        };
+        assert_eq!(host.len(), 2);
+        assert_eq!(host[0], "2001:db8::10".parse::<IpAddr>().unwrap());
+        assert_eq!(host[1], "2001:db8::20".parse::<IpAddr>().unwrap());
     }
 }

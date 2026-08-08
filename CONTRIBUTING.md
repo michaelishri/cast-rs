@@ -56,7 +56,7 @@ ScreenCaptureKit can omit a pixel buffer for idle display ticks. Cast re-encodes
 
 ## Releases
 
-`Cargo.toml` is the single source of truth for the CLI version; `cast --version` exposes that version. Use matching annotated tags: package version `0.4.0` is released as `v0.4.0`.
+`Cargo.toml` is the single source of truth for the CLI version; `cast --version` exposes that version. Use matching annotated tags: package version `X.Y.Z` is released as `vX.Y.Z`.
 
 Follow the full [release checklist](docs/RELEASE_CHECKLIST.md). After the version pull request is merged, check out that exact clean `origin/main` commit and run:
 

@@ -102,6 +102,22 @@ cast video --host 192.168.1.50 --transcode-delivery complete movie.mkv
 
 DRM-protected and corrupt files cannot be converted. Embedded subtitles and alternate audio tracks are not included yet. To use a fixed local-server port for a firewall rule, pass `--http-port 8080`.
 
+## Multiple receivers and extended displays
+
+Repeat `--host` to cast one captured desktop to a receiver group:
+
+```sh
+cast desktop --host 192.168.1.50 --host 192.168.1.51
+```
+
+Use `--extend` when each receiver should display an independent desktop. Cast creates a temporary extended display per receiver, without installing a display driver or system extension:
+
+```sh
+cast desktop --host 192.168.1.50 --extend
+```
+
+Move windows onto the new display while Cast is running. `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. It cannot be combined with `--display`.
+
 ## Everyday commands
 
 Choose a display and stop after 30 seconds:
@@ -158,6 +174,8 @@ cast desktop --host 192.168.1.50 --transport hls
 ```
 
 **A local video does not start** — Allow incoming connections through the macOS firewall and confirm that guest/client isolation is disabled. Use `--transcode always` to normalize a file initially selected for direct playback.
+
+**An extended display is unavailable or blank** — Your macOS version may not support the experimental `CGVirtualDisplay` API. Re-check Screen Recording permission and cast an existing display instead.
 
 **Need more detail** — Add `-v` before a command for diagnostics, or `-vv` for protocol-level tracing:
 
