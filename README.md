@@ -14,14 +14,27 @@ The CLI currently supports these Cast paths:
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
 - retain fragmented-MP4 HLS as a compatibility fallback.
 
+## Install
+
+Install the current stable release with Homebrew:
+
+```sh
+brew install michaelishri/tap/cast
+cast --version
+```
+
+Architecture-specific archives remain available from the GitHub Releases page. See the
+[Cast user guide](docs/USER_GUIDE.md) for manual installation and first-use instructions.
+
 ## Requirements
 
 - macOS 13 or newer;
-- Rust 1.85 or newer (edition 2024);
-- Xcode (the native capture bindings use Apple's Swift runtime);
-- `pkg-config`, plus either FFmpeg 8 development libraries or the bundled-library build helper;
 - Mac and Chromecast on the same network;
 - Screen Recording permission for your terminal when using capture commands.
+
+Building from source additionally requires Rust 1.85 or newer, Xcode 15 or newer, `nasm`, and
+`pkg-config`. The native capture bindings use Apple's Swift toolchain, while the compatibility
+pipeline links pinned FFmpeg libraries built by the helper below.
 
 ## Build
 
@@ -39,7 +52,12 @@ archives include these libraries, so end users do not need FFmpeg or Homebrew in
 
 `Cargo.toml` is the single source of truth for the CLI version; Clap exposes that same version through `cast --version`. Releases use matching annotated Git tags: package version `0.3.0` is released as `v0.3.0`.
 
-After changing the package version and pushing its commit, run:
+Follow the [release checklist](docs/RELEASE_CHECKLIST.md) for the complete, handoff-ready process:
+version bump and validation, annotated tagging, GitHub release verification, Homebrew formula update,
+bottle publication, installation testing, and failure recovery.
+
+After the version pull request is merged, check out that exact `origin/main` commit in a clean
+worktree and run:
 
 ```sh
 ./scripts/release.sh

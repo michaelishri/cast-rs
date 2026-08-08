@@ -280,7 +280,7 @@ impl LiveFrameHandler {
         reason: &str,
     ) {
         let count = self.repeated_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count.is_multiple_of(120) {
+        if count == 1 || count % 120 == 0 {
             log::debug!(
                 "encoded {count} idle ScreenCaptureKit samples by reusing the last frame (latest status={status:?}: {reason})"
             );
@@ -289,7 +289,7 @@ impl LiveFrameHandler {
 
     fn record_skipped_sample(&self, status: Option<screencapturekit::SCFrameStatus>, reason: &str) {
         let count = self.skipped_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count.is_multiple_of(120) {
+        if count == 1 || count % 120 == 0 {
             log::debug!(
                 "skipped {count} non-video ScreenCaptureKit samples (latest status={status:?}: {reason})"
             );
@@ -402,7 +402,7 @@ impl LivePipeline {
             .context("could not add H.264 frame to fragmented MP4")?;
         self.frame_index += 1;
         self.frames_in_segment += 1;
-        if self.frame_index.is_multiple_of(self.fps as u64) {
+        if self.frame_index % self.fps as u64 == 0 {
             log::trace!(
                 "encoded frame {}: {} bytes, keyframe={keyframe}",
                 self.frame_index,
