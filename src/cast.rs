@@ -24,6 +24,7 @@ pub use rust_cast::channels::media::HlsVideoSegmentFormat;
 
 const BUFFERED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BUFFERED_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const LIVE_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const CAST_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MEDIA_COMMAND_PAUSE: u32 = 1;
@@ -108,6 +109,18 @@ pub struct BufferedMediaDescription {
 pub struct BufferedMediaSession {
     commands: Sender<MediaSessionCommand>,
     events: Receiver<MediaSessionEvent>,
+    done: Receiver<std::result::Result<(), String>>,
+    interrupt: CastConnectionInterrupt,
+    thread: Option<JoinHandle<()>>,
+}
+
+enum LiveMediaCommand {
+    Stop,
+}
+
+pub struct LiveMediaSession {
+    host: IpAddr,
+    commands: Sender<LiveMediaCommand>,
     done: Receiver<std::result::Result<(), String>>,
     interrupt: CastConnectionInterrupt,
     thread: Option<JoinHandle<()>>,
@@ -346,6 +359,170 @@ impl Drop for BufferedMediaSession {
     }
 }
 
+impl LiveMediaSession {
+    pub fn start_fmp4_hls(host: IpAddr, port: u16, url: String) -> Result<Self> {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (interrupt_sender, interrupt_receiver) = mpsc::sync_channel(1);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name(format!("cast-live-control-{host}"))
+            .spawn(move || {
+                eprintln!("Connecting to Cast receiver at {host}:{port}...");
+                let device = match CastDevice::connect_without_host_verification_timeout(
+                    host.to_string(),
+                    port,
+                    CAST_TCP_CONNECT_TIMEOUT,
+                ) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        let detail =
+                            format!("could not connect to Cast device at {host}:{port}: {error}");
+                        let _ = interrupt_sender.send(Err(detail.clone()));
+                        let _ = ready_sender.send(Err(detail.clone()));
+                        let _ = done_sender.send(Err(detail));
+                        return;
+                    }
+                };
+                let interrupt = match device.connection_interrupt() {
+                    Ok(interrupt) => interrupt,
+                    Err(error) => {
+                        let detail = format!("could not create Cast connection interrupt: {error}");
+                        let _ = interrupt_sender.send(Err(detail.clone()));
+                        let _ = ready_sender.send(Err(detail.clone()));
+                        let _ = done_sender.send(Err(detail));
+                        return;
+                    }
+                };
+                if interrupt_sender.send(Ok(interrupt)).is_err() {
+                    let _ = done_sender.send(Ok(()));
+                    return;
+                }
+
+                let outcome =
+                    run_live_media_session(&device, &url, &ready_sender, &command_receiver)
+                        .map_err(|error| format!("live Cast control session failed: {error:#}"));
+                if let Err(detail) = &outcome {
+                    let _ = ready_sender.send(Err(detail.clone()));
+                }
+                let _ = done_sender.send(outcome);
+            })
+            .context("could not start live Cast control thread")?;
+
+        let interrupt = match interrupt_receiver.recv_timeout(CAST_CONNECT_TIMEOUT) {
+            Ok(Ok(interrupt)) => interrupt,
+            Ok(Err(detail)) => {
+                let _ = thread.join();
+                return Err(anyhow!(detail));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(anyhow!(
+                    "Cast receiver connection did not initialize within 20 seconds"
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                return Err(anyhow!(
+                    "live Cast control thread ended before initializing the connection"
+                ));
+            }
+        };
+
+        match ready_receiver.recv_timeout(CAST_CONNECT_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self {
+                host,
+                commands: command_sender,
+                done: done_receiver,
+                interrupt,
+                thread: Some(thread),
+            }),
+            Ok(Err(detail)) => {
+                let _ = thread.join();
+                Err(anyhow!(detail))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = interrupt.interrupt();
+                let _ = thread.join();
+                Err(anyhow!(
+                    "Cast receiver did not accept the live stream within 20 seconds"
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                Err(anyhow!(
+                    "live Cast control thread ended before loading the stream"
+                ))
+            }
+        }
+    }
+
+    pub fn ensure_alive(&self) -> Result<()> {
+        match self.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!(
+                "Cast control session for {} disconnected",
+                self.host
+            )),
+            Ok(Ok(())) => Err(anyhow!(
+                "Cast receiver {} ended the live session unexpectedly",
+                self.host
+            )),
+            Ok(Err(detail)) => Err(anyhow!(detail)),
+        }
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        self.shutdown(true)
+    }
+
+    fn shutdown(&mut self, request_stop: bool) -> Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        if request_stop {
+            let _ = self.commands.send(LiveMediaCommand::Stop);
+        }
+        let mut outcome = None;
+        let finished = match self.done.recv_timeout(BUFFERED_SESSION_STOP_TIMEOUT) {
+            Ok(result) => {
+                outcome = Some(result);
+                true
+            }
+            Err(RecvTimeoutError::Disconnected) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+        };
+        if !finished {
+            log::debug!("interrupting live Cast connection to {}", self.host);
+            if let Err(error) = self.interrupt.interrupt()
+                && error.kind() != std::io::ErrorKind::NotConnected
+            {
+                log::debug!("could not interrupt Cast connection: {error}");
+            }
+        }
+        thread
+            .join()
+            .map_err(|_| anyhow!("live Cast control thread for {} panicked", self.host))?;
+        let outcome = outcome
+            .or_else(|| self.done.try_recv().ok())
+            .unwrap_or(Ok(()));
+        if request_stop && !finished {
+            return Ok(());
+        }
+        outcome.map_err(anyhow::Error::msg)
+    }
+}
+
+impl Drop for LiveMediaSession {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown(true) {
+            log::warn!(
+                "could not shut down live Cast session for {}: {error:#}",
+                self.host
+            );
+        }
+    }
+}
+
 pub fn cast_url(host: IpAddr, port: u16, url: &str, content_type: &str, live: bool) -> Result<()> {
     cast_url_with_options(host, port, url, content_type, live, None, None)
 }
@@ -367,18 +544,6 @@ pub fn cast_url_with_hls_video_format(
         live,
         segment_format,
         Some(format),
-    )
-}
-
-pub fn cast_fmp4_hls(host: IpAddr, port: u16, url: &str) -> Result<()> {
-    cast_url_with_options(
-        host,
-        port,
-        url,
-        "application/x-mpegURL",
-        true,
-        Some(HlsSegmentFormat::Fmp4),
-        Some(HlsVideoSegmentFormat::Fmp4),
     )
 }
 
@@ -1094,6 +1259,146 @@ fn detailed_media_failure(code: MediaDetailedErrorCode, message_type: &str) -> M
         kind,
         detail: format!("receiver media error {code:?} ({message_type})"),
     }
+}
+
+fn run_live_media_session(
+    device: &CastDevice<'_>,
+    url: &str,
+    ready: &mpsc::SyncSender<std::result::Result<(), String>>,
+    commands: &Receiver<LiveMediaCommand>,
+) -> Result<()> {
+    device
+        .connection
+        .connect("receiver-0")
+        .context("could not initialize the Cast receiver channel")?;
+    device
+        .heartbeat
+        .ping()
+        .context("could not initialize the Cast heartbeat")?;
+    eprintln!("Launching the Default Media Receiver...");
+    let application = device
+        .receiver
+        .launch_app(&CastDeviceApp::DefaultMediaReceiver)
+        .context("could not launch the Default Media Receiver")?;
+    device
+        .connection
+        .connect(&application.transport_id)
+        .context("could not connect to the receiver application")?;
+
+    let media = Media {
+        content_id: url.to_owned(),
+        stream_type: StreamType::Live,
+        content_type: "application/x-mpegURL".to_owned(),
+        hls_segment_format: Some(HlsSegmentFormat::Fmp4),
+        hls_video_segment_format: Some(HlsVideoSegmentFormat::Fmp4),
+        metadata: None,
+        duration: Some(-1.0),
+    };
+    let status = device
+        .media
+        .load_with_opts(
+            application.transport_id.clone(),
+            application.session_id.clone(),
+            &media,
+            LoadOptions {
+                current_time: None,
+                autoplay: true,
+            },
+        )
+        .context("Cast receiver rejected the live HLS URL")?;
+    let media_session_id = status
+        .entries
+        .iter()
+        .find(|entry| {
+            entry
+                .media
+                .as_ref()
+                .is_some_and(|loaded| loaded.content_id == url)
+        })
+        .or_else(|| status.entries.first())
+        .map(|entry| entry.media_session_id)
+        .ok_or_else(|| anyhow!("Cast LOAD response did not contain a live media session"))?;
+    validate_live_status(&status, media_session_id)?;
+    println!("Cast receiver accepted {url}");
+    ready
+        .send(Ok(()))
+        .map_err(|_| anyhow!("caller stopped waiting for the Cast receiver"))?;
+
+    loop {
+        match commands.recv_timeout(LIVE_STATUS_POLL_INTERVAL) {
+            Ok(LiveMediaCommand::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                return stop_buffered_cast_session(
+                    device,
+                    &application.transport_id,
+                    &application.session_id,
+                    media_session_id,
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        let status = device
+            .media
+            .get_status(&application.transport_id, Some(media_session_id))
+            .context("could not poll live media status")?;
+        validate_live_status(&status, media_session_id)?;
+        while let Some(message) = device
+            .receive_buffered()
+            .context("could not parse a live Cast message")?
+        {
+            match message {
+                ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => {
+                    device
+                        .heartbeat
+                        .pong()
+                        .context("could not answer Cast receiver heartbeat")?;
+                }
+                ChannelMessage::Connection(ConnectionResponse::Close) => {
+                    return Err(anyhow!("Cast receiver closed the live media connection"));
+                }
+                ChannelMessage::Media(MediaResponse::Status(status)) => {
+                    validate_live_status(&status, media_session_id)?;
+                }
+                ChannelMessage::Media(MediaResponse::Error(error)) => {
+                    return Err(anyhow!(
+                        "receiver media error {:?} ({})",
+                        error.detailed_error_code,
+                        error.message_type
+                    ));
+                }
+                ChannelMessage::Media(MediaResponse::LoadFailed(error)) => {
+                    return Err(anyhow!(
+                        "receiver failed to load live media (request {})",
+                        error.request_id
+                    ));
+                }
+                ChannelMessage::Media(MediaResponse::LoadCancelled(error)) => {
+                    return Err(anyhow!(
+                        "receiver cancelled live media (request {})",
+                        error.request_id
+                    ));
+                }
+                message => log::trace!("live Cast control message: {message:?}"),
+            }
+        }
+    }
+}
+
+fn validate_live_status(status: &Status, media_session_id: i32) -> Result<()> {
+    let entry = status
+        .entries
+        .iter()
+        .find(|entry| entry.media_session_id == media_session_id)
+        .ok_or_else(|| anyhow!("receiver no longer reports the live media session"))?;
+    if entry.player_state == PlayerState::Idle && entry.extended_status.is_none() {
+        return Err(anyhow!(
+            "receiver ended the live media session ({})",
+            entry
+                .idle_reason
+                .map_or_else(|| "no reason".to_owned(), |reason| format!("{reason:?}"))
+        ));
+    }
+    Ok(())
 }
 
 fn cast_url_inner(

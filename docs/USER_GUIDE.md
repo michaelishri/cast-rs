@@ -77,6 +77,34 @@ archive, replace `cast` with `./cast`.
 
 Cast uses its low-latency mirroring transport by default. The first connection can take a few seconds while the receiver starts.
 
+## Cast to multiple receivers
+
+Repeat `--host` to show one existing display on several receivers:
+
+```sh
+cast desktop \
+  --host 192.168.1.50 \
+  --host 192.168.1.51
+```
+
+Cast captures and encodes the display once, then sends the encoded frames through a separate,
+encrypted Cast session for each receiver. The slowest negotiated frame rate and the most congested
+receiver govern the shared stream. If any receiver disconnects, stalls beyond its bounded queue, or
+otherwise fails, Cast stops the whole group cleanly.
+
+The HLS compatibility transport supports the same repeated-host form:
+
+```sh
+cast desktop \
+  --host 192.168.1.50 \
+  --host 192.168.1.51 \
+  --transport hls
+```
+
+HLS shares one capture when `--extend` is absent. Cast uses one local HTTP listener per network
+interface and gives every receiver a private stream route. The `--serve-only` diagnostic remains
+limited to exactly one `--host`.
+
 ## Use the receiver as a second display
 
 Create an independent desktop space instead of casting an existing display:
@@ -104,6 +132,20 @@ display only while the cast is active, and Cast removes it during normal or erro
 uses a private macOS API, however, so it is experimental and could stop working after a macOS
 update. Screen Recording permission is still required. `--extend` cannot be combined with
 `--display`.
+
+For several independent extended desktops, repeat `--host` and add one `--extend` switch:
+
+```sh
+cast desktop \
+  --host 192.168.1.50 \
+  --host 192.168.1.51 \
+  --extend
+```
+
+Cast creates a separate temporary display and capture/encoder pipeline for each receiver. Repeated
+host order is the mapping order: the first host gets extended display 1, the second gets display 2,
+and so on. The displays are arranged from left to right beyond the existing desktop. An error from
+any display or receiver tears down the complete group.
 
 The temporary display works with the HLS fallback as well:
 
@@ -227,6 +269,18 @@ cast profile --host 192.168.1.50
 ```
 
 The final report recommends a `desktop` command. Copy that command as the starting point for everyday use.
+
+Repeat `--host` to profile every receiver together:
+
+```sh
+cast profile \
+  --host 192.168.1.50 \
+  --host 192.168.1.51
+```
+
+The report includes per-receiver measurements and one worst-common recommendation. Group profiling
+also supports `--extend`, synthetic input, and `--auto-tune`; an extended group profiles one
+temporary display per receiver.
 
 For a repeatable automated comparison of latency controls, use the synthetic workload:
 

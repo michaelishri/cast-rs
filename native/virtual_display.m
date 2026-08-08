@@ -51,7 +51,6 @@ static __strong id cast_mode = nil;
 
 static const uint32_t CAST_VENDOR_ID = 0xCA57;
 static const uint32_t CAST_PRODUCT_ID = 0x0001;
-static const uint32_t CAST_SERIAL_NUMBER = 0x0001;
 enum { MAX_DISPLAYS = 32 };
 
 static void set_error(char *buffer, size_t length, const char *message) {
@@ -69,7 +68,8 @@ static void set_descriptor_serial(id<CastVirtualDisplayDescriptorApi> descriptor
     }
 }
 
-static bool cast_display_is_already_online(CGDirectDisplayID *existing_id) {
+static bool cast_display_with_serial_is_online(uint32_t serial_number,
+                                               CGDirectDisplayID *existing_id) {
     CGDirectDisplayID displays[MAX_DISPLAYS];
     uint32_t count = 0;
     if (CGGetOnlineDisplayList((uint32_t)MAX_DISPLAYS, displays, &count) !=
@@ -80,7 +80,7 @@ static bool cast_display_is_already_online(CGDirectDisplayID *existing_id) {
         CGDirectDisplayID display_id = displays[index];
         if (CGDisplayVendorNumber(display_id) == CAST_VENDOR_ID &&
             CGDisplayModelNumber(display_id) == CAST_PRODUCT_ID &&
-            CGDisplaySerialNumber(display_id) == CAST_SERIAL_NUMBER) {
+            CGDisplaySerialNumber(display_id) == serial_number) {
             if (existing_id != NULL) {
                 *existing_id = display_id;
             }
@@ -202,12 +202,15 @@ static CGError configure_as_extension(CGDirectDisplayID display_id,
 
 uint32_t cast_virtual_display_create(uint32_t width, uint32_t height,
                                      uint32_t frames_per_second,
+                                     uint32_t serial_number,
+                                     uint32_t ordinal,
                                      char *error_buffer,
                                      size_t error_buffer_length) {
     @autoreleasepool {
-        if (width < 2 || height < 2 || frames_per_second == 0) {
+        if (width < 2 || height < 2 || frames_per_second == 0 ||
+            serial_number == 0 || ordinal == 0) {
             set_error(error_buffer, error_buffer_length,
-                      "virtual display dimensions and frame rate must be positive");
+                      "virtual display dimensions, frame rate, serial, and ordinal must be positive");
             return 0;
         }
         if (cast_display != nil) {
@@ -217,11 +220,11 @@ uint32_t cast_virtual_display_create(uint32_t width, uint32_t height,
         }
 
         CGDirectDisplayID existing_id = kCGNullDirectDisplay;
-        if (cast_display_is_already_online(&existing_id)) {
+        if (cast_display_with_serial_is_online(serial_number, &existing_id)) {
             char message[160];
             snprintf(message, sizeof(message),
-                     "another Cast extended display is already active (display %u)",
-                     existing_id);
+                     "another Cast extended display already uses serial %u (display %u)",
+                     serial_number, existing_id);
             set_error(error_buffer, error_buffer_length, message);
             return 0;
         }
@@ -250,10 +253,11 @@ uint32_t cast_virtual_display_create(uint32_t width, uint32_t height,
                       "could not create a CGVirtualDisplay descriptor");
             return 0;
         }
-        descriptor.name = @"Cast Extended Display";
+        descriptor.name =
+            [NSString stringWithFormat:@"Cast Extended Display %u", ordinal];
         descriptor.vendorID = CAST_VENDOR_ID;
         descriptor.productID = CAST_PRODUCT_ID;
-        set_descriptor_serial(descriptor, CAST_SERIAL_NUMBER);
+        set_descriptor_serial(descriptor, serial_number);
         descriptor.maxPixelsWide = width;
         descriptor.maxPixelsHigh = height;
         double pixel_diagonal = hypot((double)width, (double)height);

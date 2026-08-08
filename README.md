@@ -10,7 +10,7 @@ The CLI currently supports these Cast paths:
 - control Google Cast receivers with `rust-cast`;
 - inspect, remux, or transcode local media through linked FFmpeg libraries;
 - capture a macOS display with ScreenCaptureKit and hardware-encode it with VideoToolbox;
-- create a temporary extended display for a desktop cast without installing a display driver;
+- cast one captured desktop to multiple receivers, or create one temporary extended display per receiver without installing a display driver;
 - send encrypted H.264 over Cast Streaming RTP with receiver feedback and retransmission;
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
 - retain fragmented-MP4 HLS as a compatibility fallback.
@@ -83,11 +83,27 @@ cargo run -- displays
 # Cast the first display over the default low-latency mirroring transport
 cargo run --release -- desktop --host 192.168.1.50
 
+# Mirror one shared desktop source to two receivers
+cargo run --release -- desktop \
+  --host 192.168.1.50 \
+  --host 192.168.1.51
+
 # Create a temporary second display and cast that independent desktop space
 cargo run --release -- desktop --host 192.168.1.50 --extend
 
+# Create a separate temporary extended display for each receiver, in --host order
+cargo run --release -- desktop \
+  --host 192.168.1.50 \
+  --host 192.168.1.51 \
+  --extend
+
 # Profile the real capture/network path for one minute and recommend a delay
 cargo run --release -- profile --host 192.168.1.50
+
+# Profile two receivers and emit one worst-common recommendation
+cargo run --release -- profile \
+  --host 192.168.1.50 \
+  --host 192.168.1.51
 
 # Run the repeatable synthetic stress workload instead of capturing the desktop
 cargo run --release -- profile --host 192.168.1.50 --synthetic
@@ -191,22 +207,26 @@ trouble with incremental fMP4 HLS. DRM-protected or corrupt inputs cannot be con
 
 ## How live casting works
 
-By default, `desktop` launches the receiver's built-in Chrome Mirroring application and performs the Cast Streaming `OFFER`/`ANSWER` exchange. It converts VideoToolbox's AVCC output to Annex B, prepends SPS/PPS to keyframes, encrypts each frame with session-specific AES-128-CTR material, and sends it as Cast RTP over UDP. RTCP sender reports establish the media clock; receiver checkpoints and loss fields drive history cleanup and packet retransmission. The default offer requests a 200 ms receiver playout delay. Actual glass-to-glass latency also includes capture, encode, Wi-Fi, decode, and display time.
+By default, `desktop` launches each receiver's built-in Chrome Mirroring application and performs a Cast Streaming `OFFER`/`ANSWER` exchange. It converts VideoToolbox's AVCC output to Annex B, prepends SPS/PPS to keyframes, encrypts each frame with session-specific AES-128-CTR material, and sends it as Cast RTP over UDP. RTCP sender reports establish the media clock; receiver checkpoints and loss fields drive history cleanup and packet retransmission. The default offer requests a 200 ms receiver playout delay. Actual glass-to-glass latency also includes capture, encode, Wi-Fi, decode, and display time.
 
-Add `--extend` to `desktop` when the receiver should be an independent second desktop rather than a
-copy of an existing screen. Cast creates one non-HiDPI virtual display whose mode matches the
-effective `--width`, `--height`, and requested `--fps`, places it to the right of the existing
-desktop, and captures it with ScreenCaptureKit. It works with both the default mirroring transport
-and `--transport hls`. Move a window onto the new display while Cast is running. The helper process
-owns the display and releases it on normal shutdown, errors, or loss of the parent process; no
-display driver or system extension is installed. `--extend` and `--display` are mutually exclusive.
+Repeat `--host` to cast to a receiver group. Without `--extend`, Cast captures and encodes the selected display once, then fans each encoded frame out through an independent encrypted RTP session. The slowest negotiated receiver frame rate caps the shared pipeline, and congestion reported by any receiver lowers the common adaptive bitrate. Each receiver has a bounded sender queue, so a stalled or failed target stops the complete group instead of allowing the outputs to drift apart. Startup and teardown are likewise all-or-nothing.
+
+Add `--extend` to `desktop` when each receiver should be an independent desktop rather than a copy
+of an existing screen. Cast creates one non-HiDPI virtual display per receiver, with modes matching
+the effective `--width`, `--height`, and requested `--fps`, and gives each display its own capture
+and encoder pipeline. Displays are placed to the right of the existing desktop in repeated
+`--host` order: the first host receives extended display 1, the second receives display 2, and so
+on. It works with both the default mirroring transport and `--transport hls`. Move windows onto the
+new displays while Cast is running. Helper processes own the displays and release them on normal
+shutdown, errors, or loss of the parent process; no display driver or system extension is installed.
+`--extend` and `--display` are mutually exclusive.
 
 The same switch is available on `profile`, so `cast profile --host 192.168.1.50 --extend` measures
 the temporary-display path and prints a recommendation that retains `--extend`. It cannot be mixed
 with the synthetic profiler or `--auto-tune` because those modes intentionally bypass display
 capture.
 
-`--transport hls` uses the earlier compatibility path. It determines the Mac's LAN address from the route to the receiver, binds an HTTP server only to that address, generates a random session path, and serves a rolling fragmented-MP4 HLS stream through the Default Media Receiver. Its one-second HLS target duration typically leaves playback roughly three seconds behind the encoder's live edge.
+`--transport hls` uses the earlier compatibility path. It determines the Mac's LAN address for each receiver and starts one HTTP listener per distinct local interface, with a private random route for every target. Receivers on the same interface share a listener. Without `--extend`, all routes serve one shared fragmented-MP4 capture; with `--extend`, each route serves its receiver's independent capture. Owned Default Media Receiver sessions are monitored for the lifetime of the group. Its one-second HLS target duration typically leaves playback roughly three seconds behind the encoder's live edge. `--serve-only` remains a single-host diagnostic mode.
 
 Live output defaults to aspect-preserved 1280x720 H.264 Baseline Level 3.1 for compatibility with Google Nest Hub receivers. The mirroring path selects the minimum valid H.264 level from resolution, frame rate, and bitrate: 720p60 uses Level 3.2 rather than incorrectly advertising Level 3.1. If the Cast `ANSWER` selects a lower display frame rate than requested, capture and encoding are capped to the receiver's rate instead of wasting bandwidth on frames it cannot display. ScreenCaptureKit presentation timestamps drive the HLS timeline even when macOS emits metadata-only samples between video frames.
 
@@ -224,7 +244,12 @@ offer.
 
 ## Latency profiling
 
-`profile` runs the same ScreenCaptureKit, VideoToolbox, encrypted RTP, and receiver-feedback path as `desktop`, using a deliberately small 10 ms receiver probe buffer by default. For 60 seconds it redraws a terminal graph of the most recent per-second p95 latency and displays cumulative p50, p95, p99, and packet-loss measurements. Use the desktop normally—especially scrolling, animation, and window changes—so keyframe and bitrate pressure resemble the intended workload.
+`profile` runs the same ScreenCaptureKit, VideoToolbox, encrypted RTP, and receiver-feedback path as `desktop`, using a deliberately small 10 ms receiver probe buffer by default. A single-receiver profile redraws a terminal graph of the most recent per-second p95 latency and displays cumulative p50, p95, p99, and packet-loss measurements. Use the desktop normally—especially scrolling, animation, and window changes—so keyframe and bitrate pressure resemble the intended workload.
+
+Repeat `--host` to profile a receiver group. Cast reports each receiver independently and emits one
+command using the worst observed tail latency, loss, negotiated frame rate, and bitrate outcome.
+Synthetic profiling and auto-tuning also support receiver groups. With `--extend`, each receiver is
+profiled against its own temporary display and capture pipeline.
 
 Add `--synthetic` for repeatable comparisons between encoder or transport settings. This bypasses ScreenCaptureKit and writes deterministic `420v` content into a small reusable IOSurface pool, then follows the same latest-frame queue, VideoToolbox, encryption, RTP, feedback, and receiver path as normal mirroring. Reports identify this stable workload as `synthetic-v1`. Its ten-second cycle contains four equal 2.5-second phases:
 
@@ -295,7 +320,7 @@ ScreenCaptureKit currently composites the cursor into each captured video frame.
 - If `video` reports that the receiver never requested the file, check the firewall and guest/client-isolation settings.
 - Try a lower bitrate for congested Wi-Fi: `--bitrate 3000000`.
 - Use `--transport hls --serve-only` to test HLS packaging without contacting a receiver; for safety this mode binds only to loopback.
-- Port 8080 must be available for HLS, or select another one with `--http-port`.
+- Port 8080 must be available on every HLS listener interface, or select another one with `--http-port`.
 - If `--extend` reports that `CGVirtualDisplay` is unavailable, that macOS build is not compatible
   with the experimental private API; cast an existing display instead.
 - If a temporary display is blank or cannot be captured, re-check Screen Recording permission for
