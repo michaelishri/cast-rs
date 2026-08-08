@@ -747,6 +747,9 @@ fn run_desktop(
         if let Some(error) = take_failure(&failure)? {
             bail!("mirroring encoder failed: {error}");
         }
+        if let Some(error) = take_failure(&negotiation.control.failure)? {
+            bail!("Cast Streaming control connection failed: {error}");
+        }
         if let Some(graph) = graph.as_mut() {
             graph.draw_if_due(&stats, started.elapsed())?;
         }
@@ -761,7 +764,8 @@ fn run_desktop(
     input.stop()?;
     drop(feedback);
     negotiation
-        .control_close_expected
+        .control
+        .close_expected
         .store(true, Ordering::SeqCst);
     if let Err(error) = stop_cast_streaming_session(
         options.cast_host,
@@ -1783,7 +1787,14 @@ struct NegotiatedTransport {
     aes_key: [u8; 16],
     aes_iv_mask: [u8; 16],
     receiver_frame_rate: Option<u32>,
-    control_close_expected: Arc<AtomicBool>,
+    control: Arc<CastStreamingControlState>,
+}
+
+#[derive(Default)]
+struct CastStreamingControlState {
+    close_expected: AtomicBool,
+    ready: AtomicBool,
+    failure: Mutex<Option<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1808,7 +1819,7 @@ fn negotiate_cast_streaming(
         h264_level,
     );
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-    let thread_control_close_expected = Arc::new(AtomicBool::new(false));
+    let thread_control = Arc::new(CastStreamingControlState::default());
     thread::Builder::new()
         .name("cast-mirror-control".into())
         .spawn(move || {
@@ -1818,18 +1829,23 @@ fn negotiate_cast_streaming(
                 material,
                 offer,
                 &ready_sender,
-                Arc::clone(&thread_control_close_expected),
+                Arc::clone(&thread_control),
             );
             if let Err(error) = result {
                 let message = format!("{error:#}");
-                if ready_sender.send(Err(error)).is_err() {
-                    if thread_control_close_expected.load(Ordering::SeqCst) {
+                if thread_control.ready.load(Ordering::SeqCst) {
+                    if thread_control.close_expected.load(Ordering::SeqCst) {
                         log::debug!(
                             "Cast Streaming control connection ended after planned teardown: {message}"
                         );
                     } else {
+                        store_source_failure(&thread_control.failure, message.clone());
                         log::warn!("Cast Streaming control connection ended: {message}");
                     }
+                } else if ready_sender.send(Err(error)).is_err() {
+                    log::warn!(
+                        "Cast Streaming negotiation ended after the caller stopped waiting: {message}"
+                    );
                 }
             }
         })
@@ -1846,7 +1862,7 @@ fn negotiate_cast_streaming_inner(
     material: OfferMaterial,
     offer: CastStreamingOfferMessage,
     ready: &mpsc::SyncSender<Result<NegotiatedTransport>>,
-    shared_control_close_expected: Arc<AtomicBool>,
+    shared_control: Arc<CastStreamingControlState>,
 ) -> Result<()> {
     eprintln!("Connecting to Cast receiver at {host}:{port}...");
     let device = CastDevice::connect_without_host_verification(host.to_string(), port)
@@ -1929,9 +1945,10 @@ fn negotiate_cast_streaming_inner(
             aes_key: material.aes_key,
             aes_iv_mask: material.aes_iv_mask,
             receiver_frame_rate,
-            control_close_expected: shared_control_close_expected,
+            control: Arc::clone(&shared_control),
         }))
         .map_err(|_| anyhow!("caller stopped waiting for Cast Streaming negotiation"))?;
+    shared_control.ready.store(true, Ordering::SeqCst);
 
     monitor_cast_streaming_control(&device)
 }
@@ -1952,8 +1969,7 @@ fn stop_cast_streaming_session(host: IpAddr, port: u16, session_id: &str) -> Res
 
 fn wait_for_answer(device: &CastDevice<'_>, expected_sequence: u32) -> Result<AnswerData> {
     loop {
-        match device
-            .receive()
+        match receive_cast_streaming_message(device)
             .context("could not receive Cast Streaming negotiation message")?
         {
             ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => {
@@ -2020,11 +2036,23 @@ fn parse_answer(message: CastMessage, expected_sequence: u32) -> Result<Option<A
     })?))
 }
 
+fn receive_cast_streaming_message(device: &CastDevice<'_>) -> Result<ChannelMessage> {
+    let message = device.receive_raw()?;
+    if device.connection.can_handle(&message) {
+        return Ok(ChannelMessage::Connection(
+            device.connection.parse(&message)?,
+        ));
+    }
+    if device.heartbeat.can_handle(&message) {
+        return Ok(ChannelMessage::Heartbeat(device.heartbeat.parse(&message)?));
+    }
+    Ok(ChannelMessage::Raw(message))
+}
+
 fn monitor_cast_streaming_control(device: &CastDevice<'_>) -> Result<()> {
     log::debug!("monitoring Cast Streaming control channel");
     loop {
-        match device
-            .receive()
+        match receive_cast_streaming_message(device)
             .context("could not receive the next Cast Streaming control message")?
         {
             ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => {
@@ -3685,7 +3713,7 @@ fn local_ip_for(host: IpAddr, port: u16) -> Result<IpAddr> {
 fn take_failure(failure: &Mutex<Option<String>>) -> Result<Option<String>> {
     Ok(failure
         .lock()
-        .map_err(|_| anyhow!("encoder failure lock was poisoned"))?
+        .map_err(|_| anyhow!("failure state lock was poisoned"))?
         .take())
 }
 

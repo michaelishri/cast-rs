@@ -282,8 +282,16 @@ impl<'a> CastDevice<'a> {
     ///
     /// Parsed channel message.
     pub fn receive(&self) -> Result<ChannelMessage, Error> {
-        let cast_message = self.message_manager.receive()?;
+        let cast_message = self.receive_raw()?;
         self.parse_message(cast_message)
+    }
+
+    /// Waits for any message returned by the Cast device without parsing its channel payload.
+    ///
+    /// This is useful for protocol-specific clients that need to keep handling heartbeat and
+    /// connection messages while treating unrelated namespaces as opaque data.
+    pub fn receive_raw(&self) -> Result<CastMessage, Error> {
+        self.message_manager.receive()
     }
 
     /// Returns a message retained by a previous filtered receive without waiting on the network.
