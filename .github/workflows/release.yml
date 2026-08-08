@@ -60,7 +60,6 @@ jobs:
           cp target/release/cast "package/$archive_root/"
           mkdir -p "package/$archive_root/lib"
           cp -R .build/ffmpeg-dist/lib/*.dylib "package/$archive_root/lib/"
-          cp docs/USER_GUIDE.md "package/$archive_root/"
           cp README.md "package/$archive_root/"
           cp LICENSE "package/$archive_root/"
           cp THIRD_PARTY_NOTICES.md "package/$archive_root/"
