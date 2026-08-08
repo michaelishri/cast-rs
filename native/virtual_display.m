@@ -48,14 +48,10 @@ static __strong id cast_display = nil;
 static __strong id cast_descriptor = nil;
 static __strong id cast_settings = nil;
 static __strong id cast_mode = nil;
-static uint32_t cast_width = 0;
-static uint32_t cast_height = 0;
-static uint32_t cast_frames_per_second = 0;
 
 static const uint32_t CAST_VENDOR_ID = 0xCA57;
 static const uint32_t CAST_PRODUCT_ID = 0x0001;
 static const uint32_t CAST_SERIAL_NUMBER = 0x0001;
-static const uint32_t CAST_TEARDOWN_SERIAL_NUMBER = 0x0002;
 enum { MAX_DISPLAYS = 32 };
 
 static void set_error(char *buffer, size_t length, const char *message) {
@@ -82,11 +78,9 @@ static bool cast_display_is_already_online(CGDirectDisplayID *existing_id) {
     }
     for (uint32_t index = 0; index < count; index++) {
         CGDirectDisplayID display_id = displays[index];
-        uint32_t serial_number = CGDisplaySerialNumber(display_id);
         if (CGDisplayVendorNumber(display_id) == CAST_VENDOR_ID &&
             CGDisplayModelNumber(display_id) == CAST_PRODUCT_ID &&
-            (serial_number == CAST_SERIAL_NUMBER ||
-             serial_number == CAST_TEARDOWN_SERIAL_NUMBER)) {
+            CGDisplaySerialNumber(display_id) == CAST_SERIAL_NUMBER) {
             if (existing_id != NULL) {
                 *existing_id = display_id;
             }
@@ -167,9 +161,6 @@ static void release_cast_display(void) {
     cast_settings = nil;
     cast_mode = nil;
     cast_descriptor = nil;
-    cast_width = 0;
-    cast_height = 0;
-    cast_frames_per_second = 0;
 }
 
 static CGError configure_as_extension(CGDirectDisplayID display_id,
@@ -299,9 +290,6 @@ uint32_t cast_virtual_display_create(uint32_t width, uint32_t height,
         cast_mode = mode;
         cast_settings = settings;
         cast_display = display;
-        cast_width = width;
-        cast_height = height;
-        cast_frames_per_second = frames_per_second;
         CGDirectDisplayID display_id = display.displayID;
         if (!wait_until_online(display_id)) {
             release_cast_display();
@@ -325,121 +313,9 @@ uint32_t cast_virtual_display_create(uint32_t width, uint32_t height,
     }
 }
 
-bool cast_virtual_display_destroy(uint32_t *companion_display_id,
-                                  char *error_buffer,
-                                  size_t error_buffer_length) {
+void cast_virtual_display_destroy(void) {
     @autoreleasepool {
-        if (companion_display_id != NULL) {
-            *companion_display_id = kCGNullDirectDisplay;
-        }
-        if (cast_display == nil) {
-            release_cast_display();
-            return true;
-        }
-
-        // WindowServer has a long-standing bug where the first CGVirtualDisplay
-        // created in a process can remain online when it is released by itself.
-        // Chromium works around the same behavior by creating a second display
-        // and releasing both together (crbug.com/40148077). Each Cast helper is
-        // a fresh process, so perform that workaround for every session teardown.
-        Class descriptor_class = NSClassFromString(@"CGVirtualDisplayDescriptor");
-        Class mode_class = NSClassFromString(@"CGVirtualDisplayMode");
-        Class settings_class = NSClassFromString(@"CGVirtualDisplaySettings");
-        Class display_class = NSClassFromString(@"CGVirtualDisplay");
-        if (descriptor_class == Nil || mode_class == Nil ||
-            settings_class == Nil || display_class == Nil ||
-            cast_width < 2 || cast_height < 2 ||
-            cast_frames_per_second == 0) {
-            release_cast_display();
-            set_error(error_buffer, error_buffer_length,
-                      "could not prepare the virtual display teardown workaround");
-            return false;
-        }
-
-        id<CastVirtualDisplayDescriptorApi> companion_descriptor =
-            [(id)descriptor_class new];
-        if (companion_descriptor == nil) {
-            release_cast_display();
-            set_error(error_buffer, error_buffer_length,
-                      "could not create the companion display descriptor used during teardown");
-            return false;
-        }
-        companion_descriptor.name = @"Cast Teardown Display";
-        companion_descriptor.vendorID = CAST_VENDOR_ID;
-        companion_descriptor.productID = CAST_PRODUCT_ID;
-        set_descriptor_serial(companion_descriptor,
-                              CAST_TEARDOWN_SERIAL_NUMBER);
-        companion_descriptor.maxPixelsWide = cast_width;
-        companion_descriptor.maxPixelsHigh = cast_height;
-        double pixel_diagonal = hypot((double)cast_width, (double)cast_height);
-        double millimeter_diagonal = 27.0 * 25.4;
-        companion_descriptor.sizeInMillimeters = CGSizeMake(
-            millimeter_diagonal * (double)cast_width / pixel_diagonal,
-            millimeter_diagonal * (double)cast_height / pixel_diagonal);
-        [companion_descriptor setDispatchQueue:
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0)];
-
-        id<CastVirtualDisplayModeApi> companion_mode =
-            [[(id)mode_class alloc] initWithWidth:cast_width
-                                           height:cast_height
-                                      refreshRate:(CGFloat)cast_frames_per_second];
-        id<CastVirtualDisplaySettingsApi> companion_settings =
-            [(id)settings_class new];
-        if (companion_mode == nil || companion_settings == nil) {
-            release_cast_display();
-            set_error(error_buffer, error_buffer_length,
-                      "could not create the companion display mode used during teardown");
-            return false;
-        }
-        companion_settings.hiDPI = 0;
-        companion_settings.modes = @[ companion_mode ];
-
-        id<CastVirtualDisplayApi> companion_display =
-            [[(id)display_class alloc] initWithDescriptor:companion_descriptor];
-        if (companion_display == nil ||
-            ![companion_display applySettings:companion_settings] ||
-            companion_display.displayID == kCGNullDirectDisplay) {
-            release_cast_display();
-            set_error(error_buffer, error_buffer_length,
-                      "macOS rejected the companion display used during teardown");
-            return false;
-        }
-
-        CGDirectDisplayID companion_id = companion_display.displayID;
-        if (!wait_until_online(companion_id)) {
-            release_cast_display();
-            companion_display = nil;
-            set_error(error_buffer, error_buffer_length,
-                      "the companion teardown display did not become visible to WindowServer");
-            return false;
-        }
-        // CGDisplayIsOnline can become true just before the corresponding
-        // display-reconfiguration notification is delivered. Give WindowServer
-        // one polling interval to finish registering the companion.
-        usleep(100000);
-        if (!online_display_list_contains(companion_id)) {
-            release_cast_display();
-            companion_display = nil;
-            set_error(error_buffer, error_buffer_length,
-                      "the companion teardown display disappeared before registration completed");
-            return false;
-        }
-        if (companion_display_id != NULL) {
-            *companion_display_id = companion_id;
-        }
-
-        // Keep both strong references alive until WindowServer knows about the
-        // companion, then release the pair without returning to the run loop in
-        // between. The remaining objects do not own either display.
-        cast_display = nil;
-        companion_display = nil;
-        cast_settings = nil;
-        cast_mode = nil;
-        cast_descriptor = nil;
-        cast_width = 0;
-        cast_height = 0;
-        cast_frames_per_second = 0;
-        return true;
+        release_cast_display();
     }
 }
 

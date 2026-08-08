@@ -19,19 +19,13 @@ unsafe extern "C" {
         error_buffer: *mut c_char,
         error_buffer_length: usize,
     ) -> u32;
-    fn cast_virtual_display_destroy(
-        companion_display_id: *mut u32,
-        error_buffer: *mut c_char,
-        error_buffer_length: usize,
-    ) -> bool;
+    fn cast_virtual_display_destroy();
     fn cast_virtual_display_is_online(display_id: u32) -> bool;
 }
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHAREABLE_TIMEOUT: Duration = Duration::from_secs(5);
-// Teardown may spend up to five seconds registering the companion display and
-// another five waiting for WindowServer to remove the pair.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
 
 pub struct VirtualDisplaySession {
     display_id: u32,
@@ -46,8 +40,7 @@ impl VirtualDisplaySession {
             .context("could not locate the Cast executable for the virtual display helper")?;
         let mut command = Command::new(executable);
         let helper_stderr = if log::log_enabled!(log::Level::Debug) {
-            // The helper's final anyhow error identifies which teardown phase
-            // failed. Surface it alongside the parent's timing at -v/-vv.
+            // Surface helper failures alongside the parent's timing at -v/-vv.
             Stdio::inherit()
         } else {
             Stdio::null()
@@ -328,39 +321,10 @@ pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
         Ok(())
     })();
 
-    let companion_display_id = guard
-        .release()
-        .context("could not apply the virtual display teardown workaround")?;
-    let started = Instant::now();
-    while display_pair_is_online(display_id, companion_display_id, native_is_online) {
-        if started.elapsed() >= SHAREABLE_TIMEOUT {
-            let display_online = native_is_online(display_id);
-            let companion_online =
-                companion_display_id != 0 && native_is_online(companion_display_id);
-            match (display_online, companion_online) {
-                (true, true) => bail!(
-                    "virtual display {display_id} and its teardown companion {companion_display_id} remained online after release"
-                ),
-                (false, true) => bail!(
-                    "teardown companion display {companion_display_id} remained online after release"
-                ),
-                (true, false) => {
-                    bail!("virtual display {display_id} remained online after release")
-                }
-                (false, false) => break,
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    // WindowServer may keep the display registered until this helper exits, so
+    // the parent performs the offline check after reaping the process.
+    guard.release();
     read_result
-}
-
-fn display_pair_is_online(
-    display_id: u32,
-    companion_display_id: u32,
-    mut is_online: impl FnMut(u32) -> bool,
-) -> bool {
-    is_online(display_id) || (companion_display_id != 0 && is_online(companion_display_id))
 }
 
 struct NativeDisplayGuard {
@@ -368,16 +332,16 @@ struct NativeDisplayGuard {
 }
 
 impl NativeDisplayGuard {
-    fn release(mut self) -> Result<u32> {
+    fn release(mut self) {
         self.armed = false;
-        native_destroy()
+        native_destroy();
     }
 }
 
 impl Drop for NativeDisplayGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = native_destroy();
+            native_destroy();
         }
     }
 }
@@ -437,36 +401,14 @@ fn native_create(_width: u32, _height: u32, _fps: u32, error_buffer: &mut [c_cha
 }
 
 #[cfg(target_os = "macos")]
-fn native_destroy() -> Result<u32> {
-    let mut companion_display_id = 0;
-    let mut error_buffer = [0 as c_char; 512];
-    // SAFETY: the helper owns at most one Cast display. Both output pointers
-    // remain valid and writable for the duration of this idempotent call.
-    let destroyed = unsafe {
-        cast_virtual_display_destroy(
-            &mut companion_display_id,
-            error_buffer.as_mut_ptr(),
-            error_buffer.len(),
-        )
-    };
-    if !destroyed {
-        let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let message = if message.is_empty() {
-            "macOS did not release the temporary virtual display".to_owned()
-        } else {
-            single_line(&message)
-        };
-        bail!(message);
-    }
-    Ok(companion_display_id)
+fn native_destroy() {
+    // SAFETY: the helper owns at most one Cast display. The native operation is
+    // idempotent and receives no borrowed data.
+    unsafe { cast_virtual_display_destroy() }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_destroy() -> Result<u32> {
-    Ok(0)
-}
+fn native_destroy() {}
 
 #[cfg(target_os = "macos")]
 fn native_is_online(display_id: u32) -> bool {
@@ -481,7 +423,7 @@ fn native_is_online(_display_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_pair_is_online, parse_startup_message, single_line};
+    use super::{parse_startup_message, single_line};
 
     #[test]
     fn parses_ready_message() {
@@ -506,16 +448,5 @@ mod tests {
     #[test]
     fn helper_protocol_messages_stay_on_one_line() {
         assert_eq!(single_line("one\ntwo\rthree"), "one two three");
-    }
-
-    #[test]
-    fn teardown_waits_for_both_virtual_displays() {
-        assert!(display_pair_is_online(41, 42, |id| id == 41));
-        assert!(display_pair_is_online(41, 42, |id| id == 42));
-        assert!(!display_pair_is_online(41, 42, |_| false));
-        assert!(!display_pair_is_online(41, 0, |id| {
-            assert_ne!(id, 0);
-            false
-        }));
     }
 }
