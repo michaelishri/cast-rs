@@ -85,6 +85,14 @@ struct MediaLoad {
     hls_video_segment_format: Option<HlsVideoSegmentFormat>,
 }
 
+struct BufferedMediaLoad {
+    url: String,
+    content_type: String,
+    start_at: f64,
+    duration: Option<f64>,
+    fmp4_hls: bool,
+}
+
 impl BufferedMediaSession {
     pub fn start(
         host: IpAddr,
@@ -93,6 +101,43 @@ impl BufferedMediaSession {
         content_type: String,
         start_at: f64,
     ) -> Result<Self> {
+        Self::start_with_options(host, port, url, content_type, start_at, None, false)
+    }
+
+    pub fn start_fmp4_hls(
+        host: IpAddr,
+        port: u16,
+        url: String,
+        start_at: f64,
+        duration: Option<f64>,
+    ) -> Result<Self> {
+        Self::start_with_options(
+            host,
+            port,
+            url,
+            "application/x-mpegURL".to_owned(),
+            start_at,
+            duration,
+            true,
+        )
+    }
+
+    fn start_with_options(
+        host: IpAddr,
+        port: u16,
+        url: String,
+        content_type: String,
+        start_at: f64,
+        duration: Option<f64>,
+        fmp4_hls: bool,
+    ) -> Result<Self> {
+        let media_load = BufferedMediaLoad {
+            url,
+            content_type,
+            start_at,
+            duration,
+            fmp4_hls,
+        };
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
@@ -139,9 +184,7 @@ impl BufferedMediaSession {
 
                 let outcome = match run_buffered_media_session(
                     &device,
-                    &url,
-                    &content_type,
-                    start_at,
+                    &media_load,
                     &command_receiver,
                     &event_sender,
                 ) {
@@ -318,9 +361,7 @@ fn cast_url_with_options(
 
 fn run_buffered_media_session(
     device: &CastDevice<'_>,
-    url: &str,
-    content_type: &str,
-    start_at: f64,
+    media_load: &BufferedMediaLoad,
     commands: &Receiver<MediaSessionCommand>,
     events: &Sender<MediaSessionEvent>,
 ) -> Result<()> {
@@ -345,21 +386,16 @@ fn run_buffered_media_session(
     events
         .send(MediaSessionEvent::Loading)
         .map_err(|_| anyhow!("local video caller stopped waiting for the Cast receiver"))?;
-    let media = Media {
-        content_id: url.to_owned(),
-        stream_type: StreamType::Buffered,
-        content_type: content_type.to_owned(),
-        hls_segment_format: None,
-        hls_video_segment_format: None,
-        metadata: None,
-        duration: None,
-    };
+    let media = buffered_media(media_load);
     let load_options = LoadOptions {
-        current_time: Some(start_at),
+        current_time: Some(media_load.start_at),
         autoplay: true,
     };
     log::debug!(
-        "loading buffered media: content_type={content_type}, start_position={start_at:.3}s"
+        "loading buffered media: content_type={}, start_position={:.3}s, fmp4_hls={}",
+        media_load.content_type,
+        media_load.start_at,
+        media_load.fmp4_hls
     );
     eprintln!("Loading the buffered media URL...");
     let status = match device.media.load_with_opts(
@@ -383,7 +419,7 @@ fn run_buffered_media_session(
             entry
                 .media
                 .as_ref()
-                .is_some_and(|loaded| loaded.content_id == url)
+                .is_some_and(|loaded| loaded.content_id == media_load.url)
         })
         .or_else(|| status.entries.first())
         .map(|entry| entry.media_session_id)
@@ -394,15 +430,30 @@ fn run_buffered_media_session(
 
     let mut last_state = None;
     if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
-        return Ok(());
+        return stop_buffered_cast_session(
+            device,
+            &application.transport_id,
+            &application.session_id,
+            media_session_id,
+        );
     }
     if emit_status(status, media_session_id, &mut last_state, events) {
-        return Ok(());
+        return stop_buffered_cast_session(
+            device,
+            &application.transport_id,
+            &application.session_id,
+            media_session_id,
+        );
     }
 
     loop {
         if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
-            return Ok(());
+            return stop_buffered_cast_session(
+                device,
+                &application.transport_id,
+                &application.session_id,
+                media_session_id,
+            );
         }
 
         match commands.recv_timeout(BUFFERED_STATUS_POLL_INTERVAL) {
@@ -424,11 +475,33 @@ fn run_buffered_media_session(
             .get_status(&application.transport_id, Some(media_session_id))
             .context("could not poll buffered media status")?;
         if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
-            return Ok(());
+            return stop_buffered_cast_session(
+                device,
+                &application.transport_id,
+                &application.session_id,
+                media_session_id,
+            );
         }
         if emit_status(status, media_session_id, &mut last_state, events) {
-            return Ok(());
+            return stop_buffered_cast_session(
+                device,
+                &application.transport_id,
+                &application.session_id,
+                media_session_id,
+            );
         }
+    }
+}
+
+fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
+    Media {
+        content_id: media_load.url.clone(),
+        stream_type: StreamType::Buffered,
+        content_type: media_load.content_type.clone(),
+        hls_segment_format: media_load.fmp4_hls.then_some(HlsSegmentFormat::Fmp4),
+        hls_video_segment_format: media_load.fmp4_hls.then_some(HlsVideoSegmentFormat::Fmp4),
+        metadata: None,
+        duration: media_load.duration.map(|duration| duration as f32),
     }
 }
 
@@ -1012,6 +1085,24 @@ mod tests {
             ));
             assert_eq!(receiver.recv().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn describes_incremental_fmp4_hls_as_buffered_media() {
+        let media = buffered_media(&BufferedMediaLoad {
+            url: "http://127.0.0.1/private/index.m3u8".to_owned(),
+            content_type: "application/x-mpegURL".to_owned(),
+            start_at: 12.0,
+            duration: Some(90.0),
+            fmp4_hls: true,
+        });
+        assert_eq!(media.stream_type, StreamType::Buffered);
+        assert_eq!(media.duration, Some(90.0));
+        assert_eq!(media.hls_segment_format, Some(HlsSegmentFormat::Fmp4));
+        assert_eq!(
+            media.hls_video_segment_format,
+            Some(HlsVideoSegmentFormat::Fmp4)
+        );
     }
 
     #[test]

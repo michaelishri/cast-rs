@@ -19,10 +19,19 @@ use crate::{
     media::{self, CompatibilityMode, PreparationPlan},
     media_server::MediaFileServer,
     network::{local_ip_for, private_route},
+    vod_hls::IncrementalHlsPreparation,
 };
 
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(20);
+const INCREMENTAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(120);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TranscodeDelivery {
+    Complete,
+    #[default]
+    Incremental,
+}
 
 pub struct VideoOptions {
     pub cast_host: std::net::IpAddr,
@@ -32,6 +41,7 @@ pub struct VideoOptions {
     pub start_at: f64,
     pub content_type: Option<String>,
     pub compatibility_mode: CompatibilityMode,
+    pub transcode_delivery: TranscodeDelivery,
 }
 
 pub fn cast_video(options: VideoOptions) -> Result<()> {
@@ -125,19 +135,50 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
                     return Err(error);
                 }
                 println!("Lossless remux was not safe ({error}); transcoding instead...");
-                transcode_with_progress(&path, &output_path, info, &interrupted)?;
+                if options.transcode_delivery == TranscodeDelivery::Complete {
+                    println!("Transcoding a complete compatibility MP4...");
+                    transcode_with_progress(&path, &output_path, info, &interrupted)?;
+                    let file = File::open(&output_path)
+                        .context("could not open the transcoded compatibility MP4")?;
+                    let size = file.metadata()?.len();
+                    temporary = Some(directory);
+                    (file, "video/mp4".to_owned(), size)
+                } else {
+                    drop(directory);
+                    return cast_incremental_video(
+                        &path,
+                        info,
+                        options.cast_host,
+                        options.cast_port,
+                        options.http_port,
+                        options.start_at,
+                        interrupted,
+                    );
+                }
+            } else {
+                let file = File::open(&output_path).context("could not open the prepared MP4")?;
+                let size = file.metadata()?.len();
+                temporary = Some(directory);
+                (file, "video/mp4".to_owned(), size)
             }
-            let file = File::open(&output_path).context("could not open the prepared MP4")?;
-            let size = file.metadata()?.len();
-            temporary = Some(directory);
-            (file, "video/mp4".to_owned(), size)
         }
         PreparationPlan::Transcode { .. } => {
             let info = info
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing media information for transcode"))?;
+            if options.transcode_delivery == TranscodeDelivery::Incremental {
+                return cast_incremental_video(
+                    &path,
+                    info,
+                    options.cast_host,
+                    options.cast_port,
+                    options.http_port,
+                    options.start_at,
+                    interrupted,
+                );
+            }
             let (directory, output_path) = media::temporary_mp4_path()?;
-            println!("Transcoding to receiver-compatible H.264/AAC MP4...");
+            println!("Transcoding a complete receiver-compatible H.264/AAC MP4...");
             transcode_with_progress(&path, &output_path, info, &interrupted)?;
             let file = File::open(&output_path).context("could not open the transcoded MP4")?;
             let size = file.metadata()?.len();
@@ -170,7 +211,12 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         content_type,
         options.start_at,
     )?;
-    let playback = monitor_playback(&session, &server, &interrupted);
+    let playback = monitor_playback(
+        &session,
+        &interrupted,
+        || server.received_request(),
+        || None,
+    );
     let stop = session.stop();
     drop(temporary);
     let stats = server.stats();
@@ -208,10 +254,85 @@ fn transcode_with_progress(
     })
 }
 
+fn cast_incremental_video(
+    path: &Path,
+    info: &media::MediaInfo,
+    cast_host: std::net::IpAddr,
+    cast_port: u16,
+    http_port: u16,
+    start_at: f64,
+    interrupted: Arc<AtomicBool>,
+) -> Result<()> {
+    let lan_ip = local_ip_for(cast_host, cast_port)?;
+    let route = private_route()?;
+    println!("Preparing receiver-compatible H.264/AAC fMP4 segments...");
+    let mut last_printed = -5_i32;
+    let mut preparation = IncrementalHlsPreparation::start(
+        path.to_owned(),
+        info.clone(),
+        SocketAddr::new(lan_ip, http_port),
+        route,
+        move |percent| {
+            let whole = percent.floor() as i32;
+            if whole >= last_printed + 5 || whole == 100 {
+                println!("Preparing stream: {whole}%");
+                last_printed = whole;
+            }
+        },
+    )?;
+    preparation.wait_until_playable(start_at, &interrupted, INCREMENTAL_PREPARATION_TIMEOUT)?;
+    let url = preparation.url();
+    println!("Incremental stream ready at {url}");
+
+    let mut session =
+        BufferedMediaSession::start_fmp4_hls(cast_host, cast_port, url, start_at, info.duration)?;
+    let playback = monitor_playback(
+        &session,
+        &interrupted,
+        || preparation.received_request(),
+        || preparation.failure(),
+    );
+    let cancelled = interrupted.load(Ordering::SeqCst) || playback.is_err();
+    if cancelled {
+        preparation.cancel();
+    }
+    let stop = session.stop();
+    let preparation_result = preparation.finish();
+    let stats = preparation.stats();
+    println!(
+        "Stopped. Served {} playlists, {} init segments, {} media segments, and {}.",
+        stats.playlists,
+        stats.init_segments,
+        stats.media_segments,
+        human_bytes(stats.bytes_sent)
+    );
+
+    match playback {
+        Ok(()) => {
+            if !cancelled {
+                preparation_result.context("incremental media preparation did not finish")?;
+            }
+            stop.context("could not close the Cast media session")
+        }
+        Err(error) => {
+            if let Err(preparation_error) = preparation_result {
+                log::debug!(
+                    "incremental preparation cleanup after playback failure failed: {preparation_error:#}"
+                );
+            }
+            if let Err(stop_error) = stop {
+                log::debug!("Cast session cleanup after playback failure failed: {stop_error:#}");
+            }
+            Err(error)
+        }
+    }
+}
+
 fn monitor_playback(
     session: &BufferedMediaSession,
-    server: &MediaFileServer,
     interrupted: &AtomicBool,
+    received_request: impl Fn() -> bool,
+    preparation_failure: impl Fn() -> Option<String>,
 ) -> Result<()> {
     let started = Instant::now();
     let mut playing = false;
@@ -220,8 +341,11 @@ fn monitor_playback(
             println!("Stopping local video cast...");
             return Ok(());
         }
+        if let Some(failure) = preparation_failure() {
+            bail!("incremental media preparation failed: {failure}");
+        }
         if !playing && started.elapsed() >= PLAYBACK_START_TIMEOUT {
-            if server.received_request() {
+            if received_request() {
                 bail!(
                     "timed out waiting for the receiver to start playback after it requested the video; the container or codecs may not be supported"
                 );
@@ -273,7 +397,7 @@ fn monitor_playback(
                 bail!("video playback was replaced by another Cast request");
             }
             Ok(MediaSessionEvent::Failed(failure)) => {
-                return Err(playback_failure(failure, server.received_request()));
+                return Err(playback_failure(failure, received_request()));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

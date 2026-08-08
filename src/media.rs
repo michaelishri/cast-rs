@@ -411,9 +411,11 @@ impl VideoTranscoder {
         }
         encoder.set_time_base(input_stream.time_base());
         output_stream.set_time_base(input_stream.time_base());
+        let mut encoder_flags = codec::Flags::CLOSED_GOP;
         if global_header {
-            encoder.set_flags(codec::Flags::GLOBAL_HEADER);
+            encoder_flags.insert(codec::Flags::GLOBAL_HEADER);
         }
+        encoder.set_flags(encoder_flags);
         let mut options = Dictionary::new();
         options.set("profile", "main");
         if hardware.is_some() {
@@ -837,32 +839,88 @@ pub fn transcode_to_mp4(
     output_path: &Path,
     info: &MediaInfo,
     cancelled: &AtomicBool,
+    progress: impl FnMut(f64),
+) -> Result<()> {
+    let mut output = format::output_as(output_path, "mp4")
+        .with_context(|| format!("could not create temporary MP4 {}", output_path.display()))?;
+    let mut options = Dictionary::new();
+    options.set("movflags", "+faststart");
+    transcode_to_output(
+        input_path,
+        info,
+        cancelled,
+        progress,
+        &mut output,
+        options,
+        "temporary MP4",
+    )
+}
+
+pub fn transcode_to_hls(
+    input_path: &Path,
+    playlist_path: &Path,
+    segment_pattern: &Path,
+    info: &MediaInfo,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(f64),
+) -> Result<()> {
+    let mut output = format::output_as(playlist_path, "hls").with_context(|| {
+        format!(
+            "could not create incremental HLS playlist {}",
+            playlist_path.display()
+        )
+    })?;
+    let segment_pattern = segment_pattern
+        .to_str()
+        .ok_or_else(|| anyhow!("temporary HLS path is not valid UTF-8"))?;
+    let mut options = Dictionary::new();
+    options.set("hls_segment_type", "fmp4");
+    options.set("hls_time", "2");
+    options.set("hls_list_size", "0");
+    options.set("hls_playlist_type", "event");
+    options.set("hls_fmp4_init_filename", "init.mp4");
+    options.set("hls_segment_filename", segment_pattern);
+    options.set("hls_flags", "independent_segments+temp_file");
+    transcode_to_output(
+        input_path,
+        info,
+        cancelled,
+        progress,
+        &mut output,
+        options,
+        "incremental HLS stream",
+    )
+}
+
+fn transcode_to_output(
+    input_path: &Path,
+    info: &MediaInfo,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(f64),
+    output: &mut format::context::Output,
+    options: Dictionary<'_>,
+    output_description: &str,
 ) -> Result<()> {
     let mut input = format::input(input_path)
         .with_context(|| format!("could not open {} for transcoding", input_path.display()))?;
-    let mut output = format::output_as(output_path, "mp4")
-        .with_context(|| format!("could not create temporary MP4 {}", output_path.display()))?;
     let video_stream = input
         .stream(info.video.stream_index)
         .ok_or_else(|| anyhow!("selected video stream disappeared"))?;
-    let mut video = VideoTranscoder::new(&video_stream, &mut output)?;
+    let mut video = VideoTranscoder::new(&video_stream, output)?;
     let mut audio = match &info.audio {
         Some(audio) => {
             let stream = input
                 .stream(audio.stream_index)
                 .ok_or_else(|| anyhow!("selected audio stream disappeared"))?;
-            Some(AudioTranscoder::new(&stream, &mut output)?)
+            Some(AudioTranscoder::new(&stream, output)?)
         }
         None => None,
     };
 
     output.set_metadata(input.metadata().to_owned());
-    let mut options = Dictionary::new();
-    options.set("movflags", "+faststart");
     output
         .write_header_with(options)
-        .context("could not write temporary MP4 header")?;
+        .with_context(|| format!("could not write the {output_description} header"))?;
     let output_time_bases = output
         .streams()
         .map(|stream| stream.time_base())
@@ -886,26 +944,26 @@ pub fn transcode_to_mp4(
                 }
             }
             let time_base = output_time_bases[video.output_index];
-            video.process_packet(&packet, &mut output, time_base)?;
+            video.process_packet(&packet, output, time_base)?;
         } else if let Some(audio) = &mut audio
             && stream.index() == audio.input_index
         {
             let mut packet = packet;
             packet.rescale_ts(stream.time_base(), audio.decoder_time_base);
             let time_base = output_time_bases[audio.output_index];
-            audio.process_packet(&packet, &mut output, time_base)?;
+            audio.process_packet(&packet, output, time_base)?;
         }
     }
 
     let video_time_base = output_time_bases[video.output_index];
-    video.finish(&mut output, video_time_base)?;
+    video.finish(output, video_time_base)?;
     if let Some(audio) = &mut audio {
         let audio_time_base = output_time_bases[audio.output_index];
-        audio.finish(&mut output, audio_time_base)?;
+        audio.finish(output, audio_time_base)?;
     }
     output
         .write_trailer()
-        .context("could not finish the transcoded MP4")?;
+        .with_context(|| format!("could not finish the {output_description}"))?;
     progress(100.0);
     Ok(())
 }

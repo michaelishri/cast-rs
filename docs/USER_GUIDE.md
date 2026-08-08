@@ -86,14 +86,22 @@ Begin at a particular position, in seconds:
 Cast first inspects the container, video, and audio. Conservative H.264/AAC MP4 and VP8/VP9 WebM
 files are served unchanged. H.264/AAC in another container is remuxed without quality loss. Other
 decodable codecs are converted to an at-most-1080p H.264/AAC MP4 using the Mac's VideoToolbox
-encoder. A full transcode finishes before casting starts, so a long video can take time to prepare.
-Progress is printed in the terminal and `Ctrl-C` cancels preparation.
+encoder. Cast normally starts after the first two-second fragmented-MP4 segment is ready and keeps
+converting in the background while the receiver plays. For `--start-at`, it first prepares enough
+segments to cover the requested position. Progress is printed in the terminal and `Ctrl-C` cancels
+preparation.
 
 To reject media that would require preparation, or to normalize every input, use:
 
 ```sh
 ./cast video --host 192.168.1.50 --transcode never movie.mp4
 ./cast video --host 192.168.1.50 --transcode always movie.mkv
+```
+
+If a receiver rejects incremental fragmented-MP4 HLS, use the full-file compatibility path:
+
+```sh
+./cast video --host 192.168.1.50 --transcode-delivery complete movie.mkv
 ```
 
 DRM-protected and corrupt files cannot be converted. Only the best video stream and best audio

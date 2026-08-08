@@ -142,14 +142,16 @@ used to reach the selected receiver and uses an automatic free port unless `--ht
 Cast inspects the selected container and its best video and audio streams through linked FFmpeg
 libraries. Conservative H.264/AAC MP4 and VP8/VP9 WebM inputs are served directly. Compatible
 H.264/AAC streams in another container are remuxed losslessly. Other decodable inputs are converted
-to an at-most-1080p H.264 Main/AAC stereo MP4 using VideoToolbox for video encoding. Preparation is
-completed before playback so the existing byte-range server retains reliable seeking and
-`--start-at` behavior.
+to at-most-1080p H.264 Main/AAC stereo using VideoToolbox for video encoding. By default Cast
+publishes two-second fragmented-MP4 HLS segments atomically and starts the receiver as soon as the
+first segment—or the segment covering `--start-at`—is ready. Conversion continues in the background
+while the video plays and the playlist becomes a finished VOD playlist at end of input.
 
 Use `--transcode never` to reject anything outside the direct-play set, or `--transcode always` to
 normalize even directly playable input. `--content-type` remains an expert direct-play override and
-bypasses automatic preparation unless `--transcode always` is also supplied. DRM-protected or
-corrupt inputs cannot be converted.
+bypasses automatic preparation unless `--transcode always` is also supplied. Use
+`--transcode-delivery complete` to retain the original full-file preparation path if a receiver has
+trouble with incremental fMP4 HLS. DRM-protected or corrupt inputs cannot be converted.
 
 ## How live casting works
 

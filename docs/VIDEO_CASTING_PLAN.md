@@ -1,6 +1,6 @@
 # Local video casting plan
 
-- Status: implemented; physical receiver validation pending
+- Status: full-file compatibility validated on a physical receiver; incremental delivery pending validation
 - Target release: `v0.3.0`
 - Planning branch: `codex/video-casting`
 
@@ -281,8 +281,22 @@ Implemented as a separate `--transcode auto|never|always` milestone:
 
 The pipeline links pinned FFmpeg libraries directly for probing, demuxing, decoding, scaling,
 resampling, and muxing; it does not launch FFmpeg command-line programs. H.264 output uses
-VideoToolbox. Incremental buffered fMP4 HLS remains a future optimization for starting playback
-before a long transcode completes.
+VideoToolbox.
+
+### 7. Incremental compatibility delivery
+
+Implemented as the default transcoded-media delivery mode:
+
+1. encode closed-GOP H.264/AAC into two-second fragmented-MP4 HLS segments;
+2. atomically publish completed segments and the growing event playlist from a private directory;
+3. start buffered receiver playback after the first segment, or after enough media exists for
+   `--start-at`;
+4. continue transcoding in a cancellable background worker and surface worker failures to the CLI;
+5. finish the playlist with `EXT-X-ENDLIST`, then remove all temporary media on shutdown;
+6. retain `--transcode-delivery complete` as a receiver-compatibility fallback.
+
+This slice also terminates the Default Media Receiver after natural end-of-media instead of letting
+the control thread exit before application cleanup.
 
 ## Test matrix
 

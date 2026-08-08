@@ -44,6 +44,7 @@ configure_options=(
   --disable-encoders
   --enable-encoder=aac
   --disable-muxers
+  --enable-muxer=hls
   --enable-muxer=mp4
 )
 if ! command -v nasm >/dev/null 2>&1; then

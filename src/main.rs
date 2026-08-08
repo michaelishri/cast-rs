@@ -8,6 +8,7 @@ mod mirror;
 mod network;
 mod synthetic;
 mod video;
+mod vod_hls;
 
 use std::{net::IpAddr, path::PathBuf, thread, time::Duration};
 
@@ -80,6 +81,9 @@ enum Command {
         /// Convert incompatible containers/codecs using linked media libraries.
         #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
         transcode: TranscodeMode,
+        /// Deliver transcoded media as it is prepared or after a complete MP4 is ready.
+        #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
+        transcode_delivery: TranscodeDeliveryMode,
     },
     /// Capture and hardware-encode a short H.264/AVCC diagnostic sample.
     Capture {
@@ -211,6 +215,12 @@ enum TranscodeMode {
     Always,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TranscodeDeliveryMode {
+    Complete,
+    Incremental,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -268,6 +278,7 @@ fn main() -> Result<()> {
             start_at,
             content_type,
             transcode,
+            transcode_delivery,
         } => video::cast_video(video::VideoOptions {
             cast_host: host,
             cast_port,
@@ -279,6 +290,10 @@ fn main() -> Result<()> {
                 TranscodeMode::Auto => media::CompatibilityMode::Auto,
                 TranscodeMode::Never => media::CompatibilityMode::Never,
                 TranscodeMode::Always => media::CompatibilityMode::Always,
+            },
+            transcode_delivery: match transcode_delivery {
+                TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
+                TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
             },
         })?,
         Command::Capture {
