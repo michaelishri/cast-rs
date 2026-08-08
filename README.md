@@ -10,6 +10,7 @@ The CLI currently supports these Cast paths:
 - control Google Cast receivers with `rust-cast`;
 - inspect, remux, or transcode local media through linked FFmpeg libraries;
 - capture a macOS display with ScreenCaptureKit and hardware-encode it with VideoToolbox;
+- create a temporary extended display for a desktop cast without installing a display driver;
 - send encrypted H.264 over Cast Streaming RTP with receiver feedback and retransmission;
 - keep capture non-blocking with a latest-frame-wins encoder queue, adaptive bitrate, and bounded packet pacing;
 - retain fragmented-MP4 HLS as a compatibility fallback.
@@ -31,6 +32,9 @@ Architecture-specific archives remain available from the GitHub Releases page. S
 - macOS 13 or newer;
 - Mac and Chromecast on the same network;
 - Screen Recording permission for your terminal when using capture commands.
+
+The optional `--extend` mode uses Apple's private `CGVirtualDisplay` API. It is experimental and
+may stop working on a future macOS release, but it does not install a driver or system extension.
 
 Building from source additionally requires Rust 1.85 or newer, Xcode 15 or newer, `nasm`, and
 `pkg-config`. The native capture bindings use Apple's Swift toolchain, while the compatibility
@@ -78,6 +82,9 @@ cargo run -- displays
 
 # Cast the first display over the default low-latency mirroring transport
 cargo run --release -- desktop --host 192.168.1.50
+
+# Create a temporary second display and cast that independent desktop space
+cargo run --release -- desktop --host 192.168.1.50 --extend
 
 # Profile the real capture/network path for one minute and recommend a delay
 cargo run --release -- profile --host 192.168.1.50
@@ -186,6 +193,19 @@ trouble with incremental fMP4 HLS. DRM-protected or corrupt inputs cannot be con
 
 By default, `desktop` launches the receiver's built-in Chrome Mirroring application and performs the Cast Streaming `OFFER`/`ANSWER` exchange. It converts VideoToolbox's AVCC output to Annex B, prepends SPS/PPS to keyframes, encrypts each frame with session-specific AES-128-CTR material, and sends it as Cast RTP over UDP. RTCP sender reports establish the media clock; receiver checkpoints and loss fields drive history cleanup and packet retransmission. The default offer requests a 200 ms receiver playout delay. Actual glass-to-glass latency also includes capture, encode, Wi-Fi, decode, and display time.
 
+Add `--extend` to `desktop` when the receiver should be an independent second desktop rather than a
+copy of an existing screen. Cast creates one non-HiDPI virtual display whose mode matches the
+effective `--width`, `--height`, and requested `--fps`, places it to the right of the existing
+desktop, and captures it with ScreenCaptureKit. It works with both the default mirroring transport
+and `--transport hls`. Move a window onto the new display while Cast is running. The helper process
+owns the display and releases it on normal shutdown, errors, or loss of the parent process; no
+display driver or system extension is installed. `--extend` and `--display` are mutually exclusive.
+
+The same switch is available on `profile`, so `cast profile --host 192.168.1.50 --extend` measures
+the temporary-display path and prints a recommendation that retains `--extend`. It cannot be mixed
+with the synthetic profiler or `--auto-tune` because those modes intentionally bypass display
+capture.
+
 `--transport hls` uses the earlier compatibility path. It determines the Mac's LAN address from the route to the receiver, binds an HTTP server only to that address, generates a random session path, and serves a rolling fragmented-MP4 HLS stream through the Default Media Receiver. Its one-second HLS target duration typically leaves playback roughly three seconds behind the encoder's live edge.
 
 Live output defaults to aspect-preserved 1280x720 H.264 Baseline Level 3.1 for compatibility with Google Nest Hub receivers. The mirroring path selects the minimum valid H.264 level from resolution, frame rate, and bitrate: 720p60 uses Level 3.2 rather than incorrectly advertising Level 3.1. If the Cast `ANSWER` selects a lower display frame rate than requested, capture and encoding are capped to the receiver's rate instead of wasting bandwidth on frames it cannot display. ScreenCaptureKit presentation timestamps drive the HLS timeline even when macOS emits metadata-only samples between video frames.
@@ -276,5 +296,9 @@ ScreenCaptureKit currently composites the cursor into each captured video frame.
 - Try a lower bitrate for congested Wi-Fi: `--bitrate 3000000`.
 - Use `--transport hls --serve-only` to test HLS packaging without contacting a receiver; for safety this mode binds only to loopback.
 - Port 8080 must be available for HLS, or select another one with `--http-port`.
+- If `--extend` reports that `CGVirtualDisplay` is unavailable, that macOS build is not compatible
+  with the experimental private API; cast an existing display instead.
+- If a temporary display is blank or cannot be captured, re-check Screen Recording permission for
+  the terminal running Cast.
 - If low-latency playback stutters, first try `--target-delay-ms 400`, then a lower bitrate such as `--bitrate 3000000`.
 - Add `-v` before the command for useful diagnostics, or `-vv` for trace-level protocol details.
