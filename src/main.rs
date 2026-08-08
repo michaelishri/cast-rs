@@ -10,7 +10,13 @@ mod synthetic;
 mod video;
 mod vod_hls;
 
-use std::{net::IpAddr, path::PathBuf, thread, time::Duration};
+use std::{
+    io::{self, IsTerminal},
+    net::IpAddr,
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -223,6 +229,11 @@ enum TranscodeDeliveryMode {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let interactive_video = interactive_video_output(
+        cli.verbose,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    );
     init_logging(cli.verbose);
     match cli.command {
         Command::Devices { timeout } => {
@@ -295,6 +306,7 @@ fn main() -> Result<()> {
                 TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
                 TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
             },
+            interactive: interactive_video,
         })?,
         Command::Capture {
             display,
@@ -416,4 +428,22 @@ fn init_logging(verbosity: u8) {
         .filter_module("rust_cast", level)
         .format_timestamp_millis()
         .init();
+}
+
+fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal: bool) -> bool {
+    verbosity == 0 && stdin_terminal && stdout_terminal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interactive_video_output;
+
+    #[test]
+    fn interactive_video_requires_default_verbosity_and_terminal_io() {
+        assert!(interactive_video_output(0, true, true));
+        assert!(!interactive_video_output(1, true, true));
+        assert!(!interactive_video_output(2, true, true));
+        assert!(!interactive_video_output(0, false, true));
+        assert!(!interactive_video_output(0, true, false));
+    }
 }
