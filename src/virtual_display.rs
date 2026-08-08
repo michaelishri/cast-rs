@@ -16,6 +16,8 @@ unsafe extern "C" {
         width: u32,
         height: u32,
         frames_per_second: u32,
+        serial_number: u32,
+        ordinal: u32,
         error_buffer: *mut c_char,
         error_buffer_length: usize,
     ) -> u32;
@@ -35,7 +37,8 @@ pub struct VirtualDisplaySession {
 }
 
 impl VirtualDisplaySession {
-    pub fn start(width: u32, height: u32, fps: u32) -> Result<Self> {
+    pub fn start(width: u32, height: u32, fps: u32, ordinal: u32) -> Result<Self> {
+        let serial = random_nonzero_serial()?;
         let executable = std::env::current_exe()
             .context("could not locate the Cast executable for the virtual display helper")?;
         let mut command = Command::new(executable);
@@ -53,6 +56,10 @@ impl VirtualDisplaySession {
             .arg(height.to_string())
             .arg("--fps")
             .arg(fps.to_string())
+            .arg("--serial")
+            .arg(serial.to_string())
+            .arg("--ordinal")
+            .arg(ordinal.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(helper_stderr);
@@ -135,7 +142,9 @@ impl VirtualDisplaySession {
             return Err(error);
         }
 
-        println!("Created temporary extended display {display_id} at {width}x{height}, {fps} fps.");
+        println!(
+            "Created temporary extended display {ordinal} (display {display_id}) at {width}x{height}, {fps} fps."
+        );
         Ok(session)
     }
 
@@ -282,9 +291,9 @@ impl Drop for VirtualDisplaySession {
     }
 }
 
-pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
+pub fn run_helper(width: u32, height: u32, fps: u32, serial: u32, ordinal: u32) -> Result<()> {
     let mut error_buffer = [0 as c_char; 512];
-    let display_id = native_create(width, height, fps, &mut error_buffer);
+    let display_id = native_create(width, height, fps, serial, ordinal, &mut error_buffer);
     if display_id == 0 {
         let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }
             .to_string_lossy()
@@ -375,8 +384,21 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn random_nonzero_serial() -> Result<u32> {
+    let mut bytes = [0_u8; 4];
+    getrandom::fill(&mut bytes).context("could not generate a virtual display serial number")?;
+    Ok(u32::from_ne_bytes(bytes).max(1))
+}
+
 #[cfg(target_os = "macos")]
-fn native_create(width: u32, height: u32, fps: u32, error_buffer: &mut [c_char]) -> u32 {
+fn native_create(
+    width: u32,
+    height: u32,
+    fps: u32,
+    serial: u32,
+    ordinal: u32,
+    error_buffer: &mut [c_char],
+) -> u32 {
     // SAFETY: the Objective-C bridge receives primitive values and a valid,
     // writable buffer for the duration of the call.
     unsafe {
@@ -384,6 +406,8 @@ fn native_create(width: u32, height: u32, fps: u32, error_buffer: &mut [c_char])
             width,
             height,
             fps,
+            serial,
+            ordinal,
             error_buffer.as_mut_ptr(),
             error_buffer.len(),
         )
@@ -391,7 +415,14 @@ fn native_create(width: u32, height: u32, fps: u32, error_buffer: &mut [c_char])
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_create(_width: u32, _height: u32, _fps: u32, error_buffer: &mut [c_char]) -> u32 {
+fn native_create(
+    _width: u32,
+    _height: u32,
+    _fps: u32,
+    _serial: u32,
+    _ordinal: u32,
+    error_buffer: &mut [c_char],
+) -> u32 {
     let message = b"temporary virtual displays are available only on macOS\0";
     for (target, source) in error_buffer.iter_mut().zip(message.iter().copied()) {
         *target = source as c_char;
@@ -422,7 +453,7 @@ fn native_is_online(_display_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_startup_message, single_line};
+    use super::{parse_startup_message, random_nonzero_serial, single_line};
 
     #[test]
     fn parses_ready_message() {
@@ -447,5 +478,10 @@ mod tests {
     #[test]
     fn helper_protocol_messages_stay_on_one_line() {
         assert_eq!(single_line("one\ntwo\rthree"), "one two three");
+    }
+
+    #[test]
+    fn generated_display_serials_are_nonzero() {
+        assert_ne!(random_nonzero_serial().unwrap(), 0);
     }
 }

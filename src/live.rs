@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::c_void,
     io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -32,8 +32,9 @@ const PLAYLIST_WINDOW_SEGMENTS: usize = 8;
 const RETAINED_SEGMENTS: usize = 32;
 const STARTUP_SEGMENTS: usize = 1;
 
+#[derive(Clone)]
 pub struct LiveOptions {
-    pub cast_host: IpAddr,
+    pub cast_hosts: Vec<IpAddr>,
     pub cast_port: u16,
     pub display_id: Option<u32>,
     pub extend: bool,
@@ -46,215 +47,461 @@ pub struct LiveOptions {
     pub serve_only: bool,
 }
 
-pub fn cast_desktop(mut options: LiveOptions) -> Result<()> {
+pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     if options.bitrate <= 0 {
         bail!("bitrate must be greater than zero");
     }
     if options.extend && options.display_id.is_some() {
         bail!("--extend cannot be combined with --display");
     }
+    validate_cast_hosts(&options.cast_hosts)?;
+    validate_serve_only(&options.cast_hosts, options.serve_only)?;
 
     let width = even(options.width);
     let height = even(options.height);
-    let mut virtual_display = if options.extend {
-        Some(VirtualDisplaySession::start(width, height, options.fps)?)
-    } else {
-        None
-    };
-    if let Some(session) = virtual_display.as_ref() {
-        options.display_id = Some(session.display_id());
-    }
-
-    let lan_ip = local_ip_for(options.cast_host, options.cast_port)?;
-    let serve_ip = if options.serve_only {
-        if lan_ip.is_ipv4() {
-            IpAddr::from([127, 0, 0, 1])
-        } else {
-            IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])
-        }
-    } else {
-        lan_ip
-    };
-    let route = private_route()?;
-    log::debug!(
-        "route to receiver uses local address {lan_ip}; HTTP listener address is {serve_ip}:{}",
-        options.http_port
-    );
-    let store = Arc::new(HlsStore::default());
-    let stop = Arc::new(AtomicBool::new(false));
-    let server = HttpServer::start(
-        SocketAddr::new(serve_ip, options.http_port),
-        Arc::clone(&store),
-        Arc::clone(&stop),
-        route.clone(),
-    )?;
-
-    let content = SCShareableContent::get().context(
-        "could not enumerate displays; grant Screen Recording permission in System Settings",
-    )?;
-    let displays = content.displays();
-    let display = match options.display_id {
-        Some(id) => displays
-            .iter()
-            .find(|display| display.display_id() == id)
-            .ok_or_else(|| anyhow!("display {id} was not found"))?,
-        None => displays
-            .first()
-            .ok_or_else(|| anyhow!("no displays found"))?,
-    };
-    let source_width = display.width();
-    let source_height = display.height();
-    log::debug!(
-        "scaling source display {}x{} into H.264 output {}x{} with aspect ratio preserved",
-        source_width,
-        source_height,
-        width,
-        height
-    );
-    let keyframe_interval = live_keyframe_interval(options.fps);
-    log::debug!(
-        "using a {keyframe_interval}-frame VideoToolbox keyframe interval for sub-second HLS segments"
-    );
-
-    let encoder = CompressionSession::builder(width as i32, height as i32, Codec::H264)
-        .with_real_time(true)
-        .with_allow_frame_reordering(false)
-        .with_average_bit_rate(options.bitrate)
-        .with_expected_frame_rate(options.fps as f64)
-        .with_max_keyframe_interval(keyframe_interval)
-        .with_profile_level(ProfileLevel::H264Baseline3_1)
-        .build()
-        .context("could not create the VideoToolbox H.264 encoder")?;
-
-    let failure = Arc::new(Mutex::new(None));
-    let pipeline = LivePipeline {
-        encoder,
-        muxer: None,
-        store: Arc::clone(&store),
-        last_surface: None,
-        frame_index: 0,
-        frames_in_segment: 0,
-        first_capture_timestamp: None,
-        last_timestamp: None,
-        segment_start_timestamp: None,
-        fps: options.fps,
-        width,
-        height,
-        bitrate: options.bitrate as u32,
-    };
-
-    let filter = SCContentFilter::create()
-        .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
-    let frame_interval = CMTime::new(1, options.fps as i32);
-    let config = SCStreamConfiguration::new()
-        .with_width(width)
-        .with_height(height)
-        .with_scales_to_fit(true)
-        .with_preserves_aspect_ratio(true)
-        .with_pixel_format(PixelFormat::YCbCr_420v)
-        .with_shows_cursor(true)
-        .with_queue_depth(4)
-        .with_minimum_frame_interval(&frame_interval);
-    let mut stream = SCStream::new(&filter, &config);
-    stream.add_output_handler(
-        LiveFrameHandler {
-            pipeline: Mutex::new(pipeline),
-            failure: Arc::clone(&failure),
-            repeated_samples: AtomicU64::new(0),
-            skipped_samples: AtomicU64::new(0),
-        },
-        SCStreamOutputType::Screen,
-    );
-
-    println!(
-        "Capturing display {} at {}x{} into {}x{}, {} fps...",
-        display.display_id(),
-        source_width,
-        source_height,
-        width,
-        height,
-        options.fps
-    );
-    stream
-        .start_capture()
-        .context("could not start screen capture")?;
-
-    let startup_started = Instant::now();
-    loop {
-        if store.wait_until_ready(Duration::from_millis(100), STARTUP_SEGMENTS) {
-            break;
-        }
-        if let Some(error) = take_failure(&failure)? {
-            stream.stop_capture().ok();
-            bail!("live encoder failed: {error}");
-        }
-        if let Some(session) = virtual_display.as_mut() {
-            session.ensure_alive()?;
-        }
-        if startup_started.elapsed() >= Duration::from_secs(12) {
-            stream.stop_capture().ok();
-            bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
-        }
-    }
-
-    let url = http_url(
-        SocketAddr::new(serve_ip, options.http_port),
-        &format!("/{route}/master.m3u8"),
-    );
-    println!("Live stream ready at {url}");
-    if !options.serve_only {
-        cast::cast_fmp4_hls(options.cast_host, options.cast_port, &url)?;
-        println!("Casting desktop. Press Ctrl-C to stop.");
-    } else {
-        println!("Serving without contacting the Cast receiver. Press Ctrl-C to stop.");
-    }
-
     let interrupted = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&interrupted);
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
         .context("could not install Ctrl-C handler")?;
-    let started = Instant::now();
+
+    let mut virtual_displays = Vec::new();
+    if options.extend {
+        for (index, host) in options.cast_hosts.iter().copied().enumerate() {
+            let ordinal = u32::try_from(index + 1)
+                .context("the number of extended displays exceeded the supported ordinal range")?;
+            let session = VirtualDisplaySession::start(width, height, options.fps, ordinal)?;
+            println!(
+                "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
+                session.display_id()
+            );
+            virtual_displays.push((host, session));
+        }
+    }
+
+    let shared_store = (!options.extend).then(|| Arc::new(HlsStore::default()));
+    let mut targets = Vec::with_capacity(options.cast_hosts.len());
+    let mut private_routes = HashSet::with_capacity(options.cast_hosts.len());
+    for host in options.cast_hosts.iter().copied() {
+        let lan_ip = local_ip_for(host, options.cast_port)?;
+        let serve_ip = if options.serve_only {
+            loopback_for(lan_ip)
+        } else {
+            lan_ip
+        };
+        let store = shared_store
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(HlsStore::default()));
+        let route = loop {
+            let candidate = private_route()?;
+            if private_routes.insert(candidate.clone()) {
+                break candidate;
+            }
+        };
+        targets.push(HlsTarget {
+            host,
+            serve_ip,
+            route,
+            store,
+            url: String::new(),
+        });
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let failure = Arc::new(Mutex::new(None));
+    let mut interface_order = Vec::new();
+    let mut interface_routes: HashMap<IpAddr, HashMap<String, Arc<HlsStore>>> = HashMap::new();
+    for target in &targets {
+        if !interface_routes.contains_key(&target.serve_ip) {
+            interface_order.push(target.serve_ip);
+        }
+        interface_routes
+            .entry(target.serve_ip)
+            .or_default()
+            .insert(target.route.clone(), Arc::clone(&target.store));
+    }
+    let mut servers = HashMap::new();
+    for serve_ip in interface_order {
+        let routes = interface_routes
+            .remove(&serve_ip)
+            .expect("interface route table was created");
+        let server = HttpServer::start(
+            SocketAddr::new(serve_ip, options.http_port),
+            Arc::new(routes),
+            Arc::clone(&stop),
+            Arc::clone(&failure),
+        )?;
+        log::debug!(
+            "HLS HTTP server for interface {serve_ip} is listening on {} with {} private routes",
+            server.local_addr(),
+            server.route_count()
+        );
+        servers.insert(serve_ip, server);
+    }
+    for target in &mut targets {
+        let address = servers
+            .get(&target.serve_ip)
+            .expect("target HTTP interface was started")
+            .local_addr();
+        target.url = http_url(address, &format!("/{}/master.m3u8", target.route));
+    }
+
+    let mut captures = Vec::new();
+    if options.extend {
+        for (target, (_, session)) in targets.iter().zip(virtual_displays.iter()) {
+            captures.push(LiveCapture::start(
+                Some(session.display_id()),
+                &options,
+                Arc::clone(&target.store),
+                Arc::clone(&failure),
+            )?);
+        }
+    } else {
+        captures.push(LiveCapture::start(
+            options.display_id,
+            &options,
+            Arc::clone(shared_store.as_ref().expect("shared HLS store exists")),
+            Arc::clone(&failure),
+        )?);
+    }
+
+    let startup_started = Instant::now();
     loop {
-        if interrupted.load(Ordering::SeqCst)
-            || options
-                .duration
-                .is_some_and(|duration| started.elapsed() >= duration)
-        {
+        if captures.iter().all(LiveCapture::is_ready) {
             break;
         }
         if let Some(error) = take_failure(&failure)? {
-            bail!("live encoder failed: {error}");
+            bail!("live HLS startup failed: {error}");
         }
-        if let Some(session) = virtual_display.as_mut() {
+        for (_, session) in &mut virtual_displays {
             session.ensure_alive()?;
+        }
+        if startup_started.elapsed() >= Duration::from_secs(12) {
+            bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
         }
         thread::sleep(Duration::from_millis(100));
     }
+    for target in &targets {
+        println!(
+            "Live stream for receiver {} ready at {}",
+            target.host, target.url
+        );
+    }
 
-    stream
-        .stop_capture()
-        .context("could not stop screen capture")?;
-    // SCStream retains its content filter after capture stops. Release the
-    // complete capture graph before removing a virtual source display.
-    drop(stream);
-    drop(filter);
-    drop(config);
-    drop(displays);
-    drop(content);
+    let mut receiver_sessions = if options.serve_only {
+        Vec::new()
+    } else {
+        start_hls_receivers(&targets, options.cast_port)?
+    };
+    if options.serve_only {
+        println!("Serving without contacting the Cast receiver. Press Ctrl-C to stop.");
+    } else {
+        println!(
+            "Casting desktop to {} receivers over HLS. Press Ctrl-C to stop.",
+            receiver_sessions.len()
+        );
+    }
+
+    let started = Instant::now();
+    let mut run_result = (|| -> Result<()> {
+        loop {
+            if interrupted.load(Ordering::SeqCst)
+                || options
+                    .duration
+                    .is_some_and(|duration| started.elapsed() >= duration)
+            {
+                break;
+            }
+            if let Some(error) = take_failure(&failure)? {
+                bail!("live HLS group failed: {error}");
+            }
+            for (_, session) in &mut virtual_displays {
+                session.ensure_alive()?;
+            }
+            for (host, session) in &receiver_sessions {
+                session
+                    .ensure_alive()
+                    .with_context(|| format!("HLS receiver {host} failed"))?;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    })();
+
+    let mut capture_result = Ok(());
+    for capture in &mut captures {
+        if let Err(error) = capture.stop_and_release()
+            && capture_result.is_ok()
+        {
+            capture_result = Err(error);
+        }
+    }
     log::debug!("released desktop capture resources before display teardown");
+    let mut receiver_result = Ok(());
+    for (_, session) in &mut receiver_sessions {
+        if let Err(error) = session.stop()
+            && receiver_result.is_ok()
+        {
+            receiver_result = Err(error);
+        }
+    }
     stop.store(true, Ordering::SeqCst);
-    drop(server);
-    let stats = store.stats();
-    println!(
-        "Stopped. Served {} playlists, {} init segments, and {} media segments.",
-        stats.playlists, stats.init_segments, stats.media_segments
-    );
-    if let Some(session) = virtual_display.as_mut() {
-        session.stop()?;
+    drop(servers);
+    if run_result.is_ok() {
+        run_result = match take_failure(&failure) {
+            Ok(Some(error)) => Err(anyhow!("live HLS group failed: {error}")),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+    }
+    print_hls_stats(&targets);
+
+    let mut display_result = Ok(());
+    for (_, session) in virtual_displays.iter_mut().rev() {
+        if let Err(error) = session.stop()
+            && display_result.is_ok()
+        {
+            display_result = Err(error);
+        }
+    }
+    run_result?;
+    capture_result?;
+    receiver_result?;
+    display_result
+}
+
+struct HlsTarget {
+    host: IpAddr,
+    serve_ip: IpAddr,
+    route: String,
+    store: Arc<HlsStore>,
+    url: String,
+}
+
+fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
+    if hosts.is_empty() {
+        bail!("at least one --host is required");
+    }
+    let mut unique = HashSet::with_capacity(hosts.len());
+    for host in hosts {
+        if !unique.insert(*host) {
+            bail!("duplicate Cast receiver host {host}");
+        }
     }
     Ok(())
+}
+
+fn validate_serve_only(hosts: &[IpAddr], serve_only: bool) -> Result<()> {
+    if serve_only && hosts.len() != 1 {
+        bail!("--serve-only requires exactly one --host");
+    }
+    Ok(())
+}
+
+fn loopback_for(address: IpAddr) -> IpAddr {
+    if address.is_ipv4() {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])
+    }
+}
+
+fn start_hls_receivers(
+    targets: &[HlsTarget],
+    cast_port: u16,
+) -> Result<Vec<(IpAddr, cast::LiveMediaSession)>> {
+    let results = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(targets.len());
+        for (index, target) in targets.iter().enumerate() {
+            let host = target.host;
+            let url = target.url.clone();
+            workers.push((
+                index,
+                host,
+                scope.spawn(move || cast::LiveMediaSession::start_fmp4_hls(host, cast_port, url)),
+            ));
+        }
+        workers
+            .into_iter()
+            .map(|(index, host, worker)| {
+                let result = worker
+                    .join()
+                    .map_err(|_| anyhow!("HLS Cast control worker for {host} panicked"))?;
+                Ok((index, host, result))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    let mut slots: Vec<Option<(IpAddr, cast::LiveMediaSession)>> =
+        (0..targets.len()).map(|_| None).collect();
+    let mut errors = Vec::new();
+    for (index, host, result) in results {
+        match result {
+            Ok(session) => slots[index] = Some((host, session)),
+            Err(error) => errors.push(format!("{host}: {error:#}")),
+        }
+    }
+    let mut sessions = slots.into_iter().flatten().collect::<Vec<_>>();
+    if !errors.is_empty() {
+        for (_, session) in &mut sessions {
+            if let Err(error) = session.stop() {
+                log::warn!("could not stop HLS receiver after partial startup: {error:#}");
+            }
+        }
+        bail!("could not start every HLS receiver: {}", errors.join("; "));
+    }
+    Ok(sessions)
+}
+
+fn print_hls_stats(targets: &[HlsTarget]) {
+    let mut reported = HashSet::new();
+    for target in targets {
+        let identity = Arc::as_ptr(&target.store) as usize;
+        if !reported.insert(identity) {
+            continue;
+        }
+        let receivers = targets
+            .iter()
+            .filter(|candidate| Arc::ptr_eq(&candidate.store, &target.store))
+            .map(|candidate| candidate.host.to_string())
+            .collect::<Vec<_>>();
+        let stats = target.store.stats();
+        println!(
+            "HLS source for {} served {} playlists, {} init segments, and {} media segments.",
+            receivers.join(", "),
+            stats.playlists,
+            stats.init_segments,
+            stats.media_segments
+        );
+    }
+}
+
+struct LiveCapture {
+    stream: Option<SCStream>,
+    store: Arc<HlsStore>,
+}
+
+impl LiveCapture {
+    fn start(
+        display_id: Option<u32>,
+        options: &LiveOptions,
+        store: Arc<HlsStore>,
+        failure: Arc<Mutex<Option<String>>>,
+    ) -> Result<Self> {
+        let width = even(options.width);
+        let height = even(options.height);
+        let content = SCShareableContent::get().context(
+            "could not enumerate displays; grant Screen Recording permission in System Settings",
+        )?;
+        let displays = content.displays();
+        let display = match display_id {
+            Some(id) => displays
+                .iter()
+                .find(|display| display.display_id() == id)
+                .ok_or_else(|| anyhow!("display {id} was not found"))?,
+            None => displays
+                .first()
+                .ok_or_else(|| anyhow!("no displays found"))?,
+        };
+        let source_width = display.width();
+        let source_height = display.height();
+        log::debug!(
+            "scaling source display {}x{} into H.264 output {}x{} with aspect ratio preserved",
+            source_width,
+            source_height,
+            width,
+            height
+        );
+        let keyframe_interval = live_keyframe_interval(options.fps);
+        let encoder = CompressionSession::builder(width as i32, height as i32, Codec::H264)
+            .with_real_time(true)
+            .with_allow_frame_reordering(false)
+            .with_average_bit_rate(options.bitrate)
+            .with_expected_frame_rate(options.fps as f64)
+            .with_max_keyframe_interval(keyframe_interval)
+            .with_profile_level(ProfileLevel::H264Baseline3_1)
+            .build()
+            .context("could not create the VideoToolbox H.264 encoder")?;
+        let pipeline = LivePipeline {
+            encoder,
+            muxer: None,
+            store: Arc::clone(&store),
+            last_surface: None,
+            frame_index: 0,
+            frames_in_segment: 0,
+            first_capture_timestamp: None,
+            last_timestamp: None,
+            segment_start_timestamp: None,
+            fps: options.fps,
+            width,
+            height,
+            bitrate: options.bitrate as u32,
+        };
+        let filter = SCContentFilter::create()
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
+        let frame_interval = CMTime::new(1, options.fps as i32);
+        let config = SCStreamConfiguration::new()
+            .with_width(width)
+            .with_height(height)
+            .with_scales_to_fit(true)
+            .with_preserves_aspect_ratio(true)
+            .with_pixel_format(PixelFormat::YCbCr_420v)
+            .with_shows_cursor(true)
+            .with_queue_depth(4)
+            .with_minimum_frame_interval(&frame_interval);
+        let mut stream = SCStream::new(&filter, &config);
+        stream.add_output_handler(
+            LiveFrameHandler {
+                pipeline: Mutex::new(pipeline),
+                failure,
+                repeated_samples: AtomicU64::new(0),
+                skipped_samples: AtomicU64::new(0),
+            },
+            SCStreamOutputType::Screen,
+        );
+        println!(
+            "Capturing display {} at {}x{} into {}x{}, {} fps...",
+            display.display_id(),
+            source_width,
+            source_height,
+            width,
+            height,
+            options.fps
+        );
+        stream
+            .start_capture()
+            .context("could not start screen capture")?;
+        Ok(Self {
+            stream: Some(stream),
+            store,
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.store
+            .wait_until_ready(Duration::ZERO, STARTUP_SEGMENTS)
+    }
+
+    fn stop_and_release(&mut self) -> Result<()> {
+        let Some(stream) = self.stream.take() else {
+            return Ok(());
+        };
+        stream
+            .stop_capture()
+            .context("could not stop screen capture")?;
+        drop(stream);
+        Ok(())
+    }
+}
+
+impl Drop for LiveCapture {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_and_release() {
+            log::warn!("could not stop live desktop capture: {error:#}");
+        }
+    }
 }
 
 struct LiveFrameHandler {
@@ -681,6 +928,8 @@ impl HttpBody {
 }
 
 struct HttpServer {
+    local_addr: SocketAddr,
+    route_count: usize,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -688,17 +937,19 @@ struct HttpServer {
 impl HttpServer {
     fn start(
         address: SocketAddr,
-        store: Arc<HlsStore>,
+        routes: Arc<HashMap<String, Arc<HlsStore>>>,
         stop: Arc<AtomicBool>,
-        route: String,
+        failure: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(address)
             .with_context(|| format!("could not bind live HTTP server to {address}"))?;
         listener.set_nonblocking(true)?;
-        log::debug!("HTTP server listening on {address}");
+        let local_addr = listener.local_addr()?;
+        let route_count = routes.len();
+        log::debug!("HTTP server listening on {local_addr}");
         let server_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("cast-http".into())
+            .name(format!("cast-http-{}", local_addr.ip()))
             .spawn(move || {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
@@ -707,10 +958,9 @@ impl HttpServer {
                                 eprintln!("Could not configure HTTP client socket: {error}");
                                 continue;
                             }
-                            let store = Arc::clone(&store);
-                            let route = route.clone();
+                            let routes = Arc::clone(&routes);
                             thread::spawn(move || {
-                                if let Err(error) = handle_http(stream, &store, &route) {
+                                if let Err(error) = handle_http(stream, &routes) {
                                     eprintln!("HTTP request failed: {error:#}");
                                 }
                             });
@@ -719,7 +969,11 @@ impl HttpServer {
                             thread::sleep(Duration::from_millis(20));
                         }
                         Err(error) => {
-                            eprintln!("HTTP server failed: {error}");
+                            store_failure(
+                                &failure,
+                                format!("HTTP server on {local_addr} failed: {error}"),
+                            );
+                            server_stop.store(true, Ordering::SeqCst);
                             break;
                         }
                     }
@@ -727,9 +981,19 @@ impl HttpServer {
             })
             .context("could not start live HTTP server thread")?;
         Ok(Self {
+            local_addr,
+            route_count,
             stop,
             thread: Some(thread),
         })
+    }
+
+    const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    const fn route_count(&self) -> usize {
+        self.route_count
     }
 }
 
@@ -742,7 +1006,7 @@ impl Drop for HttpServer {
     }
 }
 
-fn handle_http(mut stream: TcpStream, store: &HlsStore, route: &str) -> Result<()> {
+fn handle_http(mut stream: TcpStream, routes: &HashMap<String, Arc<HlsStore>>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request = [0_u8; 8192];
     let size = stream.read(&mut request)?;
@@ -766,15 +1030,7 @@ fn handle_http(mut stream: TcpStream, store: &HlsStore, route: &str) -> Result<(
         return Ok(());
     }
 
-    let route_prefix = format!("/{route}");
-    let routed_path = path
-        .strip_prefix(&route_prefix)
-        .filter(|remainder| remainder.is_empty() || remainder.starts_with('/'));
-    let response = match routed_path {
-        Some("") => store.response("/")?,
-        Some(path) => store.response(path)?,
-        None => None,
-    };
+    let response = routed_response(routes, path)?;
     match response {
         Some(body) => {
             log::debug!(
@@ -790,6 +1046,25 @@ fn handle_http(mut stream: TcpStream, store: &HlsStore, route: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+fn routed_response(
+    routes: &HashMap<String, Arc<HlsStore>>,
+    path: &str,
+) -> Result<Option<HttpBody>> {
+    let Some(path) = path.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (route, remainder) = path.split_once('/').unwrap_or((path, ""));
+    let Some(store) = routes.get(route) else {
+        return Ok(None);
+    };
+    let store_path = if remainder.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{remainder}")
+    };
+    store.response(&store_path)
 }
 
 fn write_http(
@@ -885,11 +1160,19 @@ fn take_failure(failure: &Mutex<Option<String>>) -> Result<Option<String>> {
         .take())
 }
 
+fn store_failure(failure: &Mutex<Option<String>>, message: String) {
+    if let Ok(mut failure) = failure.lock()
+        && failure.is_none()
+    {
+        *failure = Some(message);
+    }
+}
+
 const fn even(value: u32) -> u32 {
     value - value % 2
 }
 
-#[link(name = "CoreMedia", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreMedia", kind = "framework"))]
 unsafe extern "C" {
     fn CMSampleBufferGetFormatDescription(sample_buffer: *mut c_void) -> *mut c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -905,11 +1188,12 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        HlsState, Segment, advance_timestamp, avc_codec_string, avcc_contains_nal_type,
-        cm_time_to_ticks, live_keyframe_interval, master_playlist, playlist,
+        HlsState, HlsStore, Segment, advance_timestamp, avc_codec_string, avcc_contains_nal_type,
+        cm_time_to_ticks, live_keyframe_interval, master_playlist, playlist, routed_response,
+        validate_cast_hosts, validate_serve_only,
     };
     use screencapturekit::CMTime;
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{collections::HashMap, collections::VecDeque, net::IpAddr, sync::Arc};
 
     #[test]
     fn detects_idr_in_avcc() {
@@ -1000,5 +1284,49 @@ mod tests {
         assert!(value.contains("RESOLUTION=1280x720"));
         assert!(value.contains("FRAME-RATE=30.000"));
         assert!(value.ends_with("live.m3u8\n"));
+    }
+
+    #[test]
+    fn multiplexed_routes_are_private_and_isolated() {
+        let first = Arc::new(HlsStore::default());
+        let second = Arc::new(HlsStore::default());
+        first
+            .set_init(vec![1, 2, 3], "avc1.42001F", 1280, 720, 30, 6_000_000)
+            .unwrap();
+        second
+            .set_init(vec![4, 5, 6], "avc1.42001F", 1280, 720, 30, 6_000_000)
+            .unwrap();
+        let routes = HashMap::from([("alpha".to_owned(), first), ("bravo".to_owned(), second)]);
+
+        assert_eq!(
+            &*routed_response(&routes, "/alpha/init.mp4")
+                .unwrap()
+                .unwrap()
+                .data,
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            &*routed_response(&routes, "/bravo/init.mp4")
+                .unwrap()
+                .unwrap()
+                .data,
+            &[4, 5, 6]
+        );
+        assert!(
+            routed_response(&routes, "/alphax/init.mp4")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn group_validation_rejects_duplicates_and_multi_host_serve_only() {
+        let first = "192.0.2.10".parse::<IpAddr>().unwrap();
+        let second = "192.0.2.20".parse::<IpAddr>().unwrap();
+        assert!(validate_cast_hosts(&[first, second]).is_ok());
+        assert!(validate_cast_hosts(&[first, first]).is_err());
+        assert!(validate_serve_only(&[first], true).is_ok());
+        assert!(validate_serve_only(&[first, second], true).is_err());
+        assert!(validate_serve_only(&[first, second], false).is_ok());
     }
 }

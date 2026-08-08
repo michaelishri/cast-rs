@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::c_void,
     io::{self, ErrorKind, IsTerminal, Write},
     net::{IpAddr, SocketAddr, UdpSocket},
@@ -49,6 +49,7 @@ const KEYFRAME_PACKETS_PER_BURST: usize = 24;
 const MAX_FRAME_PACING_WINDOW: Duration = Duration::from_millis(5);
 const RATE_CONTROL_INTERVAL: Duration = Duration::from_secs(1);
 const RATE_CONTROL_HEALTHY_WINDOWS_BEFORE_INCREASE: u8 = 3;
+static VIRTUAL_DISPLAY_TEARDOWN: Mutex<()> = Mutex::new(());
 const SYNTHETIC_SURFACE_POOL_SIZE: usize = 3;
 const PROFILE_HISTORY_SECONDS: usize = 60;
 const PROFILE_GRAPH_COLUMNS: usize = 44;
@@ -60,7 +61,7 @@ type Aes128Ctr = Ctr128BE<Aes128>;
 
 #[derive(Clone)]
 pub struct MirrorOptions {
-    pub cast_host: IpAddr,
+    pub cast_hosts: Vec<IpAddr>,
     pub cast_port: u16,
     pub display_id: Option<u32>,
     pub extend: bool,
@@ -77,30 +78,65 @@ pub struct MirrorOptions {
     pub prioritize_encoding_speed: bool,
 }
 
+fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
+    if hosts.is_empty() {
+        bail!("at least one --host is required");
+    }
+    let mut unique = HashSet::with_capacity(hosts.len());
+    for host in hosts {
+        if !unique.insert(*host) {
+            bail!("duplicate Cast receiver host {host}");
+        }
+    }
+    Ok(())
+}
+
 pub fn cast_desktop(options: MirrorOptions) -> Result<()> {
+    validate_cast_hosts(&options.cast_hosts)?;
     let interrupted = install_interrupt_handler()?;
-    run_desktop(
-        options,
-        RunMode::Cast,
-        ProfilePresentation::Detailed,
-        interrupted.as_ref(),
-    )
-    .map(|_| ())
+    if options.extend && options.cast_hosts.len() > 1 {
+        run_extended_desktop(
+            options,
+            RunMode::Cast,
+            ProfilePresentation::Detailed,
+            &interrupted,
+        )
+        .map(|_| ())
+    } else {
+        run_desktop(
+            options,
+            RunMode::Cast,
+            ProfilePresentation::Detailed,
+            interrupted.as_ref(),
+            None,
+        )
+        .map(|_| ())
+    }
 }
 
 pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
+    validate_cast_hosts(&options.cast_hosts)?;
     if options.duration.is_none() {
         bail!("latency profiling requires a fixed duration");
     }
     let interrupted = install_interrupt_handler()?;
     if auto_tune {
         auto_tune_profile(options, interrupted.as_ref())
+    } else if options.extend && options.cast_hosts.len() > 1 {
+        run_extended_desktop(
+            options,
+            RunMode::Profile,
+            ProfilePresentation::Detailed,
+            &interrupted,
+        )
+        .map(|_| ())
     } else {
         run_desktop(
             options,
             RunMode::Profile,
             ProfilePresentation::Detailed,
             interrupted.as_ref(),
+            None,
         )
         .map(|_| ())
     }
@@ -115,6 +151,7 @@ enum RunMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProfilePresentation {
     Detailed,
+    GroupedTarget,
     AutoTuneTrial,
 }
 
@@ -217,6 +254,12 @@ struct ProfileRunResult {
     effective_fps: u32,
     final_target_bitrate: u64,
     score_ms: f64,
+}
+
+#[derive(Debug)]
+struct ProfileGroupResult {
+    receivers: Vec<(IpAddr, ProfileRunResult)>,
+    aggregate: ProfileRunResult,
 }
 
 struct AutoTuneTrial {
@@ -362,8 +405,10 @@ fn run_auto_tune_trial(
         RunMode::Profile,
         ProfilePresentation::AutoTuneTrial,
         interrupted,
+        None,
     )?
-    .expect("profile mode returns profile measurements");
+    .expect("profile mode returns profile measurements")
+    .aggregate;
     println!(
         "Trial result: p95 {:.1} ms, p99 {:.1} ms, retrans {:.2}%, raw drops {:.2}%, {:.1} fps, score {:.1} ms",
         micros_to_millis(result.pipeline.p95_micros),
@@ -477,8 +522,8 @@ fn print_auto_tune_report(base: &MirrorOptions, trials: &[AutoTuneTrial]) {
         winner.result.recommendations.balanced_ms,
     );
     println!(
-        "\nUse: cast desktop --host {} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
-        base.cast_host,
+        "\nUse: cast desktop{} --cast-port {} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
+        host_command_arguments(&base.cast_hosts),
         base.cast_port,
         winner.result.recommendations.balanced_ms,
         winner.result.effective_fps,
@@ -492,12 +537,116 @@ fn print_auto_tune_report(base: &MirrorOptions, trials: &[AutoTuneTrial]) {
     );
 }
 
+fn host_command_arguments(hosts: &[IpAddr]) -> String {
+    hosts.iter().map(|host| format!(" --host {host}")).collect()
+}
+
+fn run_extended_desktop(
+    options: MirrorOptions,
+    mode: RunMode,
+    presentation: ProfilePresentation,
+    interrupted: &Arc<AtomicBool>,
+) -> Result<Option<ProfileGroupResult>> {
+    let width = even(options.width);
+    let height = even(options.height);
+    let mut displays = Vec::with_capacity(options.cast_hosts.len());
+    for (index, host) in options.cast_hosts.iter().copied().enumerate() {
+        let ordinal = u32::try_from(index + 1)
+            .context("the number of extended displays exceeded the supported ordinal range")?;
+        let session = VirtualDisplaySession::start(width, height, options.fps, ordinal)?;
+        println!(
+            "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
+            session.display_id()
+        );
+        displays.push((host, session));
+    }
+
+    let worker_presentation =
+        if mode == RunMode::Profile && presentation == ProfilePresentation::Detailed {
+            ProfilePresentation::GroupedTarget
+        } else {
+            presentation
+        };
+    let results = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(displays.len());
+        for (host, session) in displays {
+            let mut target_options = options.clone();
+            target_options.cast_hosts = vec![host];
+            target_options.extend = false;
+            target_options.display_id = Some(session.display_id());
+            let stop = Arc::clone(interrupted);
+            workers.push((
+                host,
+                scope.spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_desktop(
+                            target_options,
+                            mode,
+                            worker_presentation,
+                            stop.as_ref(),
+                            Some(session),
+                        )
+                    }))
+                    .map_err(|_| anyhow!("desktop cast worker for {host} panicked"))
+                    .and_then(std::convert::identity);
+                    if result.is_err() {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    result
+                }),
+            ));
+        }
+
+        workers
+            .into_iter()
+            .map(|(host, worker)| {
+                let result = worker
+                    .join()
+                    .map_err(|_| anyhow!("desktop cast worker for {host} panicked"))?;
+                result.with_context(|| format!("desktop cast to {host} failed"))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut failures = Vec::new();
+    let mut receivers = Vec::new();
+    for result in results {
+        match result {
+            Ok(Some(group)) => receivers.extend(group.receivers),
+            Ok(None) => {}
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("multi-receiver cast stopped: {}", failures.join("; "));
+    }
+    if mode == RunMode::Cast {
+        return Ok(None);
+    }
+
+    let aggregate = aggregate_profile_results(
+        &receivers
+            .iter()
+            .map(|(_, result)| *result)
+            .collect::<Vec<_>>(),
+    )?;
+    if presentation == ProfilePresentation::Detailed {
+        print_group_profile_report(&options, &receivers, aggregate);
+    }
+    Ok(Some(ProfileGroupResult {
+        receivers,
+        aggregate,
+    }))
+}
+
 fn run_desktop(
     mut options: MirrorOptions,
     mode: RunMode,
     presentation: ProfilePresentation,
     interrupted: &AtomicBool,
-) -> Result<Option<ProfileRunResult>> {
+    precreated_display: Option<VirtualDisplaySession>,
+) -> Result<Option<ProfileGroupResult>> {
+    validate_cast_hosts(&options.cast_hosts)?;
     if options.bitrate <= 0 {
         bail!("bitrate must be greater than zero");
     }
@@ -528,16 +677,16 @@ fn run_desktop(
         height,
         options.fps
     );
-    let mut virtual_display = if options.extend {
-        Some(VirtualDisplaySession::start(width, height, options.fps)?)
-    } else {
-        None
+    let mut virtual_display = match (options.extend, precreated_display) {
+        (true, Some(_)) => bail!("temporary display ownership was specified twice"),
+        (true, None) => Some(VirtualDisplaySession::start(width, height, options.fps, 1)?),
+        (false, display) => display,
     };
     if let Some(session) = virtual_display.as_ref() {
         options.display_id = Some(session.display_id());
     }
-    let negotiation = negotiate_cast_streaming(
-        options.cast_host,
+    let mut targets = negotiate_cast_streaming_group(
+        &options.cast_hosts,
         options.cast_port,
         width,
         height,
@@ -547,60 +696,93 @@ fn run_desktop(
         h264_level,
     )?;
     let requested_fps = options.fps;
-    if let Some(receiver_fps) = negotiation.receiver_frame_rate
-        && receiver_fps > 0
-        && receiver_fps < options.fps
-    {
+    let receiver_fps = negotiated_group_frame_rate(&targets, options.fps);
+    if receiver_fps < options.fps {
         eprintln!(
-            "Receiver selected {receiver_fps} fps instead of {} fps; capping capture and encoding to the negotiated rate.",
+            "A receiver selected {receiver_fps} fps instead of {} fps; capping the shared capture and encoding pipeline to the group rate.",
             options.fps
         );
         options.fps = receiver_fps;
     }
 
-    let local_ip = local_ip_for(options.cast_host, options.cast_port)?;
-    let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))
-        .with_context(|| format!("could not bind Cast Streaming UDP socket on {local_ip}"))?;
-    socket
-        .connect(SocketAddr::new(options.cast_host, negotiation.udp_port))
-        .with_context(|| {
-            format!(
-                "could not connect Cast Streaming UDP socket to {}:{}",
-                options.cast_host, negotiation.udp_port
-            )
-        })?;
-    log::debug!(
-        "Cast Streaming UDP route is {} -> {}:{}",
-        socket.local_addr()?,
-        options.cast_host,
-        negotiation.udp_port
-    );
-
-    let stats = Arc::new(MirrorStats::default());
-    stats
+    let capture_stats = Arc::new(MirrorStats::default());
+    capture_stats
         .requested_frame_rate
         .store(u64::from(requested_fps), Ordering::Relaxed);
-    stats
+    capture_stats
         .effective_frame_rate
         .store(u64::from(options.fps), Ordering::Relaxed);
-    let rate_control = Arc::new(AdaptiveRateControl::new(
+    let rate_control = Arc::new(AdaptiveRateControl::new_group(
         options.bitrate as u64,
         options.adaptive_bitrate,
-        Arc::clone(&stats),
+        Arc::clone(&capture_stats),
+        targets.len(),
     ));
-    let sender = Arc::new(Mutex::new(CastRtpSender::new(
-        socket.try_clone()?,
-        options.cast_host.is_ipv4(),
-        negotiation.sender_ssrc,
-        negotiation.receiver_ssrc,
-        negotiation.aes_key,
-        negotiation.aes_iv_mask,
-        Arc::clone(&stats),
-        Arc::clone(&rate_control),
-        options.fps,
-        options.target_delay,
-    )?));
-    let feedback = FeedbackThread::start(socket, Arc::clone(&sender), Arc::clone(&stats))?;
+    let failure = Arc::new(Mutex::new(None));
+    let mut sender_workers = Vec::with_capacity(targets.len());
+    let mut feedback_threads = Vec::with_capacity(targets.len());
+    let mut outputs = Vec::with_capacity(targets.len());
+    let mut target_stats = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().enumerate() {
+        let host = target.host;
+        let transport = &target.transport;
+        let local_ip = local_ip_for(host, options.cast_port)?;
+        let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))
+            .with_context(|| format!("could not bind Cast Streaming UDP socket on {local_ip}"))?;
+        socket
+            .connect(SocketAddr::new(host, transport.udp_port))
+            .with_context(|| {
+                format!(
+                    "could not connect Cast Streaming UDP socket to {}:{}",
+                    host, transport.udp_port
+                )
+            })?;
+        log::debug!(
+            "Cast Streaming UDP route for {} is {} -> {}:{}",
+            host,
+            socket.local_addr()?,
+            host,
+            transport.udp_port
+        );
+
+        let stats = if targets.len() == 1 {
+            Arc::clone(&capture_stats)
+        } else {
+            Arc::new(MirrorStats::default())
+        };
+        stats
+            .requested_frame_rate
+            .store(u64::from(requested_fps), Ordering::Relaxed);
+        stats
+            .effective_frame_rate
+            .store(u64::from(options.fps), Ordering::Relaxed);
+        let sender = Arc::new(Mutex::new(CastRtpSender::new(
+            socket.try_clone()?,
+            host.is_ipv4(),
+            transport.sender_ssrc,
+            transport.receiver_ssrc,
+            transport.aes_key,
+            transport.aes_iv_mask,
+            Arc::clone(&stats),
+            Arc::clone(&rate_control),
+            index,
+            options.fps,
+            options.target_delay,
+        )?));
+        let feedback = FeedbackThread::start(
+            index + 1,
+            host,
+            socket,
+            Arc::clone(&sender),
+            Arc::clone(&stats),
+            Arc::clone(&failure),
+        )?;
+        let (output, worker) = SenderWorker::start(index + 1, host, sender, Arc::clone(&failure))?;
+        target_stats.push((host, stats));
+        feedback_threads.push(feedback);
+        sender_workers.push(worker);
+        outputs.push(output);
+    }
 
     let keyframe_interval = i32::try_from(options.fps)
         .context("frame rate exceeded VideoToolbox's keyframe interval range")?;
@@ -613,12 +795,11 @@ fn run_desktop(
         .with_profile_level(h264_level.profile_level)
         .build()
         .context("could not create the VideoToolbox H.264 mirroring encoder")?;
-    configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &stats);
+    configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
 
-    let failure = Arc::new(Mutex::new(None));
     let pipeline = MirrorPipeline {
         encoder,
-        sender,
+        outputs,
         parameter_sets: None,
         frame_index: 0,
         first_capture_timestamp: None,
@@ -626,14 +807,14 @@ fn run_desktop(
         fps: options.fps,
         rate_control,
         encoder_bitrate: options.bitrate,
-        stats: Arc::clone(&stats),
+        stats: Arc::clone(&capture_stats),
     };
     let max_frame_age = resolve_max_frame_age(options.max_frame_age, options.fps);
     let (submitter, encoder_worker) = EncoderWorker::start(
         pipeline,
         max_frame_age,
         Arc::clone(&failure),
-        Arc::clone(&stats),
+        Arc::clone(&capture_stats),
     )?;
     if let Some(max_frame_age) = max_frame_age {
         log::debug!(
@@ -658,7 +839,7 @@ fn run_desktop(
                 height,
                 options.fps,
                 Arc::clone(&failure),
-                Arc::clone(&stats),
+                Arc::clone(&capture_stats),
             )?,
             encoder_worker,
         )
@@ -748,78 +929,143 @@ fn run_desktop(
     }
 
     let started = Instant::now();
-    let mut graph = (mode == RunMode::Profile).then(|| {
-        LiveLatencyGraph::new(
-            options.duration.expect("profile duration was validated"),
-            options.synthetic,
-            options.fps,
-        )
-    });
-    loop {
-        if interrupted.load(Ordering::SeqCst)
-            || options
-                .duration
-                .is_some_and(|duration| started.elapsed() >= duration)
-        {
-            break;
+    let graph_stats = target_stats.first().map(|(_, stats)| Arc::clone(stats));
+    let mut graph = (mode == RunMode::Profile
+        && target_stats.len() == 1
+        && presentation != ProfilePresentation::GroupedTarget)
+        .then(|| {
+            LiveLatencyGraph::new(
+                options.duration.expect("profile duration was validated"),
+                options.synthetic,
+                options.fps,
+            )
+        });
+    let mut run_result = (|| -> Result<()> {
+        loop {
+            if interrupted.load(Ordering::SeqCst)
+                || options
+                    .duration
+                    .is_some_and(|duration| started.elapsed() >= duration)
+            {
+                break;
+            }
+            if let Some(error) = take_failure(&failure)? {
+                bail!("mirroring pipeline failed: {error}");
+            }
+            for target in &targets {
+                target.ensure_alive()?;
+            }
+            if let Some(session) = virtual_display.as_mut() {
+                session.ensure_alive()?;
+            }
+            if let (Some(graph), Some(stats)) = (graph.as_mut(), graph_stats.as_deref()) {
+                graph.draw_if_due(stats, started.elapsed())?;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-        if let Some(error) = take_failure(&failure)? {
-            bail!("mirroring encoder failed: {error}");
-        }
-        if let Some(error) = take_failure(&negotiation.control.failure)? {
-            bail!("Cast Streaming control connection failed: {error}");
-        }
-        if let Some(session) = virtual_display.as_mut() {
-            session.ensure_alive()?;
-        }
-        if let Some(graph) = graph.as_mut() {
-            graph.draw_if_due(&stats, started.elapsed())?;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 
-    if let Some(graph) = graph.as_mut() {
-        graph.finish(&stats, started.elapsed())?;
-    }
+        if let (Some(graph), Some(stats)) = (graph.as_mut(), graph_stats.as_deref()) {
+            graph.finish(stats, started.elapsed())?;
+        }
+        Ok(())
+    })();
     let sampled_for = started.elapsed();
+    if run_result.is_err() {
+        interrupted.store(true, Ordering::SeqCst);
+    }
 
-    input.stop_and_release()?;
+    let input_result = input.stop_and_release();
     // Stopping an SCStream does not release the stream or its content filter.
     // Drop the capture graph before removing a virtual source display so
     // ScreenCaptureKit cannot keep that display registered with WindowServer.
     log::debug!("released desktop capture resources before display teardown");
-    drop(feedback);
-    negotiation
-        .control
-        .close_expected
-        .store(true, Ordering::SeqCst);
-    if let Err(error) = stop_cast_streaming_session(
-        options.cast_host,
-        options.cast_port,
-        &negotiation.session_id,
-    ) {
-        log::warn!("could not stop the Cast Streaming receiver app cleanly: {error:#}");
-    }
-    let profile_result = match mode {
-        RunMode::Cast => {
-            print_cast_summary(&stats);
-            None
+    let mut sender_result = Ok(());
+    for worker in &mut sender_workers {
+        if let Err(error) = worker.stop()
+            && sender_result.is_ok()
+        {
+            sender_result = Err(error);
         }
-        RunMode::Profile => {
-            let result = collect_profile_result(&stats, sampled_for)?;
-            if presentation == ProfilePresentation::Detailed {
-                print_profile_report(&stats, sampled_for, &options)?;
+    }
+    drop(feedback_threads);
+    if run_result.is_ok() {
+        run_result = match take_failure(&failure) {
+            Ok(Some(error)) => Err(anyhow!("mirroring pipeline failed: {error}")),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+    }
+    if run_result.is_err() || input_result.is_err() || sender_result.is_err() {
+        interrupted.store(true, Ordering::SeqCst);
+    }
+    for target in &mut targets {
+        if let Err(error) = target.stop() {
+            log::warn!("could not stop a Cast Streaming receiver cleanly: {error:#}");
+        }
+    }
+
+    let merge_result = (|| -> Result<()> {
+        for (_, stats) in &target_stats {
+            if !Arc::ptr_eq(&capture_stats, stats) {
+                merge_capture_stats(&capture_stats, stats)?;
             }
-            Some(result)
         }
+        Ok(())
+    })();
+    let profile_result = (|| -> Result<Option<ProfileGroupResult>> {
+        merge_result?;
+        match mode {
+            RunMode::Cast => {
+                for (host, stats) in &target_stats {
+                    print_cast_summary(*host, stats);
+                }
+                Ok(None)
+            }
+            RunMode::Profile => {
+                let mut receivers = Vec::with_capacity(target_stats.len());
+                let grouped =
+                    target_stats.len() > 1 || presentation == ProfilePresentation::GroupedTarget;
+                for (host, stats) in &target_stats {
+                    let result = collect_profile_result(stats, sampled_for)?;
+                    if presentation != ProfilePresentation::AutoTuneTrial {
+                        print_profile_report(stats, sampled_for, &options, *host, !grouped)?;
+                    }
+                    receivers.push((*host, result));
+                }
+                let aggregate = aggregate_profile_results(
+                    &receivers
+                        .iter()
+                        .map(|(_, result)| *result)
+                        .collect::<Vec<_>>(),
+                )?;
+                if presentation == ProfilePresentation::Detailed && grouped {
+                    print_group_profile_report(&options, &receivers, aggregate);
+                }
+                Ok(Some(ProfileGroupResult {
+                    receivers,
+                    aggregate,
+                }))
+            }
+        }
+    })();
+    let display_result = if let Some(session) = virtual_display.as_mut() {
+        let _teardown = VIRTUAL_DISPLAY_TEARDOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        session.stop()
+    } else {
+        Ok(())
     };
-    if let Some(session) = virtual_display.as_mut() {
-        session.stop()?;
-    }
-    Ok(profile_result)
+
+    run_result?;
+    input_result?;
+    sender_result?;
+    display_result?;
+    profile_result
 }
 
-fn print_cast_summary(stats: &MirrorStats) {
+fn print_cast_summary(host: IpAddr, stats: &MirrorStats) {
+    println!("Receiver {host}:");
     println!(
         "Stopped. Sent {} frames in {} RTP packets ({} retransmissions); received {} RTCP feedback packets.",
         stats.frames.load(Ordering::Relaxed),
@@ -1125,6 +1371,110 @@ fn collect_profile_result(stats: &MirrorStats, sampled_for: Duration) -> Result<
     })
 }
 
+fn aggregate_profile_results(results: &[ProfileRunResult]) -> Result<ProfileRunResult> {
+    let Some(mut aggregate) = results.first().copied() else {
+        bail!("profile group did not produce any receiver measurements");
+    };
+    for result in &results[1..] {
+        aggregate.sampled_for = aggregate.sampled_for.min(result.sampled_for);
+        aggregate.pipeline = LatencyDistribution {
+            count: aggregate.pipeline.count.min(result.pipeline.count),
+            average_micros: aggregate
+                .pipeline
+                .average_micros
+                .max(result.pipeline.average_micros),
+            p50_micros: aggregate
+                .pipeline
+                .p50_micros
+                .max(result.pipeline.p50_micros),
+            p95_micros: aggregate
+                .pipeline
+                .p95_micros
+                .max(result.pipeline.p95_micros),
+            p99_micros: aggregate
+                .pipeline
+                .p99_micros
+                .max(result.pipeline.p99_micros),
+            max_micros: aggregate
+                .pipeline
+                .max_micros
+                .max(result.pipeline.max_micros),
+        };
+        aggregate.recommendations = LatencyRecommendations {
+            aggressive_ms: aggregate
+                .recommendations
+                .aggressive_ms
+                .max(result.recommendations.aggressive_ms),
+            balanced_ms: aggregate
+                .recommendations
+                .balanced_ms
+                .max(result.recommendations.balanced_ms),
+            resilient_ms: aggregate
+                .recommendations
+                .resilient_ms
+                .max(result.recommendations.resilient_ms),
+        };
+        aggregate.retransmission_percent = aggregate
+            .retransmission_percent
+            .max(result.retransmission_percent);
+        aggregate.raw_drop_percent = aggregate.raw_drop_percent.max(result.raw_drop_percent);
+        aggregate.frame_rate_shortfall_percent = aggregate
+            .frame_rate_shortfall_percent
+            .max(result.frame_rate_shortfall_percent);
+        aggregate.measured_fps = aggregate.measured_fps.min(result.measured_fps);
+        aggregate.requested_fps = aggregate.requested_fps.max(result.requested_fps);
+        aggregate.effective_fps = aggregate.effective_fps.min(result.effective_fps);
+        aggregate.final_target_bitrate = aggregate
+            .final_target_bitrate
+            .min(result.final_target_bitrate);
+        aggregate.score_ms = aggregate.score_ms.max(result.score_ms);
+    }
+    Ok(aggregate)
+}
+
+fn print_group_profile_report(
+    options: &MirrorOptions,
+    receivers: &[(IpAddr, ProfileRunResult)],
+    aggregate: ProfileRunResult,
+) {
+    println!("\nReceiver-group profile summary (worst receiver governs):");
+    println!(
+        "  {:<39} {:>8} {:>8} {:>9} {:>8} {:>9}",
+        "receiver", "p95 ms", "p99 ms", "retrans", "fps", "balanced"
+    );
+    for (host, result) in receivers {
+        println!(
+            "  {:<39} {:>8.1} {:>8.1} {:>8.2}% {:>8.1} {:>7}ms",
+            host,
+            micros_to_millis(result.pipeline.p95_micros),
+            micros_to_millis(result.pipeline.p99_micros),
+            result.retransmission_percent,
+            result.measured_fps,
+            result.recommendations.balanced_ms,
+        );
+    }
+    println!(
+        "  Common receiver playout delay: aggressive {} ms, balanced {} ms, resilient {} ms.",
+        aggregate.recommendations.aggressive_ms,
+        aggregate.recommendations.balanced_ms,
+        aggregate.recommendations.resilient_ms,
+    );
+    println!(
+        "\nUse: cast desktop{} --cast-port {}{} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}",
+        host_command_arguments(&options.cast_hosts),
+        options.cast_port,
+        source_command_argument(options.extend, options.display_id),
+        aggregate.recommendations.balanced_ms,
+        aggregate.effective_fps,
+        even(options.width),
+        even(options.height),
+        options.bitrate,
+    );
+    println!(
+        "The common recommendation protects the worst observed receiver; it is not a glass-to-glass display measurement."
+    );
+}
+
 fn percentage(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -1152,6 +1502,8 @@ fn print_profile_report(
     stats: &MirrorStats,
     sampled_for: Duration,
     options: &MirrorOptions,
+    host: IpAddr,
+    include_recommendation: bool,
 ) -> Result<()> {
     let samples = latency_samples(stats)?;
     let pipeline = LatencyDistribution::from_values(
@@ -1232,7 +1584,7 @@ fn print_profile_report(
     let average_mbps =
         stats.encoded_bytes.load(Ordering::Relaxed) as f64 * 8.0 / seconds / 1_000_000.0;
 
-    println!("Latency profile complete");
+    println!("Latency profile complete for receiver {host}");
     if options.synthetic {
         println!(
             "  Workload: {SYNTHETIC_WORKLOAD_NAME}, deterministic {SYNTHETIC_CYCLE_SECONDS}s cycle (static, partial motion, full motion, scene cuts)"
@@ -1367,6 +1719,10 @@ fn print_profile_report(
         print_synthetic_breakdown(stats, &samples)?;
     }
 
+    if !include_recommendation {
+        return Ok(());
+    }
+
     println!("\nRecommended receiver playout delay:");
     println!(
         "  Aggressive: {:>4} ms  (covers the measured p95 with minimal decode margin)",
@@ -1395,8 +1751,8 @@ fn print_profile_report(
     }
     let source_argument = source_command_argument(options.extend, options.display_id);
     println!(
-        "\nUse: cast desktop --host {} --cast-port {}{} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
-        options.cast_host,
+        "\nUse: cast desktop{} --cast-port {}{} --target-delay-ms {} --fps {} --width {} --height {} --bitrate {}{}",
+        host_command_arguments(&options.cast_hosts),
         options.cast_port,
         source_argument,
         recommendations.balanced_ms,
@@ -1831,11 +2187,123 @@ struct NegotiatedTransport {
     control: Arc<CastStreamingControlState>,
 }
 
+struct NegotiatedTarget {
+    host: IpAddr,
+    port: u16,
+    transport: NegotiatedTransport,
+    stopped: bool,
+}
+
+impl NegotiatedTarget {
+    fn ensure_alive(&self) -> Result<()> {
+        if let Some(error) = take_failure(&self.transport.control.failure)? {
+            bail!(
+                "Cast Streaming control connection to {} failed: {error}",
+                self.host
+            );
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+        self.transport
+            .control
+            .close_expected
+            .store(true, Ordering::SeqCst);
+        stop_cast_streaming_session(self.host, self.port, &self.transport.session_id)
+            .with_context(|| format!("could not stop Cast Streaming receiver {}", self.host))
+    }
+}
+
+impl Drop for NegotiatedTarget {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            log::warn!("could not stop Cast Streaming receiver cleanly: {error:#}");
+        }
+    }
+}
+
 #[derive(Default)]
 struct CastStreamingControlState {
     close_expected: AtomicBool,
     ready: AtomicBool,
     failure: Mutex<Option<String>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negotiate_cast_streaming_group(
+    hosts: &[IpAddr],
+    port: u16,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    target_delay: Duration,
+    h264_level: H264Level,
+) -> Result<Vec<NegotiatedTarget>> {
+    let (result_sender, result_receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for (index, host) in hosts.iter().copied().enumerate() {
+            let result_sender = result_sender.clone();
+            scope.spawn(move || {
+                let result = negotiate_cast_streaming(
+                    host,
+                    port,
+                    width,
+                    height,
+                    fps,
+                    bitrate,
+                    target_delay,
+                    h264_level,
+                );
+                let _ = result_sender.send((index, host, result));
+            });
+        }
+        drop(result_sender);
+    });
+
+    let mut slots: Vec<Option<(IpAddr, Result<NegotiatedTransport>)>> =
+        (0..hosts.len()).map(|_| None).collect();
+    for (index, host, result) in result_receiver {
+        slots[index] = Some((host, result));
+    }
+
+    let mut targets = Vec::with_capacity(hosts.len());
+    let mut errors = Vec::new();
+    for (index, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some((host, Ok(transport))) => targets.push(NegotiatedTarget {
+                host,
+                port,
+                transport,
+                stopped: false,
+            }),
+            Some((host, Err(error))) => errors.push(format!("{host}: {error:#}")),
+            None => errors.push(format!("{}: negotiation worker stopped", hosts[index])),
+        }
+    }
+    if !errors.is_empty() {
+        for target in &mut targets {
+            if let Err(error) = target.stop() {
+                log::warn!("cleanup after partial group startup failed: {error:#}");
+            }
+        }
+        bail!("could not start every Cast receiver: {}", errors.join("; "));
+    }
+    Ok(targets)
+}
+
+fn negotiated_group_frame_rate(targets: &[NegotiatedTarget], requested_fps: u32) -> u32 {
+    targets
+        .iter()
+        .filter_map(|target| target.transport.receiver_frame_rate)
+        .filter(|fps| *fps > 0)
+        .fold(requested_fps, u32::min)
+        .max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2299,16 +2767,79 @@ struct MirrorStats {
     synthetic_phase_retransmissions: [AtomicU64; 4],
 }
 
+fn merge_capture_stats(source: &MirrorStats, target: &MirrorStats) -> Result<()> {
+    macro_rules! copy_u64 {
+        ($field:ident) => {
+            target
+                .$field
+                .store(source.$field.load(Ordering::Relaxed), Ordering::Relaxed)
+        };
+    }
+    copy_u64!(requested_frame_rate);
+    copy_u64!(effective_frame_rate);
+    copy_u64!(raw_frames_submitted);
+    copy_u64!(raw_frames_replaced);
+    copy_u64!(raw_frames_expired);
+    copy_u64!(adaptive_bitrate_increases);
+    copy_u64!(adaptive_bitrate_decreases);
+    copy_u64!(adaptive_bitrate_apply_failures);
+    copy_u64!(current_target_bitrate);
+    copy_u64!(minimum_target_bitrate);
+    copy_u64!(synthetic_generated_frames);
+    copy_u64!(synthetic_skipped_frames);
+    target.vt_max_frame_delay_applied.store(
+        source.vt_max_frame_delay_applied.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    target.vt_speed_priority_applied.store(
+        source.vt_speed_priority_applied.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    let render_samples = source
+        .synthetic_render_micros
+        .lock()
+        .map_err(|_| anyhow!("synthetic render timing lock was poisoned"))?
+        .clone();
+    *target
+        .synthetic_render_micros
+        .lock()
+        .map_err(|_| anyhow!("synthetic render timing lock was poisoned"))? = render_samples;
+    Ok(())
+}
+
 struct AdaptiveRateControl {
     enabled: bool,
     minimum_bitrate: u64,
     maximum_bitrate: u64,
     target_bitrate: AtomicU64,
     stats: Arc<MirrorStats>,
+    group: Mutex<GroupRateState>,
+}
+
+#[derive(Clone, Copy)]
+struct RateWindowHealth {
+    congested: bool,
+    acknowledged_bps: u64,
+}
+
+struct GroupRateState {
+    reports: Vec<Option<RateWindowHealth>>,
+    healthy_rounds: u8,
 }
 
 impl AdaptiveRateControl {
+    #[cfg(test)]
     fn new(maximum_bitrate: u64, enabled: bool, stats: Arc<MirrorStats>) -> Self {
+        Self::new_group(maximum_bitrate, enabled, stats, 1)
+    }
+
+    fn new_group(
+        maximum_bitrate: u64,
+        enabled: bool,
+        stats: Arc<MirrorStats>,
+        participants: usize,
+    ) -> Self {
+        assert!(participants > 0, "rate-control group must not be empty");
         let minimum_bitrate = (maximum_bitrate / 4).max(500_000).min(maximum_bitrate);
         stats
             .current_target_bitrate
@@ -2322,6 +2853,10 @@ impl AdaptiveRateControl {
             maximum_bitrate,
             target_bitrate: AtomicU64::new(maximum_bitrate),
             stats,
+            group: Mutex::new(GroupRateState {
+                reports: vec![None; participants],
+                healthy_rounds: 0,
+            }),
         }
     }
 
@@ -2352,6 +2887,59 @@ impl AdaptiveRateControl {
             .max(current.saturating_add(100_000))
             .min(self.maximum_bitrate);
         self.set_target(next, true);
+    }
+
+    fn report_window(&self, target: usize, health: RateWindowHealth) {
+        let action = {
+            let Ok(mut group) = self.group.lock() else {
+                log::warn!("adaptive bitrate group lock was poisoned");
+                return;
+            };
+            let Some(slot) = group.reports.get_mut(target) else {
+                log::warn!("adaptive bitrate received an unknown target index {target}");
+                return;
+            };
+            if let Some(existing) = slot.as_mut() {
+                existing.congested |= health.congested;
+                existing.acknowledged_bps = existing.acknowledged_bps.min(health.acknowledged_bps);
+            } else {
+                *slot = Some(health);
+            }
+            if group.reports.iter().any(Option::is_none) {
+                return;
+            }
+
+            let congested = group
+                .reports
+                .iter()
+                .flatten()
+                .any(|report| report.congested);
+            let acknowledged_bps = group
+                .reports
+                .iter()
+                .flatten()
+                .map(|report| report.acknowledged_bps)
+                .min()
+                .unwrap_or(0);
+            group.reports.fill(None);
+            if congested {
+                group.healthy_rounds = 0;
+                Some((false, acknowledged_bps))
+            } else {
+                group.healthy_rounds = group.healthy_rounds.saturating_add(1);
+                if group.healthy_rounds >= RATE_CONTROL_HEALTHY_WINDOWS_BEFORE_INCREASE {
+                    group.healthy_rounds = 0;
+                    Some((true, acknowledged_bps))
+                } else {
+                    None
+                }
+            }
+        };
+        match action {
+            Some((true, _)) => self.increase(),
+            Some((false, acknowledged_bps)) => self.decrease(acknowledged_bps),
+            None => {}
+        }
     }
 
     fn set_target(&self, next: u64, increase: bool) {
@@ -2445,6 +3033,7 @@ struct CastRtpSender {
     last_sender_report: Option<Instant>,
     stats: Arc<MirrorStats>,
     rate_control: Arc<AdaptiveRateControl>,
+    rate_control_target: usize,
     fps: u32,
     target_delay: Duration,
     rate_window_started: Instant,
@@ -2453,7 +3042,6 @@ struct CastRtpSender {
     rate_window_max_latency_micros: u64,
     rate_window_max_in_flight_frames: u64,
     rate_window_max_in_flight_bytes: u64,
-    healthy_rate_windows: u8,
 }
 
 impl CastRtpSender {
@@ -2467,6 +3055,7 @@ impl CastRtpSender {
         aes_iv_mask: [u8; 16],
         stats: Arc<MirrorStats>,
         rate_control: Arc<AdaptiveRateControl>,
+        rate_control_target: usize,
         fps: u32,
         target_delay: Duration,
     ) -> Result<Self> {
@@ -2487,6 +3076,7 @@ impl CastRtpSender {
             last_sender_report: None,
             stats,
             rate_control,
+            rate_control_target,
             fps,
             target_delay,
             rate_window_started: Instant::now(),
@@ -2495,7 +3085,6 @@ impl CastRtpSender {
             rate_window_max_latency_micros: 0,
             rate_window_max_in_flight_frames: 0,
             rate_window_max_in_flight_bytes: 0,
-            healthy_rate_windows: 0,
         })
     }
 
@@ -2939,16 +3528,13 @@ impl CastRtpSender {
             byte_backlog_limit,
         );
 
-        if congested {
-            self.healthy_rate_windows = 0;
-            self.rate_control.decrease(acknowledged_bps);
-        } else {
-            self.healthy_rate_windows = self.healthy_rate_windows.saturating_add(1);
-            if self.healthy_rate_windows >= RATE_CONTROL_HEALTHY_WINDOWS_BEFORE_INCREASE {
-                self.rate_control.increase();
-                self.healthy_rate_windows = 0;
-            }
-        }
+        self.rate_control.report_window(
+            self.rate_control_target,
+            RateWindowHealth {
+                congested,
+                acknowledged_bps,
+            },
+        );
         log::trace!(
             "rate-control window: acked={:.2} Mbit/s, latency_max={:.1} ms, in_flight_max={} frames/{:.1} KiB, nacks={}, target_binding={target_is_binding}, congested={congested}, target={:.2} Mbit/s",
             acknowledged_bps as f64 / 1_000_000.0,
@@ -2974,15 +3560,18 @@ struct FeedbackThread {
 
 impl FeedbackThread {
     fn start(
+        ordinal: usize,
+        host: IpAddr,
         socket: UdpSocket,
         sender: Arc<Mutex<CastRtpSender>>,
         stats: Arc<MirrorStats>,
+        failure: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("cast-mirror-rtcp".into())
+            .name(format!("cast-mirror-rtcp-{ordinal}"))
             .spawn(move || {
                 let mut buffer = [0_u8; 2048];
                 while !thread_stop.load(Ordering::SeqCst) {
@@ -2993,7 +3582,11 @@ impl FeedbackThread {
                                 .map_err(|_| anyhow!("Cast RTP sender lock was poisoned"))
                                 .and_then(|mut sender| sender.handle_rtcp(&buffer[..size]))
                             {
-                                log::warn!("could not process Cast RTCP feedback: {error:#}");
+                                store_source_failure(
+                                    &failure,
+                                    format!("Cast RTCP feedback from {host} failed: {error:#}"),
+                                );
+                                break;
                             }
                         }
                         Err(error)
@@ -3002,7 +3595,10 @@ impl FeedbackThread {
                                 ErrorKind::WouldBlock | ErrorKind::TimedOut
                             ) => {}
                         Err(error) => {
-                            log::warn!("Cast RTCP feedback socket failed: {error}");
+                            store_source_failure(
+                                &failure,
+                                format!("Cast RTCP feedback socket for {host} failed: {error}"),
+                            );
                             break;
                         }
                     }
@@ -3503,9 +4099,109 @@ impl MirrorFrameHandler {
     }
 }
 
+const SENDER_QUEUE_FRAMES: usize = 3;
+
+#[derive(Clone)]
+struct EncodedFrame {
+    rtp_timestamp: u32,
+    keyframe: bool,
+    data: Arc<Vec<u8>>,
+    timings: FrameTimings,
+    synthetic_phase: Option<SyntheticPhase>,
+}
+
+#[derive(Clone)]
+struct SenderSubmitter {
+    host: IpAddr,
+    sender: mpsc::SyncSender<EncodedFrame>,
+}
+
+impl SenderSubmitter {
+    fn submit(&self, frame: EncodedFrame) -> Result<()> {
+        match self.sender.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => bail!(
+                "Cast receiver {} fell more than {SENDER_QUEUE_FRAMES} encoded frames behind",
+                self.host
+            ),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                bail!("Cast sender worker for {} stopped unexpectedly", self.host)
+            }
+        }
+    }
+}
+
+struct SenderWorker {
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SenderWorker {
+    fn start(
+        ordinal: usize,
+        host: IpAddr,
+        sender: Arc<Mutex<CastRtpSender>>,
+        failure: Arc<Mutex<Option<String>>>,
+    ) -> Result<(SenderSubmitter, Self)> {
+        let (submitter, receiver) = mpsc::sync_channel::<EncodedFrame>(SENDER_QUEUE_FRAMES);
+        let thread = thread::Builder::new()
+            .name(format!("cast-mirror-send-{ordinal}"))
+            .spawn(move || {
+                while let Ok(frame) = receiver.recv() {
+                    let lock_started = Instant::now();
+                    let result = sender
+                        .lock()
+                        .map_err(|_| anyhow!("Cast RTP sender lock was poisoned"))
+                        .and_then(|mut sender| {
+                            let mut timings = frame.timings;
+                            timings.sender_lock_wait_micros = elapsed_micros(lock_started);
+                            sender.send_frame(
+                                frame.rtp_timestamp,
+                                frame.keyframe,
+                                &frame.data,
+                                timings,
+                                frame.synthetic_phase,
+                            )
+                        });
+                    if let Err(error) = result {
+                        store_source_failure(
+                            &failure,
+                            format!("Cast sender for {host} failed: {error:#}"),
+                        );
+                        break;
+                    }
+                }
+            })
+            .with_context(|| format!("could not start Cast sender worker for {host}"))?;
+        Ok((
+            SenderSubmitter {
+                host,
+                sender: submitter,
+            },
+            Self {
+                thread: Some(thread),
+            },
+        ))
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("Cast sender worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SenderWorker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 struct MirrorPipeline {
     encoder: CompressionSession,
-    sender: Arc<Mutex<CastRtpSender>>,
+    outputs: Vec<SenderSubmitter>,
     parameter_sets: Option<(Vec<u8>, Vec<u8>)>,
     frame_index: u64,
     first_capture_timestamp: Option<u64>,
@@ -3564,33 +4260,29 @@ impl MirrorPipeline {
         };
         let annex_b = avcc_to_annex_b(&encoded.data, keyframe.then_some((sps, pps)))?;
         let prepare_micros = elapsed_micros(prepare_started);
-        let lock_started = Instant::now();
-        let mut sender = self
-            .sender
-            .lock()
-            .map_err(|_| anyhow!("Cast RTP sender lock was poisoned"))?;
-        let sender_lock_wait_micros = elapsed_micros(lock_started);
-        sender.send_frame(
-            timestamp as u32,
+        let frame = EncodedFrame {
+            rtp_timestamp: timestamp as u32,
             keyframe,
-            &annex_b,
-            FrameTimings {
+            data: Arc::new(annex_b),
+            timings: FrameTimings {
                 pipeline_started_at,
                 capture_age_micros,
                 queue_wait_micros,
                 encode_micros,
                 prepare_micros,
-                sender_lock_wait_micros,
+                sender_lock_wait_micros: 0,
             },
             synthetic_phase,
-        )?;
-        drop(sender);
+        };
+        for output in &self.outputs {
+            output.submit(frame.clone())?;
+        }
         self.frame_index += 1;
         if keyframe || self.frame_index % self.fps as u64 == 0 {
             log::debug!(
                 "sent mirroring frame {}: {} Annex-B bytes, keyframe={keyframe}, rtp_timestamp={timestamp}",
                 self.frame_index,
-                annex_b.len()
+                frame.data.len()
             );
         }
         Ok(())
@@ -3823,7 +4515,7 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
-#[link(name = "CoreMedia", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreMedia", kind = "framework"))]
 unsafe extern "C" {
     fn CMSampleBufferGetFormatDescription(sample_buffer: *mut c_void) -> *mut c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -3839,15 +4531,22 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdaptiveRateControl, CastRtpSender, H264Level, LatencyDistribution, LatencyRecommendations,
-        LiveLatencyGraph, MirrorStats, RawFrameDeadline, StoredFrame, TuningConfig,
-        answer_display_frame_rate, auto_tune_score, avcc_to_annex_b, combined_tuning_config,
-        encrypt_frame, expand_frame_id_after, expand_frame_id_at_or_before, frame_pacing,
+        AdaptiveRateControl, CastRtpSender, CastStreamingControlState, EncodedFrame, FrameTimings,
+        H264Level, LatencyDistribution, LatencyRecommendations, LiveLatencyGraph, MirrorStats,
+        NegotiatedTarget, NegotiatedTransport, ProfileRunResult, RateWindowHealth,
+        RawFrameDeadline, SENDER_QUEUE_FRAMES, SenderSubmitter, StoredFrame, TuningConfig,
+        aggregate_profile_results, answer_display_frame_rate, auto_tune_score, avcc_to_annex_b,
+        combined_tuning_config, encrypt_frame, expand_frame_id_after, expand_frame_id_at_or_before,
+        frame_pacing, host_command_arguments, negotiated_group_frame_rate,
         rate_window_is_congested, recommend_latency, round_target_delay, select_tuning_winner,
-        source_command_argument,
+        source_command_argument, validate_cast_hosts,
     };
     use serde_json::json;
-    use std::{net::UdpSocket, sync::Arc, time::Duration};
+    use std::{
+        net::{IpAddr, UdpSocket},
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn converts_avcc_to_annex_b_and_prepends_parameter_sets() {
@@ -3868,6 +4567,10 @@ mod tests {
         assert_eq!(source_command_argument(true, Some(42)), " --extend");
         assert_eq!(source_command_argument(false, Some(42)), " --display 42");
         assert_eq!(source_command_argument(false, None), "");
+        assert_eq!(
+            host_command_arguments(&["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap(),]),
+            " --host 192.0.2.1 --host 192.0.2.2"
+        );
     }
 
     #[test]
@@ -4056,6 +4759,144 @@ mod tests {
     }
 
     #[test]
+    fn grouped_rate_control_uses_the_worst_receiver() {
+        let stats = Arc::new(MirrorStats::default());
+        let rate = AdaptiveRateControl::new_group(6_000_000, true, stats, 2);
+        let healthy = RateWindowHealth {
+            congested: false,
+            acknowledged_bps: 6_000_000,
+        };
+        let congested = RateWindowHealth {
+            congested: true,
+            acknowledged_bps: 3_000_000,
+        };
+
+        rate.report_window(0, healthy);
+        assert_eq!(rate.target_bitrate(), 6_000_000);
+        rate.report_window(1, congested);
+        assert_eq!(rate.target_bitrate(), 4_800_000);
+
+        for _ in 0..3 {
+            rate.report_window(0, healthy);
+            rate.report_window(1, healthy);
+        }
+        assert_eq!(rate.target_bitrate(), 5_040_000);
+    }
+
+    #[test]
+    fn sender_fanout_fails_when_a_receiver_stalls_or_disconnects() {
+        let frame = EncodedFrame {
+            rtp_timestamp: 1,
+            keyframe: false,
+            data: Arc::new(vec![1, 2, 3]),
+            timings: FrameTimings {
+                pipeline_started_at: Instant::now(),
+                capture_age_micros: None,
+                queue_wait_micros: 0,
+                encode_micros: 0,
+                prepare_micros: 0,
+                sender_lock_wait_micros: 0,
+            },
+            synthetic_phase: None,
+        };
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(SENDER_QUEUE_FRAMES);
+        let output = SenderSubmitter { host, sender };
+        for _ in 0..SENDER_QUEUE_FRAMES {
+            output.submit(frame.clone()).unwrap();
+        }
+        let error = output.submit(frame.clone()).unwrap_err().to_string();
+        assert!(error.contains("fell more than"));
+        drop(receiver);
+
+        let (sender, receiver) = mpsc::sync_channel(SENDER_QUEUE_FRAMES);
+        drop(receiver);
+        let output = SenderSubmitter { host, sender };
+        let error = output.submit(frame).unwrap_err().to_string();
+        assert!(error.contains("stopped unexpectedly"));
+    }
+
+    #[test]
+    fn shared_capture_uses_the_slowest_negotiated_frame_rate() {
+        let target = |host: &str, receiver_frame_rate| NegotiatedTarget {
+            host: host.parse().unwrap(),
+            port: 8009,
+            transport: NegotiatedTransport {
+                udp_port: 50_000,
+                session_id: String::new(),
+                sender_ssrc: 1,
+                receiver_ssrc: 2,
+                aes_key: [0; 16],
+                aes_iv_mask: [0; 16],
+                receiver_frame_rate,
+                control: Arc::new(CastStreamingControlState::default()),
+            },
+            stopped: true,
+        };
+        let targets = [
+            target("192.0.2.1", Some(60)),
+            target("192.0.2.2", Some(30)),
+            target("192.0.2.3", None),
+        ];
+        assert_eq!(negotiated_group_frame_rate(&targets, 60), 30);
+    }
+
+    #[test]
+    fn profile_group_aggregation_keeps_worst_receiver_metrics() {
+        let profile = |p95_micros: u64,
+                       p99_micros: u64,
+                       balanced_ms: u64,
+                       retransmission_percent: f64,
+                       measured_fps: f64,
+                       effective_fps: u32,
+                       score_ms: f64| ProfileRunResult {
+            sampled_for: Duration::from_secs(10),
+            pipeline: LatencyDistribution {
+                count: 100,
+                average_micros: p95_micros / 2,
+                p50_micros: p95_micros / 3,
+                p95_micros,
+                p99_micros,
+                max_micros: p99_micros + 10_000,
+            },
+            recommendations: LatencyRecommendations {
+                aggressive_ms: balanced_ms.saturating_sub(50),
+                balanced_ms,
+                resilient_ms: balanced_ms + 50,
+            },
+            retransmission_percent,
+            raw_drop_percent: retransmission_percent / 2.0,
+            frame_rate_shortfall_percent: 30.0 - measured_fps,
+            measured_fps,
+            requested_fps: 60,
+            effective_fps,
+            final_target_bitrate: u64::from(effective_fps) * 100_000,
+            score_ms,
+        };
+        let aggregate = aggregate_profile_results(&[
+            profile(80_000, 100_000, 150, 0.1, 59.0, 60, 90.0),
+            profile(120_000, 180_000, 250, 2.0, 28.0, 30, 160.0),
+        ])
+        .unwrap();
+        assert_eq!(aggregate.pipeline.p95_micros, 120_000);
+        assert_eq!(aggregate.pipeline.p99_micros, 180_000);
+        assert_eq!(aggregate.recommendations.balanced_ms, 250);
+        assert_eq!(aggregate.retransmission_percent, 2.0);
+        assert_eq!(aggregate.measured_fps, 28.0);
+        assert_eq!(aggregate.effective_fps, 30);
+        assert_eq!(aggregate.final_target_bitrate, 3_000_000);
+        assert_eq!(aggregate.score_ms, 160.0);
+    }
+
+    #[test]
+    fn receiver_groups_reject_duplicate_hosts() {
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        assert!(validate_cast_hosts(&[]).is_err());
+        assert!(validate_cast_hosts(&[host, host]).is_err());
+        assert!(validate_cast_hosts(&[host]).is_ok());
+    }
+
+    #[test]
     fn congestion_detection_does_not_lower_an_unused_bitrate_ceiling() {
         let (congested, binding) = rate_window_is_congested(
             6_000_000,
@@ -4106,6 +4947,7 @@ mod tests {
             [2; 16],
             stats,
             rate_control,
+            0,
             30,
             Duration::from_millis(100),
         )
