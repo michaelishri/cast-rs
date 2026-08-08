@@ -75,6 +75,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         .file
         .canonicalize()
         .with_context(|| format!("could not resolve local video {}", options.file.display()))?;
+    let media_name = display_file_name(&path);
     let source_file = File::open(&path)
         .with_context(|| format!("could not open local video {}", path.display()))?;
     let metadata = source_file
@@ -116,6 +117,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         let plan = media::plan(&info, options.compatibility_mode)?;
         (Some(info), plan)
     };
+    let media_duration = info.as_ref().and_then(|info| info.duration);
     if let Some(info) = &info {
         println!(
             "Input: {} video {}x{}{}{} in {}{}.",
@@ -244,6 +246,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         url,
         content_type,
         options.start_at,
+        media_duration,
         options.interactive,
     )?;
     let playback = monitor_playback(
@@ -252,6 +255,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         || server.received_request(),
         || None,
         |_| {},
+        &media_name,
         options.interactive,
     );
     let stop = session.stop();
@@ -326,6 +330,7 @@ fn cast_incremental_video(
     )?;
     let url = preparation.url();
     println!("Incremental stream ready at {url}");
+    let media_name = display_file_name(path);
 
     let mut session = BufferedMediaSession::start_fmp4_hls(
         target.cast_host,
@@ -341,6 +346,7 @@ fn cast_incremental_video(
         || preparation.received_request(),
         || preparation.failure(),
         |position| preparation.update_playback_position(position),
+        &media_name,
         target.interactive,
     );
     let cancelled = interrupted.load(Ordering::SeqCst)
@@ -386,6 +392,7 @@ fn monitor_playback(
     received_request: impl Fn() -> bool,
     preparation_failure: impl Fn() -> Option<String>,
     mut update_playback_position: impl FnMut(f64),
+    media_name: &str,
     interactive: bool,
 ) -> Result<PlaybackCompletion> {
     let started = Instant::now();
@@ -482,13 +489,23 @@ fn monitor_playback(
                 }
             }
             Ok(MediaSessionEvent::Status(status)) => {
+                let first_playing_status = status.state == PlaybackState::Playing && !has_played;
                 if let Some(position) = status.current_time {
                     update_playback_position(position.into());
                 }
-                if status.state == PlaybackState::Playing {
+                if first_playing_status {
                     has_played = true;
                 }
-                display.update(status, Instant::now());
+                let now = Instant::now();
+                display.update(status, now);
+                if first_playing_status && let Some(player) = terminal.as_mut() {
+                    let message = connected_playing_message(media_name);
+                    if let Err(error) = player.announce(&message) {
+                        disable_terminal(&mut terminal, &error);
+                    } else {
+                        next_draw = now;
+                    }
+                }
                 if terminal.is_none() {
                     print_plain_status(status, &mut plain_state, &mut plain_started);
                 }
@@ -627,6 +644,23 @@ impl TerminalPlayer {
         self.stdout.flush().context("could not draw video player")?;
         self.rendered = true;
         Ok(())
+    }
+
+    fn announce(&mut self, message: &str) -> Result<()> {
+        self.clear_display()
+            .context("could not clear the video player before announcing playback")?;
+        let width = terminal::size()
+            .map(|(width, _)| usize::from(width))
+            .unwrap_or(80)
+            .saturating_sub(1)
+            .max(1);
+        let message = fit_to_width(message.to_owned(), width);
+        queue!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        write!(self.stdout, "{message}")?;
+        queue!(self.stdout, MoveToNextLine(1), MoveToColumn(0))?;
+        self.stdout
+            .flush()
+            .context("could not announce video playback")
     }
 
     fn clear_display(&mut self) -> io::Result<()> {
@@ -799,10 +833,10 @@ fn progress_line(status: PlaybackStatus, position: Option<f32>, width: usize) ->
         return format!("{icon} {times}");
     }
 
-    let bar = match status.duration {
-        Some(duration) => determinate_progress_bar(position.unwrap_or(0.0), duration, bar_width),
-        None => indeterminate_progress_bar(position.unwrap_or(0.0), bar_width),
+    let Some(duration) = status.duration else {
+        return format!("{icon} {times}");
     };
+    let bar = determinate_progress_bar(position.unwrap_or(0.0), duration, bar_width);
     format!("{icon} [{bar}] {times}")
 }
 
@@ -814,16 +848,6 @@ fn determinate_progress_bar(position: f32, duration: f32, width: usize) -> Strin
     };
     let filled = (ratio * width as f64).floor() as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
-}
-
-fn indeterminate_progress_bar(position: f32, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let marker = ((f64::from(position.max(0.0)) * 2.0).floor() as usize) % width;
-    (0..width)
-        .map(|index| if index == marker { '█' } else { '░' })
-        .collect()
 }
 
 fn format_media_time(seconds: f32, show_hours: bool) -> String {
@@ -941,6 +965,32 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} bytes")
     }
+}
+
+fn display_file_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "video".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn connected_playing_message(media_name: &str) -> String {
+    format!("Connected and playing {media_name}.")
 }
 
 #[cfg(test)]
@@ -1061,6 +1111,7 @@ mod tests {
             50,
         );
         assert!(unknown.contains("00:30 / --:--"));
+        assert!(!unknown.contains('['));
 
         let narrow = progress_line(
             playback_status(PlaybackState::Buffering, Some(30.0), Some(120.0)),
@@ -1104,6 +1155,19 @@ mod tests {
     fn formats_media_times_with_optional_hours() {
         assert_eq!(format_media_time(65.9, false), "01:05");
         assert_eq!(format_media_time(3665.9, true), "1:01:05");
+    }
+
+    #[test]
+    fn names_the_connected_video_without_terminal_control_characters() {
+        assert_eq!(display_file_name(Path::new("/tmp/video.mp4")), "video.mp4");
+        assert_eq!(
+            display_file_name(Path::new("/tmp/video\n.mp4")),
+            "video�.mp4"
+        );
+        assert_eq!(
+            connected_playing_message("video.mp4"),
+            "Connected and playing video.mp4."
+        );
     }
 
     #[test]

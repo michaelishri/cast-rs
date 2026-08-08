@@ -131,6 +131,7 @@ impl BufferedMediaSession {
         url: String,
         content_type: String,
         start_at: f64,
+        duration: Option<f64>,
         interactive: bool,
     ) -> Result<Self> {
         Self::start_with_options(
@@ -140,7 +141,7 @@ impl BufferedMediaSession {
                 url,
                 content_type,
                 start_at,
-                duration: None,
+                duration,
                 fmp4_hls: false,
                 interactive,
             },
@@ -481,7 +482,10 @@ fn run_buffered_media_session(
         "Cast buffered LOAD response selected media session {media_session_id}: {status:?}"
     );
 
-    let mut snapshot = BufferedPlaybackSnapshot::default();
+    let mut snapshot = BufferedPlaybackSnapshot {
+        duration: normalized_duration(media_load.duration),
+        ..BufferedPlaybackSnapshot::default()
+    };
     if drain_buffered_messages(device, media_session_id, &mut snapshot, events)? {
         return stop_buffered_cast_session(
             device,
@@ -587,8 +591,14 @@ fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
         hls_segment_format: media_load.fmp4_hls.then_some(HlsSegmentFormat::Fmp4),
         hls_video_segment_format: media_load.fmp4_hls.then_some(HlsVideoSegmentFormat::Fmp4),
         metadata: None,
-        duration: media_load.duration.map(|duration| duration as f32),
+        duration: normalized_duration(media_load.duration),
     }
+}
+
+fn normalized_duration(duration: Option<f64>) -> Option<f32> {
+    duration
+        .map(|duration| duration as f32)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
 }
 
 fn toggle_buffered_playback(
@@ -1020,13 +1030,12 @@ fn emit_playback_status(
     {
         snapshot.current_time = Some(current_time);
     }
-    if let Some(duration) = entry
-        .media
-        .as_ref()
-        .and_then(|media| media.duration)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-    {
-        snapshot.duration = Some(duration);
+    if snapshot.duration.is_none() {
+        snapshot.duration = entry
+            .media
+            .as_ref()
+            .and_then(|media| media.duration)
+            .filter(|value| value.is_finite() && *value > 0.0);
     }
     snapshot.playback_rate = if entry.playback_rate.is_finite() {
         entry.playback_rate
@@ -1304,6 +1313,31 @@ mod tests {
                 can_seek: true,
             })
         );
+    }
+
+    #[test]
+    fn keeps_the_source_duration_instead_of_a_receiver_buffer_window() {
+        let (sender, receiver) = mpsc::channel();
+        let mut snapshot = BufferedPlaybackSnapshot {
+            duration: normalized_duration(Some(600.0)),
+            ..BufferedPlaybackSnapshot::default()
+        };
+        let mut entry = status_entry(PlayerState::Playing, None);
+        entry.media = Some(Media {
+            content_id: "video".to_owned(),
+            stream_type: StreamType::Buffered,
+            content_type: "application/x-mpegURL".to_owned(),
+            hls_segment_format: Some(HlsSegmentFormat::Fmp4),
+            hls_video_segment_format: Some(HlsVideoSegmentFormat::Fmp4),
+            metadata: None,
+            duration: Some(30.0),
+        });
+
+        assert!(!emit_status_entry(entry, &mut snapshot, &sender));
+        let MediaSessionEvent::Status(status) = receiver.recv().unwrap() else {
+            panic!("expected playback status");
+        };
+        assert_eq!(status.duration, Some(600.0));
     }
 
     #[test]
