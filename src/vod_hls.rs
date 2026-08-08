@@ -21,6 +21,7 @@ use crate::{
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HLS_PEAK_BANDWIDTH: u64 = 6_500_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HlsServerStats {
@@ -68,9 +69,18 @@ struct SharedPreparationStatus {
     changed: Condvar,
 }
 
+#[derive(Clone, Copy)]
+struct HlsRendition {
+    width: u32,
+    height: u32,
+    frame_rate: Option<f64>,
+    has_audio: bool,
+}
+
 pub struct IncrementalHlsPreparation {
     server: HlsDirectoryServer,
     directory: tempfile::TempDir,
+    rendition: HlsRendition,
     cancel: Arc<AtomicBool>,
     status: Arc<SharedPreparationStatus>,
     worker: Option<JoinHandle<()>>,
@@ -91,6 +101,13 @@ impl IncrementalHlsPreparation {
         let server = HlsDirectoryServer::start(bind_address, directory.path().to_owned(), route)?;
         let playlist_path = directory.path().join("index.m3u8");
         let segment_pattern = directory.path().join("segment-%06d.m4s");
+        let (width, height) = media::compatible_dimensions(info.video.width, info.video.height);
+        let rendition = HlsRendition {
+            width,
+            height,
+            frame_rate: info.video.frame_rate,
+            has_audio: info.audio.is_some(),
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let status = Arc::new(SharedPreparationStatus::default());
         let worker_cancel = Arc::clone(&cancel);
@@ -125,6 +142,7 @@ impl IncrementalHlsPreparation {
         Ok(Self {
             server,
             directory,
+            rendition,
             cancel,
             status,
             worker: Some(worker),
@@ -175,6 +193,7 @@ impl IncrementalHlsPreparation {
                 bail!("incremental media preparation failed: {failure}");
             }
             if playlist_is_playable(self.directory.path(), start_at)? {
+                publish_master_playlist(self.directory.path(), self.rendition)?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -263,6 +282,51 @@ fn playlist_is_playable(directory: &Path, start_at: f64) -> Result<bool> {
         }
     }
     Ok(segments > 0 && duration + 0.25 >= start_at.max(0.001))
+}
+
+fn publish_master_playlist(directory: &Path, rendition: HlsRendition) -> Result<()> {
+    let init = std::fs::read(directory.join("init.mp4"))
+        .context("could not inspect the incremental HLS initialization segment")?;
+    let video_codec = avc_codec_string(&init).ok_or_else(|| {
+        anyhow!("incremental HLS initialization segment has no AVC configuration")
+    })?;
+    let codecs = if rendition.has_audio {
+        format!("{video_codec},mp4a.40.2")
+    } else {
+        video_codec
+    };
+    let mut attributes = format!(
+        "BANDWIDTH={HLS_PEAK_BANDWIDTH},CODECS=\"{codecs}\",RESOLUTION={}x{}",
+        rendition.width, rendition.height
+    );
+    if let Some(frame_rate) = rendition
+        .frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        attributes.push_str(&format!(",FRAME-RATE={frame_rate:.3}"));
+    }
+    let master = format!("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:{attributes}\nindex.m3u8\n");
+    let temporary_path = directory.join("master.m3u8.tmp");
+    std::fs::write(&temporary_path, master.as_bytes())
+        .context("could not write the incremental HLS master playlist")?;
+    std::fs::rename(temporary_path, directory.join("master.m3u8"))
+        .context("could not publish the incremental HLS master playlist")?;
+    log::debug!(
+        "published incremental HLS master playlist: {}",
+        master.trim_end().replace('\n', " | ")
+    );
+    Ok(())
+}
+
+fn avc_codec_string(init: &[u8]) -> Option<String> {
+    let offset = init.windows(4).position(|window| window == b"avcC")?;
+    let configuration = init.get(offset + 4..offset + 8)?;
+    (configuration[0] == 1).then(|| {
+        format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            configuration[1], configuration[2], configuration[3]
+        )
+    })
 }
 
 struct HlsDirectoryState {
@@ -362,7 +426,7 @@ impl HlsDirectoryServer {
     }
 
     fn url(&self) -> String {
-        http_url(self.address, &format!("/{}/index.m3u8", self.state.route))
+        http_url(self.address, &format!("/{}/master.m3u8", self.state.route))
     }
 
     fn stats(&self) -> HlsServerStats {
@@ -433,7 +497,7 @@ fn handle_client(mut stream: TcpStream, peer: SocketAddr, state: &HlsDirectorySt
         return write_empty_response(&mut stream, "404 Not Found");
     };
     let content_type = match file_name {
-        "index.m3u8" => "application/vnd.apple.mpegurl",
+        "master.m3u8" | "index.m3u8" => "application/vnd.apple.mpegurl",
         "init.mp4" => "video/mp4",
         _ => "video/iso.segment",
     };
@@ -448,7 +512,7 @@ fn handle_client(mut stream: TcpStream, peer: SocketAddr, state: &HlsDirectorySt
     };
     let length = file.metadata()?.len();
     match file_name {
-        "index.m3u8" => {
+        "master.m3u8" | "index.m3u8" => {
             state.counters.playlists.fetch_add(1, Ordering::Relaxed);
         }
         "init.mp4" => {
@@ -531,7 +595,8 @@ fn write_empty_response(stream: &mut TcpStream, status: &str) -> Result<()> {
 }
 
 fn allowed_hls_file_name(name: &str) -> bool {
-    matches!(name, "index.m3u8" | "init.mp4") || valid_hls_file_name(name, "segment-", ".m4s")
+    matches!(name, "master.m3u8" | "index.m3u8" | "init.mp4")
+        || valid_hls_file_name(name, "segment-", ".m4s")
 }
 
 fn valid_hls_file_name(name: &str, prefix: &str, suffix: &str) -> bool {
@@ -587,6 +652,30 @@ mod tests {
     }
 
     #[test]
+    fn publishes_a_master_playlist_with_the_generated_codecs() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("init.mp4"),
+            b"prefixavcC\x01\x4d\x40\x1fsuffix",
+        )
+        .unwrap();
+        publish_master_playlist(
+            directory.path(),
+            HlsRendition {
+                width: 480,
+                height: 270,
+                frame_rate: Some(30.0),
+                has_audio: true,
+            },
+        )
+        .unwrap();
+        let master = std::fs::read_to_string(directory.path().join("master.m3u8")).unwrap();
+        assert!(master.contains("CODECS=\"avc1.4D401F,mp4a.40.2\""));
+        assert!(master.contains("RESOLUTION=480x270,FRAME-RATE=30.000"));
+        assert!(master.ends_with("index.m3u8\n"));
+    }
+
+    #[test]
     fn serves_only_published_objects_under_the_private_route() {
         let directory = tempfile::tempdir().unwrap();
         write_ready_playlist(directory.path(), 2.0);
@@ -596,6 +685,7 @@ mod tests {
             "private".to_owned(),
         )
         .unwrap();
+        assert!(server.url().ends_with("/private/master.m3u8"));
         let response = request(
             server.address(),
             "GET /private/index.m3u8 HTTP/1.1\r\nHost: localhost\r\n\r\n",

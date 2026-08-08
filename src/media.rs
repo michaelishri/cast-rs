@@ -968,7 +968,7 @@ fn transcode_to_output(
     Ok(())
 }
 
-fn compatible_dimensions(width: u32, height: u32) -> (u32, u32) {
+pub fn compatible_dimensions(width: u32, height: u32) -> (u32, u32) {
     let scale = f64::min(
         1.0,
         f64::min(
