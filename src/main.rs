@@ -12,6 +12,7 @@ mod virtual_display;
 mod vod_hls;
 
 use std::{
+    fmt::Write,
     io::{self, IsTerminal},
     net::IpAddr,
     path::PathBuf,
@@ -265,13 +266,7 @@ fn main() -> Result<()> {
             if devices.is_empty() {
                 println!("No Cast devices found.");
             } else {
-                println!("NAME\tADDRESS\tPORT\tMODEL");
-                for device in devices {
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        device.name, device.address, device.port, device.model
-                    );
-                }
+                print_devices(&devices);
             }
         }
         Command::Displays => capture::list_displays()?,
@@ -452,6 +447,88 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_devices(devices: &[discovery::CastService]) {
+    print!("{}", format_devices(devices));
+}
+
+fn format_devices(devices: &[discovery::CastService]) -> String {
+    let rows: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            [
+                device.name.clone(),
+                device.address.to_string(),
+                device.port.to_string(),
+                device.model.clone(),
+                device.capability.label().to_owned(),
+            ]
+        })
+        .collect();
+    let headers = ["NAME", "ADDRESS", "PORT", "MODEL", "CAPABILITY"];
+    let widths = headers.iter().enumerate().map(|(index, header)| {
+        rows.iter()
+            .map(|row| row[index].chars().count())
+            .chain(std::iter::once(header.chars().count()))
+            .max()
+            .expect("headers are not empty")
+    });
+    let widths: Vec<_> = widths.collect();
+
+    let mut output = String::new();
+    write_row(&mut output, &headers, &widths);
+    for row in &rows {
+        write_row(&mut output, row, &widths);
+    }
+    output
+}
+
+fn write_row<T: AsRef<str>>(output: &mut String, row: &[T], widths: &[usize]) {
+    for (index, (value, width)) in row.iter().zip(widths).enumerate() {
+        if index > 0 {
+            output.push_str("  ");
+        }
+        write!(output, "{:<width$}", value.as_ref(), width = width)
+            .expect("writing to a String cannot fail");
+    }
+    output.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{discovery, format_devices};
+
+    #[test]
+    fn device_table_aligns_columns_and_shows_capabilities() {
+        let devices = [
+            discovery::CastService {
+                name: "Clock".into(),
+                address: IpAddr::V4(Ipv4Addr::new(192, 168, 86, 192)),
+                port: 8009,
+                model: "Lenovo Smart Clock".into(),
+                capability: discovery::DeviceCapability::AudioOnly,
+            },
+            discovery::CastService {
+                name: "Living Room TV".into(),
+                address: IpAddr::V4(Ipv4Addr::new(192, 168, 86, 73)),
+                port: 8009,
+                model: "Google TV Streamer".into(),
+                capability: discovery::DeviceCapability::Video,
+            },
+        ];
+
+        assert_eq!(
+            format_devices(&devices),
+            concat!(
+                "NAME            ADDRESS         PORT  MODEL               CAPABILITY   \n",
+                "Clock           192.168.86.192  8009  Lenovo Smart Clock  Audio only   \n",
+                "Living Room TV  192.168.86.73   8009  Google TV Streamer  Audio + video\n",
+            )
+        );
+    }
 }
 
 fn init_logging(verbosity: u8) {
