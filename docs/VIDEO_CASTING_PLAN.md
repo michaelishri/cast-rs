@@ -1,7 +1,7 @@
 # Local video casting plan
 
 - Status: implementation slices complete; incremental track-selective delivery validated on a physical receiver
-- Target release: `v0.3.0`
+- Target release: `v0.4.0`
 - Implementation branch: `codex/video-codecs`
 
 ## Scope assumption
