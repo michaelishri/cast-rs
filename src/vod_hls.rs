@@ -408,6 +408,10 @@ fn reap_finished_clients(client_threads: &Mutex<Vec<JoinHandle<()>>>) {
 }
 
 fn handle_client(mut stream: TcpStream, peer: SocketAddr, state: &HlsDirectoryState) -> Result<()> {
+    // Accepted sockets can inherit O_NONBLOCK from the listener on macOS. Cast receivers
+    // sometimes connect just before sending the request, so a nonblocking read would fail with
+    // EAGAIN instead of waiting for the bounded read timeout below.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     state.counters.requests.fetch_add(1, Ordering::Relaxed);
@@ -604,5 +608,33 @@ mod tests {
         );
         assert!(response.starts_with(b"HTTP/1.1 404 Not Found"));
         assert_eq!(server.stats().playlists, 1);
+    }
+
+    #[test]
+    fn waits_for_request_bytes_on_an_inherited_nonblocking_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        write_ready_playlist(directory.path(), 2.0);
+        let state = Arc::new(HlsDirectoryState {
+            directory: directory.path().to_owned(),
+            route: "private".to_owned(),
+            counters: HlsCounters::default(),
+        });
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_stream, peer) = listener.accept().unwrap();
+        server_stream.set_nonblocking(true).unwrap();
+        let handler_state = Arc::clone(&state);
+        let handler = thread::spawn(move || handle_client(server_stream, peer, &handler_state));
+
+        thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(b"GET /private/segment-000000.m4s HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        handler.join().unwrap().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(response.ends_with(b"segment"));
     }
 }
