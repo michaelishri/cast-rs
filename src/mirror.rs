@@ -32,6 +32,7 @@ use serde_json::Value;
 use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
+use crate::audio::{self, AudioFrameHandler, AudioWorker, MediaClock};
 use crate::synthetic::{
     SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticFrameGenerator, SyntheticPhase,
     phase_for_frame,
@@ -76,6 +77,7 @@ pub struct MirrorOptions {
     pub max_frame_age: Option<Duration>,
     pub adaptive_bitrate: bool,
     pub prioritize_encoding_speed: bool,
+    pub audio: bool,
 }
 
 fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
@@ -659,12 +661,27 @@ fn run_desktop(
     if options.synthetic && options.display_id.is_some() {
         bail!("--display cannot be combined with --synthetic");
     }
+    if options.synthetic && options.audio {
+        bail!("desktop audio is unavailable with synthetic profiling");
+    }
     if options.extend && options.display_id.is_some() {
         bail!("--extend cannot be combined with --display");
     }
     if options.extend && options.synthetic {
         bail!("--extend cannot be combined with --synthetic");
     }
+    let prepared_audio = if options.audio {
+        match audio::prepare() {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                options.audio = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let width = even(options.width);
     let height = even(options.height);
@@ -694,6 +711,7 @@ fn run_desktop(
         options.bitrate as u32,
         options.target_delay,
         h264_level,
+        options.audio,
     )?;
     let requested_fps = options.fps;
     let receiver_fps = negotiated_group_frame_rate(&targets, options.fps);
@@ -722,6 +740,7 @@ fn run_desktop(
     let mut sender_workers = Vec::with_capacity(targets.len());
     let mut feedback_threads = Vec::with_capacity(targets.len());
     let mut outputs = Vec::with_capacity(targets.len());
+    let mut audio_outputs = Vec::with_capacity(targets.len());
     let mut target_stats = Vec::with_capacity(targets.len());
     for (index, target) in targets.iter().enumerate() {
         let host = target.host;
@@ -769,11 +788,32 @@ fn run_desktop(
             options.fps,
             options.target_delay,
         )?));
+        let mut feedback_senders = vec![Arc::clone(&sender)];
+        if let Some(audio_transport) = &transport.audio {
+            let audio_sender = Arc::new(Mutex::new(CastRtpSender::new_audio(
+                socket.try_clone()?,
+                host.is_ipv4(),
+                audio_transport.sender_ssrc,
+                audio_transport.receiver_ssrc,
+                audio_transport.aes_key,
+                audio_transport.aes_iv_mask,
+                options.target_delay,
+            )?));
+            let (audio_output, audio_sender_worker) = SenderWorker::start(
+                targets.len() + index + 1,
+                host,
+                Arc::clone(&audio_sender),
+                Arc::clone(&failure),
+            )?;
+            feedback_senders.push(audio_sender);
+            audio_outputs.push(audio_output);
+            sender_workers.push(audio_sender_worker);
+        }
         let feedback = FeedbackThread::start(
             index + 1,
             host,
             socket,
-            Arc::clone(&sender),
+            feedback_senders,
             Arc::clone(&stats),
             Arc::clone(&failure),
         )?;
@@ -797,17 +837,49 @@ fn run_desktop(
         .context("could not create the VideoToolbox H.264 mirroring encoder")?;
     configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
 
+    let clock = Arc::new(MediaClock::default());
     let pipeline = MirrorPipeline {
         encoder,
         outputs,
         parameter_sets: None,
         frame_index: 0,
-        first_capture_timestamp: None,
+        clock: Arc::clone(&clock),
         last_timestamp: None,
         fps: options.fps,
         rate_control,
         encoder_bitrate: options.bitrate,
         stats: Arc::clone(&capture_stats),
+    };
+    let (audio_submitter, audio_worker) = if !audio_outputs.is_empty() {
+        let (submitter, worker) = AudioWorker::start_prepared(
+            prepared_audio.expect("audio was prepared before it was offered"),
+            Arc::clone(&clock),
+            Arc::clone(&failure),
+            move |audio_frame| {
+                let frame = EncodedFrame {
+                    rtp_timestamp: audio_frame.timestamp as u32,
+                    keyframe: true,
+                    data: Arc::new(audio_frame.data),
+                    timings: FrameTimings {
+                        pipeline_started_at: Instant::now(),
+                        capture_age_micros: None,
+                        queue_wait_micros: 0,
+                        encode_micros: 0,
+                        prepare_micros: 0,
+                        sender_lock_wait_micros: 0,
+                    },
+                    synthetic_phase: None,
+                };
+                for output in &audio_outputs {
+                    output.submit(frame.clone())?;
+                }
+                Ok(())
+            },
+        )
+        .context("could not start the desktop audio encoder after receiver negotiation")?;
+        (Some(submitter), Some(worker))
+    } else {
+        (None, None)
     };
     let max_frame_age = resolve_max_frame_age(options.max_frame_age, options.fps);
     let (submitter, encoder_worker) = EncoderWorker::start(
@@ -877,6 +949,15 @@ fn run_desktop(
             .with_shows_cursor(true)
             .with_queue_depth(3)
             .with_minimum_frame_interval(&frame_interval);
+        let config = if audio_submitter.is_some() {
+            config
+                .with_captures_audio(true)
+                .with_sample_rate(audio::SAMPLE_RATE as i32)
+                .with_channel_count(audio::CHANNELS as i32)
+                .with_excludes_current_process_audio(true)
+        } else {
+            config
+        };
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(
             MirrorFrameHandler {
@@ -888,6 +969,12 @@ fn run_desktop(
             },
             SCStreamOutputType::Screen,
         );
+        if let Some(audio_submitter) = audio_submitter {
+            stream.add_output_handler(
+                AudioFrameHandler::new(audio_submitter),
+                SCStreamOutputType::Audio,
+            );
+        }
 
         match mode {
             RunMode::Cast => println!(
@@ -914,7 +1001,7 @@ fn run_desktop(
         stream
             .start_capture()
             .context("could not start screen capture")?;
-        RunningInput::Screen(stream, encoder_worker)
+        RunningInput::Screen(stream, encoder_worker, audio_worker)
     };
     if mode == RunMode::Cast {
         println!(
@@ -2183,8 +2270,17 @@ struct NegotiatedTransport {
     receiver_ssrc: u32,
     aes_key: [u8; 16],
     aes_iv_mask: [u8; 16],
+    audio: Option<NegotiatedAudioTransport>,
     receiver_frame_rate: Option<u32>,
     control: Arc<CastStreamingControlState>,
+}
+
+#[derive(Clone)]
+struct NegotiatedAudioTransport {
+    sender_ssrc: u32,
+    receiver_ssrc: u32,
+    aes_key: [u8; 16],
+    aes_iv_mask: [u8; 16],
 }
 
 struct NegotiatedTarget {
@@ -2244,6 +2340,7 @@ fn negotiate_cast_streaming_group(
     bitrate: u32,
     target_delay: Duration,
     h264_level: H264Level,
+    audio: bool,
 ) -> Result<Vec<NegotiatedTarget>> {
     let (result_sender, result_receiver) = mpsc::channel();
     thread::scope(|scope| {
@@ -2259,6 +2356,7 @@ fn negotiate_cast_streaming_group(
                     bitrate,
                     target_delay,
                     h264_level,
+                    audio,
                 );
                 let _ = result_sender.send((index, host, result));
             });
@@ -2316,8 +2414,9 @@ fn negotiate_cast_streaming(
     bitrate: u32,
     target_delay: Duration,
     h264_level: H264Level,
+    audio: bool,
 ) -> Result<NegotiatedTransport> {
-    let material = OfferMaterial::random()?;
+    let material = OfferMaterial::random(audio)?;
     let offer = CastStreamingOfferMessage::new(
         &material,
         width,
@@ -2427,10 +2526,11 @@ fn negotiate_cast_streaming_inner(
     log::debug!("sent Cast Streaming offer: {offer:?}");
 
     let answer = wait_for_answer(&device, offer.sequence_number)?;
+    let video_index = if material.audio.is_some() { 1 } else { 0 };
     let selected = answer
         .send_indexes
         .iter()
-        .position(|index| *index == 0)
+        .position(|index| *index == video_index)
         .ok_or_else(|| anyhow!("Cast receiver did not select the offered H.264 video stream"))?;
     let receiver_ssrc = *answer
         .ssrcs
@@ -2439,8 +2539,24 @@ fn negotiate_cast_streaming_inner(
     let udp_port =
         u16::try_from(answer.udp_port).context("Cast receiver returned an invalid UDP port")?;
     let receiver_frame_rate = answer.display.as_ref().and_then(answer_display_frame_rate);
+    let audio = material.audio.as_ref().and_then(|audio| {
+        let selected = answer.send_indexes.iter().position(|index| *index == 0)?;
+        let receiver_ssrc = *answer.ssrcs.get(selected)?;
+        Some(NegotiatedAudioTransport {
+            sender_ssrc: audio.sender_ssrc,
+            receiver_ssrc,
+            aes_key: audio.aes_key,
+            aes_iv_mask: audio.aes_iv_mask,
+        })
+    });
+    if material.audio.is_some() && audio.is_none() {
+        eprintln!(
+            "Receiver {host} did not accept desktop audio; continuing with video only for that receiver."
+        );
+    }
     log::debug!(
-        "Cast Streaming answer selected video index 0, UDP port {udp_port}, receiver SSRC {receiver_ssrc}, constraints={:?}, display={:?}",
+        "Cast Streaming answer selected video index {video_index}, audio={}, UDP port {udp_port}, receiver SSRC {receiver_ssrc}, constraints={:?}, display={:?}",
+        audio.is_some(),
         answer.constraints,
         answer.display
     );
@@ -2453,6 +2569,7 @@ fn negotiate_cast_streaming_inner(
             receiver_ssrc,
             aes_key: material.aes_key,
             aes_iv_mask: material.aes_iv_mask,
+            audio,
             receiver_frame_rate,
             control: Arc::clone(&shared_control),
         }))
@@ -2587,11 +2704,19 @@ struct OfferMaterial {
     sender_ssrc: u32,
     aes_key: [u8; 16],
     aes_iv_mask: [u8; 16],
+    audio: Option<StreamMaterial>,
+}
+
+#[derive(Debug)]
+struct StreamMaterial {
+    sender_ssrc: u32,
+    aes_key: [u8; 16],
+    aes_iv_mask: [u8; 16],
 }
 
 impl OfferMaterial {
-    fn random() -> Result<Self> {
-        let mut random = [0_u8; 40];
+    fn random(with_audio: bool) -> Result<Self> {
+        let mut random = [0_u8; 76];
         getrandom::fill(&mut random).context("could not generate Cast Streaming session keys")?;
         let sequence_number = u32::from_be_bytes(random[0..4].try_into().unwrap()) & 0x7fff_ffff;
         let sender_ssrc = 50_001 + u32::from_be_bytes(random[4..8].try_into().unwrap()) % 50_000;
@@ -2600,6 +2725,12 @@ impl OfferMaterial {
             sender_ssrc,
             aes_key: random[8..24].try_into().unwrap(),
             aes_iv_mask: random[24..40].try_into().unwrap(),
+            audio: with_audio.then(|| StreamMaterial {
+                sender_ssrc: 100_001
+                    + u32::from_be_bytes(random[40..44].try_into().unwrap()) % 50_000,
+                aes_key: random[44..60].try_into().unwrap(),
+                aes_iv_mask: random[60..76].try_into().unwrap(),
+            }),
         })
     }
 }
@@ -2628,27 +2759,50 @@ impl CastStreamingOfferMessage {
             sequence_number: material.sequence_number,
             offer: CastStreamingOffer {
                 cast_mode: "mirroring",
-                supported_streams: vec![VideoStreamOffer {
-                    index: 0,
-                    stream_type: "video_source",
-                    channels: 1,
-                    codec_name: "h264",
-                    codec_parameter: h264_level.codec_parameter,
-                    rtp_profile: "cast",
-                    rtp_payload_type: RTP_H264_PAYLOAD_TYPE,
-                    ssrc: material.sender_ssrc,
-                    target_delay: target_delay.as_millis() as u64,
-                    aes_key: hex(&material.aes_key),
-                    aes_iv_mask: hex(&material.aes_iv_mask),
-                    receiver_rtcp_event_log: false,
-                    time_base: "1/90000",
-                    max_frame_rate: format!("{fps}/1"),
-                    max_bit_rate: bitrate,
-                    profile: "baseline",
-                    level: h264_level.name,
-                    error_recovery_mode: "castv2",
-                    resolutions: vec![VideoResolution { width, height }],
-                }],
+                supported_streams: {
+                    let mut streams =
+                        Vec::with_capacity(if material.audio.is_some() { 2 } else { 1 });
+                    if let Some(audio_material) = &material.audio {
+                        streams.push(StreamOffer::Audio(AudioStreamOffer {
+                            index: 0,
+                            stream_type: "audio_source",
+                            channels: audio::CHANNELS as u8,
+                            codec_name: "aac",
+                            codec_parameter: "mp4a.40.2",
+                            rtp_profile: "cast",
+                            rtp_payload_type: audio::RTP_PAYLOAD_TYPE,
+                            ssrc: audio_material.sender_ssrc,
+                            target_delay: target_delay.as_millis() as u64,
+                            aes_key: hex(&audio_material.aes_key),
+                            aes_iv_mask: hex(&audio_material.aes_iv_mask),
+                            receiver_rtcp_event_log: false,
+                            time_base: "1/48000",
+                            bit_rate: audio::BITRATE,
+                        }));
+                    }
+                    streams.push(StreamOffer::Video(VideoStreamOffer {
+                        index: if material.audio.is_some() { 1 } else { 0 },
+                        stream_type: "video_source",
+                        channels: 1,
+                        codec_name: "h264",
+                        codec_parameter: h264_level.codec_parameter,
+                        rtp_profile: "cast",
+                        rtp_payload_type: RTP_H264_PAYLOAD_TYPE,
+                        ssrc: material.sender_ssrc,
+                        target_delay: target_delay.as_millis() as u64,
+                        aes_key: hex(&material.aes_key),
+                        aes_iv_mask: hex(&material.aes_iv_mask),
+                        receiver_rtcp_event_log: false,
+                        time_base: "1/90000",
+                        max_frame_rate: format!("{fps}/1"),
+                        max_bit_rate: bitrate,
+                        profile: "baseline",
+                        level: h264_level.name,
+                        error_recovery_mode: "castv2",
+                        resolutions: vec![VideoResolution { width, height }],
+                    }));
+                    streams
+                },
             },
         }
     }
@@ -2659,7 +2813,43 @@ struct CastStreamingOffer {
     #[serde(rename = "castMode")]
     cast_mode: &'static str,
     #[serde(rename = "supportedStreams")]
-    supported_streams: Vec<VideoStreamOffer>,
+    supported_streams: Vec<StreamOffer>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum StreamOffer {
+    Audio(AudioStreamOffer),
+    Video(VideoStreamOffer),
+}
+
+#[derive(Debug, Serialize)]
+struct AudioStreamOffer {
+    index: u8,
+    #[serde(rename = "type")]
+    stream_type: &'static str,
+    channels: u8,
+    #[serde(rename = "codecName")]
+    codec_name: &'static str,
+    #[serde(rename = "codecParameter")]
+    codec_parameter: &'static str,
+    #[serde(rename = "rtpProfile")]
+    rtp_profile: &'static str,
+    #[serde(rename = "rtpPayloadType")]
+    rtp_payload_type: u8,
+    ssrc: u32,
+    #[serde(rename = "targetDelay")]
+    target_delay: u64,
+    #[serde(rename = "aesKey")]
+    aes_key: String,
+    #[serde(rename = "aesIvMask")]
+    aes_iv_mask: String,
+    #[serde(rename = "receiverRtcpEventLog")]
+    receiver_rtcp_event_log: bool,
+    #[serde(rename = "timeBase")]
+    time_base: &'static str,
+    #[serde(rename = "bitRate")]
+    bit_rate: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -3036,6 +3226,7 @@ struct CastRtpSender {
     rate_control_target: usize,
     fps: u32,
     target_delay: Duration,
+    payload_type: u8,
     rate_window_started: Instant,
     rate_window_acked_bytes: u64,
     rate_window_nacks: u64,
@@ -3059,6 +3250,70 @@ impl CastRtpSender {
         fps: u32,
         target_delay: Duration,
     ) -> Result<Self> {
+        Self::new_with_payload(
+            socket,
+            ipv4,
+            sender_ssrc,
+            receiver_ssrc,
+            aes_key,
+            aes_iv_mask,
+            stats,
+            rate_control,
+            rate_control_target,
+            fps,
+            target_delay,
+            RTP_H264_PAYLOAD_TYPE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_audio(
+        socket: UdpSocket,
+        ipv4: bool,
+        sender_ssrc: u32,
+        receiver_ssrc: u32,
+        aes_key: [u8; 16],
+        aes_iv_mask: [u8; 16],
+        target_delay: Duration,
+    ) -> Result<Self> {
+        let stats = Arc::new(MirrorStats::default());
+        let rate_control = Arc::new(AdaptiveRateControl::new_group(
+            u64::from(audio::BITRATE),
+            false,
+            Arc::clone(&stats),
+            1,
+        ));
+        Self::new_with_payload(
+            socket,
+            ipv4,
+            sender_ssrc,
+            receiver_ssrc,
+            aes_key,
+            aes_iv_mask,
+            stats,
+            rate_control,
+            0,
+            50,
+            target_delay,
+            audio::RTP_PAYLOAD_TYPE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_payload(
+        socket: UdpSocket,
+        ipv4: bool,
+        sender_ssrc: u32,
+        receiver_ssrc: u32,
+        aes_key: [u8; 16],
+        aes_iv_mask: [u8; 16],
+        stats: Arc<MirrorStats>,
+        rate_control: Arc<AdaptiveRateControl>,
+        rate_control_target: usize,
+        fps: u32,
+        target_delay: Duration,
+        payload_type: u8,
+    ) -> Result<Self> {
         let mut sequence = [0_u8; 2];
         getrandom::fill(&mut sequence).context("could not initialize RTP sequence number")?;
         Ok(Self {
@@ -3079,6 +3334,7 @@ impl CastRtpSender {
             rate_control_target,
             fps,
             target_delay,
+            payload_type,
             rate_window_started: Instant::now(),
             rate_window_acked_bytes: 0,
             rate_window_nacks: 0,
@@ -3273,7 +3529,7 @@ impl CastRtpSender {
                 0x80
             } else {
                 0
-            } | RTP_H264_PAYLOAD_TYPE,
+            } | self.payload_type,
         );
         packet.extend_from_slice(&self.sequence_number.to_be_bytes());
         self.sequence_number = self.sequence_number.wrapping_add(1);
@@ -3324,7 +3580,7 @@ impl CastRtpSender {
             let part = &packet[offset..offset + packet_size];
             match (packet_type, first & 0x1f) {
                 (206, 15) => self.handle_cast_feedback(part)?,
-                (206, 1) => {
+                (206, 1) if self.payload_type == RTP_H264_PAYLOAD_TYPE => {
                     log::debug!("receiver requested an H.264 recovery keyframe (PLI)");
                 }
                 (201, _) => log::trace!("received RTCP receiver report ({} bytes)", part.len()),
@@ -3563,7 +3819,7 @@ impl FeedbackThread {
         ordinal: usize,
         host: IpAddr,
         socket: UdpSocket,
-        sender: Arc<Mutex<CastRtpSender>>,
+        senders: Vec<Arc<Mutex<CastRtpSender>>>,
         stats: Arc<MirrorStats>,
         failure: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
@@ -3577,16 +3833,18 @@ impl FeedbackThread {
                 while !thread_stop.load(Ordering::SeqCst) {
                     match socket.recv(&mut buffer) {
                         Ok(size) => {
-                            if let Err(error) = sender
-                                .lock()
-                                .map_err(|_| anyhow!("Cast RTP sender lock was poisoned"))
-                                .and_then(|mut sender| sender.handle_rtcp(&buffer[..size]))
-                            {
-                                store_source_failure(
-                                    &failure,
-                                    format!("Cast RTCP feedback from {host} failed: {error:#}"),
-                                );
-                                break;
+                            for sender in &senders {
+                                if let Err(error) = sender
+                                    .lock()
+                                    .map_err(|_| anyhow!("Cast RTP sender lock was poisoned"))
+                                    .and_then(|mut sender| sender.handle_rtcp(&buffer[..size]))
+                                {
+                                    store_source_failure(
+                                        &failure,
+                                        format!("Cast RTCP feedback from {host} failed: {error:#}"),
+                                    );
+                                    return;
+                                }
                             }
                         }
                         Err(error)
@@ -3627,20 +3885,22 @@ impl Drop for FeedbackThread {
 }
 
 enum RunningInput {
-    Screen(SCStream, EncoderWorker),
+    Screen(SCStream, EncoderWorker, Option<AudioWorker>),
     Synthetic(SyntheticFrameSource, EncoderWorker),
 }
 
 impl RunningInput {
     fn stop_and_release(mut self) -> Result<()> {
         match &mut self {
-            Self::Screen(stream, encoder) => {
+            Self::Screen(stream, encoder, audio) => {
                 let capture_result = stream
                     .stop_capture()
                     .context("could not stop screen capture");
                 let encoder_result = encoder.stop();
+                let audio_result = audio.take().map(AudioWorker::stop).transpose();
                 capture_result?;
-                encoder_result
+                encoder_result?;
+                audio_result.map(|_| ())
             }
             Self::Synthetic(source, encoder) => {
                 let source_result = source.stop();
@@ -4204,7 +4464,7 @@ struct MirrorPipeline {
     outputs: Vec<SenderSubmitter>,
     parameter_sets: Option<(Vec<u8>, Vec<u8>)>,
     frame_index: u64,
-    first_capture_timestamp: Option<u64>,
+    clock: Arc<MediaClock>,
     last_timestamp: Option<u64>,
     fps: u32,
     rate_control: Arc<AdaptiveRateControl>,
@@ -4311,12 +4571,9 @@ impl MirrorPipeline {
 
     fn normalized_timestamp(&mut self, presentation_time: CMTime) -> u64 {
         let fallback_step = RTP_VIDEO_TIMEBASE / self.fps as u64;
-        let absolute = cm_time_to_ticks(presentation_time);
-        let base = *self
-            .first_capture_timestamp
-            .get_or_insert_with(|| absolute.unwrap_or(0));
-        let candidate = absolute
-            .map(|value| value.saturating_sub(base))
+        let candidate = self
+            .clock
+            .ticks(presentation_time, RTP_VIDEO_TIMEBASE)
             .unwrap_or_else(|| {
                 self.last_timestamp
                     .map_or(0, |last| last.saturating_add(fallback_step))
@@ -4421,15 +4678,6 @@ fn h264_parameter_sets(sample: *mut c_void) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((read(0)?, read(1)?))
 }
 
-fn cm_time_to_ticks(time: CMTime) -> Option<u64> {
-    if !time.is_valid() || time.timescale <= 0 || time.value < 0 {
-        return None;
-    }
-    let ticks = i128::from(time.value).saturating_mul(i128::from(RTP_VIDEO_TIMEBASE))
-        / i128::from(time.timescale);
-    u64::try_from(ticks).ok()
-}
-
 fn local_ip_for(host: IpAddr, port: u16) -> Result<IpAddr> {
     let bind = if host.is_ipv4() {
         "0.0.0.0:0"
@@ -4531,16 +4779,18 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdaptiveRateControl, CastRtpSender, CastStreamingControlState, EncodedFrame, FrameTimings,
-        H264Level, LatencyDistribution, LatencyRecommendations, LiveLatencyGraph, MirrorStats,
-        NegotiatedTarget, NegotiatedTransport, ProfileRunResult, RateWindowHealth,
-        RawFrameDeadline, SENDER_QUEUE_FRAMES, SenderSubmitter, StoredFrame, TuningConfig,
+        AdaptiveRateControl, CastRtpSender, CastStreamingControlState, CastStreamingOfferMessage,
+        EncodedFrame, FrameTimings, H264Level, LatencyDistribution, LatencyRecommendations,
+        LiveLatencyGraph, MirrorStats, NegotiatedTarget, NegotiatedTransport, OfferMaterial,
+        ProfileRunResult, RTP_H264_PAYLOAD_TYPE, RateWindowHealth, RawFrameDeadline,
+        SENDER_QUEUE_FRAMES, SenderSubmitter, StoredFrame, StreamMaterial, TuningConfig,
         aggregate_profile_results, answer_display_frame_rate, auto_tune_score, avcc_to_annex_b,
         combined_tuning_config, encrypt_frame, expand_frame_id_after, expand_frame_id_at_or_before,
         frame_pacing, host_command_arguments, negotiated_group_frame_rate,
         rate_window_is_congested, recommend_latency, round_target_delay, select_tuning_winner,
         source_command_argument, validate_cast_hosts,
     };
+    use crate::audio;
     use serde_json::json;
     use std::{
         net::{IpAddr, UdpSocket},
@@ -4739,6 +4989,41 @@ mod tests {
     }
 
     #[test]
+    fn audio_offer_keeps_audio_at_index_zero_and_video_at_one() {
+        let material = OfferMaterial {
+            sequence_number: 1,
+            sender_ssrc: 50_001,
+            aes_key: [1; 16],
+            aes_iv_mask: [2; 16],
+            audio: Some(StreamMaterial {
+                sender_ssrc: 100_001,
+                aes_key: [3; 16],
+                aes_iv_mask: [4; 16],
+            }),
+        };
+        let offer = CastStreamingOfferMessage::new(
+            &material,
+            1280,
+            720,
+            30,
+            6_000_000,
+            Duration::from_millis(200),
+            H264Level::for_stream(1280, 720, 30, 6_000_000).unwrap(),
+        );
+        let value = serde_json::to_value(offer).unwrap();
+        let streams = value["offer"]["supportedStreams"].as_array().unwrap();
+        assert_eq!(streams[0]["index"], 0);
+        assert_eq!(streams[0]["type"], "audio_source");
+        assert_eq!(streams[0]["codecName"], "aac");
+        assert_eq!(streams[0]["codecParameter"], "mp4a.40.2");
+        assert_eq!(streams[0]["bitRate"], audio::BITRATE);
+        assert_eq!(streams[0]["rtpPayloadType"], audio::RTP_PAYLOAD_TYPE);
+        assert_eq!(streams[1]["index"], 1);
+        assert_eq!(streams[1]["type"], "video_source");
+        assert_eq!(streams[1]["rtpPayloadType"], RTP_H264_PAYLOAD_TYPE);
+    }
+
+    #[test]
     fn bounds_frame_aware_packet_pacing() {
         assert!(frame_pacing(16, false, 30).is_none());
         let (_, delta_interval) = frame_pacing(17, false, 30).unwrap();
@@ -4828,6 +5113,7 @@ mod tests {
                 receiver_ssrc: 2,
                 aes_key: [0; 16],
                 aes_iv_mask: [0; 16],
+                audio: None,
                 receiver_frame_rate,
                 control: Arc::new(CastStreamingControlState::default()),
             },

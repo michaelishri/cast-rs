@@ -5,7 +5,7 @@ Cast plays local video files and sends a macOS display to Google Cast devices su
 ## Before you start
 
 - Put the Mac and Google Cast device on the same trusted local network. Guest networks and client isolation commonly prevent discovery or streaming.
-- Desktop casting is video-only. Audio already present in a compatible local video file is played.
+- Desktop system audio is opt-in with `cast desktop --audio`; microphone audio is never captured. Audio already present in a compatible local video file is played normally.
 
 ## Install
 
@@ -71,6 +71,14 @@ The examples below assume a Homebrew installation. Use `./cast` instead of `cast
 
 Cast uses its low-latency mirroring transport by default. The first connection can take a few seconds while the receiver starts.
 
+To include system and application audio, add `--audio`:
+
+```sh
+cast desktop --host 192.168.1.50 --audio
+```
+
+Desktop audio is AAC-LC stereo at 48 kHz. Cast excludes its own process audio to avoid feedback and does not capture the microphone. If the AAC encoder is unavailable, or a receiver rejects audio during startup, Cast warns and continues with video only; an audio failure after capture has started stops the session.
+
 ## Cast a local video
 
 ```sh
@@ -118,7 +126,7 @@ Use `--extend` when each receiver should display an independent desktop. Cast cr
 cast desktop --host 192.168.1.50 --extend
 ```
 
-Move windows onto the new display while Cast is running. `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. It cannot be combined with `--display`.
+Move windows onto the new display while Cast is running. With `--audio`, each receiver gets the system/application audio selected by its corresponding display capture filter. `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. It cannot be combined with `--display`.
 
 ## Everyday commands
 
@@ -143,6 +151,9 @@ cast desktop --host 192.168.1.50 --bitrate 3000000
 
 # Compatibility fallback (normally several seconds behind live video)
 cast desktop --host 192.168.1.50 --transport hls
+
+# Compatibility fallback with desktop audio
+cast desktop --host 192.168.1.50 --transport hls --audio
 ```
 
 ## Find good latency settings

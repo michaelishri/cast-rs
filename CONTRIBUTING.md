@@ -30,6 +30,7 @@ Use `cargo run -- --help` or `cargo run -- <command> --help` to inspect the CLI 
 cargo run -- devices
 cargo run -- displays
 cargo run --release -- desktop --host 192.168.1.50
+cargo run --release -- desktop --host 192.168.1.50 --audio
 cargo run --release -- profile --host 192.168.1.50 --synthetic
 ```
 
@@ -48,9 +49,11 @@ cargo build --locked --release
 
 Cast discovers receivers with mDNS and controls them through the vendored `rust-cast` client. Local video is served only from the receiver-facing LAN interface at a fresh random URL; the server supports HTTP ranges so receivers can seek and read MP4 metadata efficiently.
 
-The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. The `desktop` path uses ScreenCaptureKit and VideoToolbox, then performs the Cast Streaming offer/answer exchange and sends encrypted H.264 via Cast RTP. HLS remains a compatibility fallback.
+The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. The `desktop` path uses ScreenCaptureKit, VideoToolbox, and (when `--audio` is set) an AudioToolbox AAC-LC encoder. The low-latency path performs the Cast Streaming offer/answer exchange and sends H.264 and AAC as separately encrypted Cast RTP streams. HLS remains a compatibility fallback, with fMP4 video and an alternate packed-AAC rendition.
 
 The mirroring capture callback must never wait for VideoToolbox or the network. It uses a latest-frame-wins, one-frame mailbox; old raw frames can expire before encoding, but encoded H.264 reference frames are not discarded arbitrarily. RTP sender reports establish the media clock, and receiver feedback drives retransmission, history cleanup, and adaptive bitrate. Preserve these properties when modifying the capture, encoder, or network pipeline.
+
+Audio capture also stays nonblocking, but uses a bounded FIFO because dropping arbitrary PCM buffers would shift the audio timeline. The audio worker fills timestamp gaps with silence and shares the capture epoch with video. Audio RTP feedback is isolated from video adaptive bitrate. The HLS store waits until matching audio and video segment ranges are ready before publishing either playlist entry; packed-AAC segments begin with Apple’s transport-stream timestamp ID3 `PRIV` tag.
 
 ScreenCaptureKit can omit a pixel buffer for idle display ticks. Cast re-encodes the latest IOSurface in that case to retain a steady timeline and periodic keyframes. The current built-in receiver path has no independent cursor overlay, so the cursor stays composited in the encoded frame.
 

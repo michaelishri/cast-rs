@@ -22,6 +22,7 @@ use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
 use crate::{
+    audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker, EncodedAudioFrame, MediaClock},
     cast,
     network::{http_url, local_ip_for, private_route},
     virtual_display::VirtualDisplaySession,
@@ -45,6 +46,7 @@ pub struct LiveOptions {
     pub bitrate: i32,
     pub duration: Option<Duration>,
     pub serve_only: bool,
+    pub audio: bool,
 }
 
 pub fn cast_desktop(options: LiveOptions) -> Result<()> {
@@ -56,7 +58,6 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
-
     let width = even(options.width);
     let height = even(options.height);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -78,7 +79,7 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         }
     }
 
-    let shared_store = (!options.extend).then(|| Arc::new(HlsStore::default()));
+    let shared_store = (!options.extend).then(|| Arc::new(HlsStore::new(options.audio)));
     let mut targets = Vec::with_capacity(options.cast_hosts.len());
     let mut private_routes = HashSet::with_capacity(options.cast_hosts.len());
     for host in options.cast_hosts.iter().copied() {
@@ -91,7 +92,7 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         let store = shared_store
             .as_ref()
             .map(Arc::clone)
-            .unwrap_or_else(|| Arc::new(HlsStore::default()));
+            .unwrap_or_else(|| Arc::new(HlsStore::new(options.audio)));
         let route = loop {
             let candidate = private_route()?;
             if private_routes.insert(candidate.clone()) {
@@ -103,6 +104,7 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             serve_ip,
             route,
             store,
+            audio: Arc::new(AtomicBool::new(options.audio)),
             url: String::new(),
         });
     }
@@ -110,15 +112,18 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(Mutex::new(None));
     let mut interface_order = Vec::new();
-    let mut interface_routes: HashMap<IpAddr, HashMap<String, Arc<HlsStore>>> = HashMap::new();
+    let mut interface_routes: HashMap<IpAddr, HashMap<String, HlsRoute>> = HashMap::new();
     for target in &targets {
         if !interface_routes.contains_key(&target.serve_ip) {
             interface_order.push(target.serve_ip);
         }
-        interface_routes
-            .entry(target.serve_ip)
-            .or_default()
-            .insert(target.route.clone(), Arc::clone(&target.store));
+        interface_routes.entry(target.serve_ip).or_default().insert(
+            target.route.clone(),
+            HlsRoute {
+                store: Arc::clone(&target.store),
+                audio: Arc::clone(&target.audio),
+            },
+        );
     }
     let mut servers = HashMap::new();
     for serve_ip in interface_order {
@@ -275,7 +280,20 @@ struct HlsTarget {
     serve_ip: IpAddr,
     route: String,
     store: Arc<HlsStore>,
+    audio: Arc<AtomicBool>,
     url: String,
+}
+
+#[derive(Clone)]
+struct HlsRoute {
+    store: Arc<HlsStore>,
+    audio: Arc<AtomicBool>,
+}
+
+impl HlsRoute {
+    fn response(&self, path: &str) -> Result<Option<HttpBody>> {
+        self.store.response(path, self.audio.load(Ordering::SeqCst))
+    }
 }
 
 fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
@@ -315,10 +333,33 @@ fn start_hls_receivers(
         for (index, target) in targets.iter().enumerate() {
             let host = target.host;
             let url = target.url.clone();
+            let audio = Arc::clone(&target.audio);
+            let store = Arc::clone(&target.store);
             workers.push((
                 index,
                 host,
-                scope.spawn(move || cast::LiveMediaSession::start_fmp4_hls(host, cast_port, url)),
+                scope.spawn(move || {
+                    let with_audio = audio.load(Ordering::SeqCst) && store.audio_enabled();
+                    let first = if with_audio {
+                        cast::LiveMediaSession::start_fmp4_hls_with_aac(
+                            host,
+                            cast_port,
+                            url.clone(),
+                        )
+                    } else {
+                        cast::LiveMediaSession::start_fmp4_hls(host, cast_port, url.clone())
+                    };
+                    match first {
+                        Err(error) if with_audio => {
+                            eprintln!(
+                                "Receiver {host} did not accept desktop audio; retrying video only: {error:#}"
+                            );
+                            audio.store(false, Ordering::SeqCst);
+                            cast::LiveMediaSession::start_fmp4_hls(host, cast_port, url)
+                        }
+                        result => result,
+                    }
+                }),
             ));
         }
         workers
@@ -379,6 +420,7 @@ fn print_hls_stats(targets: &[HlsTarget]) {
 struct LiveCapture {
     stream: Option<SCStream>,
     store: Arc<HlsStore>,
+    audio_worker: Option<AudioWorker>,
 }
 
 impl LiveCapture {
@@ -422,6 +464,22 @@ impl LiveCapture {
             .with_profile_level(ProfileLevel::H264Baseline3_1)
             .build()
             .context("could not create the VideoToolbox H.264 encoder")?;
+        let clock = Arc::new(MediaClock::default());
+        let (audio_submitter, audio_worker) = if options.audio && store.audio_enabled() {
+            let audio_store = Arc::clone(&store);
+            match AudioWorker::start(Arc::clone(&clock), Arc::clone(&failure), move |frame| {
+                audio_store.push_audio(frame)
+            }) {
+                Ok((submitter, worker)) => (Some(submitter), Some(worker)),
+                Err(error) => {
+                    eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                    store.disable_audio()?;
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
         let pipeline = LivePipeline {
             encoder,
             muxer: None,
@@ -429,7 +487,8 @@ impl LiveCapture {
             last_surface: None,
             frame_index: 0,
             frames_in_segment: 0,
-            first_capture_timestamp: None,
+            clock,
+            audio_submitter: audio_submitter.clone(),
             last_timestamp: None,
             segment_start_timestamp: None,
             fps: options.fps,
@@ -451,16 +510,31 @@ impl LiveCapture {
             .with_shows_cursor(true)
             .with_queue_depth(4)
             .with_minimum_frame_interval(&frame_interval);
+        let config = if audio_submitter.is_some() {
+            config
+                .with_captures_audio(true)
+                .with_sample_rate(audio::SAMPLE_RATE as i32)
+                .with_channel_count(audio::CHANNELS as i32)
+                .with_excludes_current_process_audio(true)
+        } else {
+            config
+        };
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(
             LiveFrameHandler {
                 pipeline: Mutex::new(pipeline),
-                failure,
+                failure: Arc::clone(&failure),
                 repeated_samples: AtomicU64::new(0),
                 skipped_samples: AtomicU64::new(0),
             },
             SCStreamOutputType::Screen,
         );
+        if let Some(audio_submitter) = audio_submitter {
+            stream.add_output_handler(
+                AudioFrameHandler::new(audio_submitter),
+                SCStreamOutputType::Audio,
+            );
+        }
         println!(
             "Capturing display {} at {}x{} into {}x{}, {} fps...",
             display.display_id(),
@@ -476,6 +550,7 @@ impl LiveCapture {
         Ok(Self {
             stream: Some(stream),
             store,
+            audio_worker,
         })
     }
 
@@ -492,6 +567,9 @@ impl LiveCapture {
             .stop_capture()
             .context("could not stop screen capture")?;
         drop(stream);
+        if let Some(worker) = self.audio_worker.take() {
+            worker.stop()?;
+        }
         Ok(())
     }
 }
@@ -589,7 +667,8 @@ struct LivePipeline {
     last_surface: Option<IOSurface>,
     frame_index: u64,
     frames_in_segment: u32,
-    first_capture_timestamp: Option<u64>,
+    clock: Arc<MediaClock>,
+    audio_submitter: Option<AudioSubmitter>,
     last_timestamp: Option<u64>,
     segment_start_timestamp: Option<u64>,
     fps: u32,
@@ -676,7 +755,11 @@ impl LivePipeline {
             if let Some(segment) = muxer.flush_segment() {
                 let start = self.segment_start_timestamp.unwrap_or(timestamp);
                 let duration = timestamp.saturating_sub(start) as f64 / TIMESCALE as f64;
-                self.store.push_segment(segment, duration.max(0.001))?;
+                if let Some(audio) = &self.audio_submitter {
+                    audio.advance_to(video_to_audio_timestamp(timestamp));
+                }
+                self.store
+                    .push_segment(segment, duration.max(0.001), start, timestamp)?;
             }
             self.frames_in_segment = 0;
             self.segment_start_timestamp = Some(timestamp);
@@ -699,12 +782,9 @@ impl LivePipeline {
 
     fn normalized_timestamp(&mut self, presentation_time: CMTime) -> u64 {
         let fallback_step = TIMESCALE / self.fps as u64;
-        let absolute = cm_time_to_ticks(presentation_time);
-        let base = *self
-            .first_capture_timestamp
-            .get_or_insert_with(|| absolute.unwrap_or(0));
-        let candidate = absolute
-            .map(|value| value.saturating_sub(base))
+        let candidate = self
+            .clock
+            .ticks(presentation_time, TIMESCALE)
             .unwrap_or_else(|| {
                 self.last_timestamp
                     .map_or(0, |last| last.saturating_add(fallback_step))
@@ -738,19 +818,67 @@ struct HlsStore {
 
 #[derive(Default)]
 struct HlsState {
-    master: Option<Arc<Vec<u8>>>,
+    metadata: Option<HlsMetadata>,
     init: Option<Arc<Vec<u8>>>,
     segments: VecDeque<Segment>,
+    pending_segments: VecDeque<PendingSegment>,
+    audio_frames: VecDeque<EncodedAudioFrame>,
+    audio_watermark: u64,
+    audio_enabled: bool,
     next_sequence: u64,
+}
+
+struct HlsMetadata {
+    codec: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bandwidth: u32,
 }
 
 struct Segment {
     sequence: u64,
     duration: f64,
-    data: Arc<Vec<u8>>,
+    video: Arc<Vec<u8>>,
+    audio: Option<Arc<Vec<u8>>>,
+}
+
+struct PendingSegment {
+    duration: f64,
+    start: u64,
+    end: u64,
+    video: Vec<u8>,
 }
 
 impl HlsStore {
+    fn new(audio_enabled: bool) -> Self {
+        Self {
+            state: Mutex::new(HlsState {
+                audio_enabled,
+                ..HlsState::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn audio_enabled(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.audio_enabled)
+            .unwrap_or(false)
+    }
+
+    fn disable_audio(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("HLS store lock was poisoned"))?;
+        state.audio_enabled = false;
+        publish_ready_segments(&mut state);
+        self.ready.notify_all();
+        Ok(())
+    }
+
     fn set_init(
         &self,
         data: Vec<u8>,
@@ -760,40 +888,53 @@ impl HlsStore {
         fps: u32,
         bandwidth: u32,
     ) -> Result<()> {
-        let master = master_playlist(codec, width, height, fps, bandwidth).into_bytes();
         log::debug!(
-            "published HLS master playlist (codec={codec}, resolution={width}x{height}, fps={fps}, bandwidth={bandwidth}) and {}-byte initialization segment",
+            "published HLS metadata (codec={codec}, resolution={width}x{height}, fps={fps}, bandwidth={bandwidth}) and {}-byte initialization segment",
             data.len()
         );
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("HLS store lock was poisoned"))?;
-        state.master = Some(Arc::new(master));
+        state.metadata = Some(HlsMetadata {
+            codec: codec.to_owned(),
+            width,
+            height,
+            fps,
+            bandwidth,
+        });
         state.init = Some(Arc::new(data));
         Ok(())
     }
 
-    fn push_segment(&self, data: Vec<u8>, duration: f64) -> Result<()> {
+    fn push_segment(&self, data: Vec<u8>, duration: f64, start: u64, end: u64) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("HLS store lock was poisoned"))?;
-        let sequence = state.next_sequence;
-        let size = data.len();
-        state.next_sequence += 1;
-        state.segments.push_back(Segment {
-            sequence,
+        state.pending_segments.push_back(PendingSegment {
             duration,
-            data: Arc::new(data),
+            start,
+            end,
+            video: data,
         });
-        log::debug!(
-            "published HLS media segment {sequence}: {duration:.3}s, {} bytes",
-            size
+        publish_ready_segments(&mut state);
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    fn push_audio(&self, frame: EncodedAudioFrame) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("HLS store lock was poisoned"))?;
+        state.audio_watermark = state.audio_watermark.max(
+            frame
+                .timestamp
+                .saturating_add(audio::ACCESS_UNIT_SAMPLES as u64),
         );
-        while state.segments.len() > RETAINED_SEGMENTS {
-            state.segments.pop_front();
-        }
+        state.audio_frames.push_back(frame);
+        publish_ready_segments(&mut state);
         self.ready.notify_all();
         Ok(())
     }
@@ -811,7 +952,7 @@ impl HlsStore {
         state.segments.len() >= segment_count
     }
 
-    fn response(&self, path: &str) -> Result<Option<HttpBody>> {
+    fn response(&self, path: &str, advertise_audio: bool) -> Result<Option<HttpBody>> {
         let state = self
             .state
             .lock()
@@ -820,9 +961,19 @@ impl HlsStore {
             "/" => Ok(Some(HttpBody::text("cast is running\n"))),
             "/master.m3u8" => {
                 self.playlist_requests.fetch_add(1, Ordering::Relaxed);
-                Ok(state.master.as_ref().map(|data| HttpBody {
+                Ok(state.metadata.as_ref().map(|metadata| HttpBody {
                     content_type: "application/vnd.apple.mpegurl",
-                    data: Arc::clone(data),
+                    data: Arc::new(
+                        master_playlist(
+                            &metadata.codec,
+                            metadata.width,
+                            metadata.height,
+                            metadata.fps,
+                            metadata.bandwidth,
+                            state.audio_enabled && advertise_audio,
+                        )
+                        .into_bytes(),
+                    ),
                 }))
             }
             "/live.m3u8" => {
@@ -832,12 +983,40 @@ impl HlsStore {
                     data: Arc::new(playlist(&state).into_bytes()),
                 }))
             }
+            "/audio.m3u8" if state.audio_enabled && advertise_audio => {
+                self.playlist_requests.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(HttpBody {
+                    content_type: "application/vnd.apple.mpegurl",
+                    data: Arc::new(audio_playlist(&state).into_bytes()),
+                }))
+            }
             "/init.mp4" => {
                 self.init_requests.fetch_add(1, Ordering::Relaxed);
                 Ok(state.init.as_ref().map(|data| HttpBody {
                     content_type: "video/mp4",
                     data: Arc::clone(data),
                 }))
+            }
+            path if path.starts_with("/audio-") && state.audio_enabled && advertise_audio => {
+                let sequence = path
+                    .strip_prefix("/audio-")
+                    .and_then(|path| path.strip_suffix(".aac"))
+                    .and_then(|value| value.parse::<u64>().ok());
+                let response = sequence.and_then(|sequence| {
+                    state
+                        .segments
+                        .iter()
+                        .find(|segment| segment.sequence == sequence)
+                        .and_then(|segment| segment.audio.as_ref())
+                        .map(|data| HttpBody {
+                            content_type: "audio/aac",
+                            data: Arc::clone(data),
+                        })
+                });
+                if response.is_some() {
+                    self.segment_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(response)
             }
             _ => {
                 let sequence = path
@@ -851,7 +1030,7 @@ impl HlsStore {
                         .find(|segment| segment.sequence == sequence)
                         .map(|segment| HttpBody {
                             content_type: "video/iso.segment",
-                            data: Arc::clone(&segment.data),
+                            data: Arc::clone(&segment.video),
                         })
                 });
                 if response.is_some() {
@@ -877,11 +1056,25 @@ struct HttpStats {
     media_segments: u64,
 }
 
-fn master_playlist(codec: &str, width: u32, height: u32, fps: u32, bandwidth: u32) -> String {
+fn master_playlist(
+    codec: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bandwidth: u32,
+    with_audio: bool,
+) -> String {
     let frame_rate = f64::from(fps);
-    format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codec}\",RESOLUTION={width}x{height},FRAME-RATE={frame_rate:.3}\nlive.m3u8\n"
-    )
+    if with_audio {
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"System Audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codec},mp4a.40.2\",RESOLUTION={width}x{height},FRAME-RATE={frame_rate:.3},AUDIO=\"audio\"\nlive.m3u8\n",
+            bandwidth.saturating_add(audio::BITRATE)
+        )
+    } else {
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codec}\",RESOLUTION={width}x{height},FRAME-RATE={frame_rate:.3}\nlive.m3u8\n"
+        )
+    }
 }
 
 fn playlist(state: &HlsState) -> String {
@@ -913,6 +1106,124 @@ fn playlist(state: &HlsState) -> String {
     output
 }
 
+fn audio_playlist(state: &HlsState) -> String {
+    let visible_start = state
+        .segments
+        .len()
+        .saturating_sub(PLAYLIST_WINDOW_SEGMENTS);
+    let first_sequence = state
+        .segments
+        .get(visible_start)
+        .map_or(state.next_sequence, |segment| segment.sequence);
+    let target_duration = state
+        .segments
+        .iter()
+        .skip(visible_start)
+        .map(|segment| segment.duration.ceil() as u64)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut output = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:{first_sequence}\n"
+    );
+    for segment in state.segments.iter().skip(visible_start) {
+        output.push_str(&format!(
+            "#EXTINF:{:.3},\naudio-{}.aac\n",
+            segment.duration, segment.sequence
+        ));
+    }
+    output
+}
+
+fn publish_ready_segments(state: &mut HlsState) {
+    while state.pending_segments.front().is_some_and(|segment| {
+        !state.audio_enabled || state.audio_watermark >= video_to_audio_timestamp(segment.end)
+    }) {
+        let pending = state.pending_segments.pop_front().unwrap();
+        let audio = state.audio_enabled.then(|| {
+            let start = video_to_audio_timestamp(pending.start);
+            let end = video_to_audio_timestamp(pending.end);
+            while state.audio_frames.front().is_some_and(|frame| {
+                frame
+                    .timestamp
+                    .saturating_add(audio::ACCESS_UNIT_SAMPLES as u64)
+                    <= start
+            }) {
+                state.audio_frames.pop_front();
+            }
+            let timestamp = state
+                .audio_frames
+                .front()
+                .map_or(start, |frame| frame.timestamp);
+            let mut data = id3_timestamp(video_timestamp(timestamp));
+            while state
+                .audio_frames
+                .front()
+                .is_some_and(|frame| frame.timestamp < end)
+            {
+                data.extend_from_slice(&state.audio_frames.pop_front().unwrap().data);
+            }
+            Arc::new(data)
+        });
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let video_size = pending.video.len();
+        let audio_size = audio.as_ref().map_or(0, |audio| audio.len());
+        state.segments.push_back(Segment {
+            sequence,
+            duration: pending.duration,
+            video: Arc::new(pending.video),
+            audio,
+        });
+        log::debug!(
+            "published HLS media segment {sequence}: {:.3}s, {video_size} video bytes, {audio_size} audio bytes",
+            pending.duration
+        );
+        while state.segments.len() > RETAINED_SEGMENTS {
+            state.segments.pop_front();
+        }
+    }
+}
+
+fn video_to_audio_timestamp(timestamp: u64) -> u64 {
+    timestamp.saturating_mul(u64::from(audio::SAMPLE_RATE)) / TIMESCALE
+}
+
+fn video_timestamp(timestamp: u64) -> u64 {
+    timestamp.saturating_mul(TIMESCALE) / u64::from(audio::SAMPLE_RATE)
+}
+
+fn id3_timestamp(timestamp: u64) -> Vec<u8> {
+    const OWNER: &[u8] = b"com.apple.streaming.transportStreamTimestamp";
+    let timestamp = timestamp & ((1_u64 << 33) - 1);
+    let mut private = Vec::with_capacity(OWNER.len() + 9);
+    private.extend_from_slice(OWNER);
+    private.push(0);
+    private.extend_from_slice(&timestamp.to_be_bytes());
+
+    let mut frame = Vec::with_capacity(10 + private.len());
+    frame.extend_from_slice(b"PRIV");
+    frame.extend_from_slice(&synchsafe(private.len()));
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&private);
+
+    let mut tag = Vec::with_capacity(10 + frame.len());
+    tag.extend_from_slice(b"ID3\x04\0\0");
+    tag.extend_from_slice(&synchsafe(frame.len()));
+    tag.extend_from_slice(&frame);
+    tag
+}
+
+fn synchsafe(value: usize) -> [u8; 4] {
+    let value = value.min(0x0fff_ffff) as u32;
+    [
+        ((value >> 21) & 0x7f) as u8,
+        ((value >> 14) & 0x7f) as u8,
+        ((value >> 7) & 0x7f) as u8,
+        (value & 0x7f) as u8,
+    ]
+}
+
 struct HttpBody {
     content_type: &'static str,
     data: Arc<Vec<u8>>,
@@ -937,7 +1248,7 @@ struct HttpServer {
 impl HttpServer {
     fn start(
         address: SocketAddr,
-        routes: Arc<HashMap<String, Arc<HlsStore>>>,
+        routes: Arc<HashMap<String, HlsRoute>>,
         stop: Arc<AtomicBool>,
         failure: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
@@ -1006,7 +1317,7 @@ impl Drop for HttpServer {
     }
 }
 
-fn handle_http(mut stream: TcpStream, routes: &HashMap<String, Arc<HlsStore>>) -> Result<()> {
+fn handle_http(mut stream: TcpStream, routes: &HashMap<String, HlsRoute>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request = [0_u8; 8192];
     let size = stream.read(&mut request)?;
@@ -1048,15 +1359,12 @@ fn handle_http(mut stream: TcpStream, routes: &HashMap<String, Arc<HlsStore>>) -
     Ok(())
 }
 
-fn routed_response(
-    routes: &HashMap<String, Arc<HlsStore>>,
-    path: &str,
-) -> Result<Option<HttpBody>> {
+fn routed_response(routes: &HashMap<String, HlsRoute>, path: &str) -> Result<Option<HttpBody>> {
     let Some(path) = path.strip_prefix('/') else {
         return Ok(None);
     };
     let (route, remainder) = path.split_once('/').unwrap_or((path, ""));
-    let Some(store) = routes.get(route) else {
+    let Some(route) = routes.get(route) else {
         return Ok(None);
     };
     let store_path = if remainder.is_empty() {
@@ -1064,7 +1372,7 @@ fn routed_response(
     } else {
         format!("/{remainder}")
     };
-    store.response(&store_path)
+    route.response(&store_path)
 }
 
 fn write_http(
@@ -1109,15 +1417,6 @@ fn avcc_contains_nal_type(data: &[u8], wanted: u8) -> Result<bool> {
 
 fn avc_codec_string(sps: &[u8]) -> Option<String> {
     (sps.len() >= 4).then(|| format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]))
-}
-
-fn cm_time_to_ticks(time: CMTime) -> Option<u64> {
-    if !time.is_valid() || time.timescale <= 0 || time.value < 0 {
-        return None;
-    }
-    let ticks =
-        i128::from(time.value).saturating_mul(i128::from(TIMESCALE)) / i128::from(time.timescale);
-    u64::try_from(ticks).ok()
 }
 
 fn h264_parameter_sets(sample: *mut c_void) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1188,12 +1487,17 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        HlsState, HlsStore, Segment, advance_timestamp, avc_codec_string, avcc_contains_nal_type,
-        cm_time_to_ticks, live_keyframe_interval, master_playlist, playlist, routed_response,
-        validate_cast_hosts, validate_serve_only,
+        HlsRoute, HlsState, HlsStore, Segment, TIMESCALE, advance_timestamp, avc_codec_string,
+        avcc_contains_nal_type, id3_timestamp, live_keyframe_interval, master_playlist, playlist,
+        routed_response, validate_cast_hosts, validate_serve_only,
     };
-    use screencapturekit::CMTime;
-    use std::{collections::HashMap, collections::VecDeque, net::IpAddr, sync::Arc};
+    use crate::audio::{self, EncodedAudioFrame};
+    use std::{
+        collections::HashMap,
+        collections::VecDeque,
+        net::IpAddr,
+        sync::{Arc, atomic::AtomicBool},
+    };
 
     #[test]
     fn detects_idr_in_avcc() {
@@ -1217,12 +1521,6 @@ mod tests {
     }
 
     #[test]
-    fn converts_core_media_time_to_video_ticks() {
-        assert_eq!(cm_time_to_ticks(CMTime::new(3, 2)), Some(135_000));
-        assert_eq!(cm_time_to_ticks(CMTime::INVALID), None);
-    }
-
-    #[test]
     fn advances_a_stalled_capture_timestamp_by_one_frame() {
         assert_eq!(advance_timestamp(Some(90_000), 90_000, 3_000), 93_000);
         assert_eq!(advance_timestamp(Some(90_000), 90_001, 3_000), 90_001);
@@ -1238,14 +1536,15 @@ mod tests {
     #[test]
     fn playlist_references_available_segments() {
         let state = HlsState {
-            master: None,
             init: Some(Arc::new(vec![1])),
             segments: VecDeque::from([Segment {
                 sequence: 7,
                 duration: 1.0,
-                data: Arc::new(vec![2]),
+                video: Arc::new(vec![2]),
+                audio: None,
             }]),
             next_sequence: 8,
+            ..HlsState::default()
         };
         let value = playlist(&state);
         assert!(value.contains("#EXT-X-MEDIA-SEQUENCE:7"));
@@ -1259,14 +1558,15 @@ mod tests {
             .map(|sequence| Segment {
                 sequence,
                 duration: 0.5,
-                data: Arc::new(vec![sequence as u8]),
+                video: Arc::new(vec![sequence as u8]),
+                audio: None,
             })
             .collect();
         let state = HlsState {
-            master: None,
             init: Some(Arc::new(vec![1])),
             segments,
             next_sequence: 10,
+            ..HlsState::default()
         };
 
         let value = playlist(&state);
@@ -1278,7 +1578,7 @@ mod tests {
 
     #[test]
     fn master_playlist_describes_the_video_variant() {
-        let value = master_playlist("avc1.42001F", 1280, 720, 30, 6_000_000);
+        let value = master_playlist("avc1.42001F", 1280, 720, 30, 6_000_000, false);
         assert!(value.contains("BANDWIDTH=6000000"));
         assert!(value.contains("CODECS=\"avc1.42001F\""));
         assert!(value.contains("RESOLUTION=1280x720"));
@@ -1296,7 +1596,22 @@ mod tests {
         second
             .set_init(vec![4, 5, 6], "avc1.42001F", 1280, 720, 30, 6_000_000)
             .unwrap();
-        let routes = HashMap::from([("alpha".to_owned(), first), ("bravo".to_owned(), second)]);
+        let routes = HashMap::from([
+            (
+                "alpha".to_owned(),
+                HlsRoute {
+                    store: first,
+                    audio: Arc::new(AtomicBool::new(false)),
+                },
+            ),
+            (
+                "bravo".to_owned(),
+                HlsRoute {
+                    store: second,
+                    audio: Arc::new(AtomicBool::new(false)),
+                },
+            ),
+        ]);
 
         assert_eq!(
             &*routed_response(&routes, "/alpha/init.mp4")
@@ -1317,6 +1632,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn audio_master_and_packed_aac_timestamp_are_well_formed() {
+        let value = master_playlist("avc1.42001F", 1280, 720, 30, 6_000_000, true);
+        assert!(value.contains("#EXT-X-MEDIA:TYPE=AUDIO"));
+        assert!(value.contains("CODECS=\"avc1.42001F,mp4a.40.2\""));
+        assert!(value.contains("AUDIO=\"audio\""));
+
+        let tag = id3_timestamp(90_000);
+        assert_eq!(&tag[..6], b"ID3\x04\0\0");
+        assert!(tag.windows(4).any(|window| window == b"PRIV"));
+        assert!(
+            tag.windows(b"com.apple.streaming.transportStreamTimestamp".len())
+                .any(|window| window == b"com.apple.streaming.transportStreamTimestamp")
+        );
+        assert_eq!(&tag[tag.len() - 8..], &90_000_u64.to_be_bytes());
+    }
+
+    #[test]
+    fn audio_segments_publish_in_lockstep_with_video() {
+        let store = HlsStore::new(true);
+        store
+            .set_init(vec![1], "avc1.42001F", 1280, 720, 30, 6_000_000)
+            .unwrap();
+        store.push_segment(vec![2], 1.0, 0, TIMESCALE).unwrap();
+        assert_eq!(store.state.lock().unwrap().segments.len(), 0);
+
+        for timestamp in (0..audio::SAMPLE_RATE as u64).step_by(audio::ACCESS_UNIT_SAMPLES) {
+            store
+                .push_audio(EncodedAudioFrame {
+                    timestamp,
+                    data: vec![0xff, 0xf1],
+                })
+                .unwrap();
+        }
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.segments.len(), 1);
+        let segment = state.segments.front().unwrap();
+        assert_eq!(&*segment.video, &[2]);
+        let audio = segment.audio.as_ref().unwrap();
+        assert!(audio.starts_with(b"ID3"));
+        assert!(audio.ends_with(&[0xff, 0xf1]));
     }
 
     #[test]

@@ -361,6 +361,14 @@ impl Drop for BufferedMediaSession {
 
 impl LiveMediaSession {
     pub fn start_fmp4_hls(host: IpAddr, port: u16, url: String) -> Result<Self> {
+        Self::start_hls(host, port, url, false)
+    }
+
+    pub fn start_fmp4_hls_with_aac(host: IpAddr, port: u16, url: String) -> Result<Self> {
+        Self::start_hls(host, port, url, true)
+    }
+
+    fn start_hls(host: IpAddr, port: u16, url: String, with_aac: bool) -> Result<Self> {
         let (command_sender, command_receiver) = mpsc::channel();
         let (interrupt_sender, interrupt_receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -399,9 +407,14 @@ impl LiveMediaSession {
                     return;
                 }
 
-                let outcome =
-                    run_live_media_session(&device, &url, &ready_sender, &command_receiver)
-                        .map_err(|error| format!("live Cast control session failed: {error:#}"));
+                let outcome = run_live_media_session(
+                    &device,
+                    &url,
+                    with_aac,
+                    &ready_sender,
+                    &command_receiver,
+                )
+                .map_err(|error| format!("live Cast control session failed: {error:#}"));
                 if let Err(detail) = &outcome {
                     let _ = ready_sender.send(Err(detail.clone()));
                 }
@@ -1264,6 +1277,7 @@ fn detailed_media_failure(code: MediaDetailedErrorCode, message_type: &str) -> M
 fn run_live_media_session(
     device: &CastDevice<'_>,
     url: &str,
+    with_aac: bool,
     ready: &mpsc::SyncSender<std::result::Result<(), String>>,
     commands: &Receiver<LiveMediaCommand>,
 ) -> Result<()> {
@@ -1285,15 +1299,7 @@ fn run_live_media_session(
         .connect(&application.transport_id)
         .context("could not connect to the receiver application")?;
 
-    let media = Media {
-        content_id: url.to_owned(),
-        stream_type: StreamType::Live,
-        content_type: "application/x-mpegURL".to_owned(),
-        hls_segment_format: Some(HlsSegmentFormat::Fmp4),
-        hls_video_segment_format: Some(HlsVideoSegmentFormat::Fmp4),
-        metadata: None,
-        duration: Some(-1.0),
-    };
+    let media = live_hls_media(url, with_aac);
     let status = device
         .media
         .load_with_opts(
@@ -1381,6 +1387,22 @@ fn run_live_media_session(
                 message => log::trace!("live Cast control message: {message:?}"),
             }
         }
+    }
+}
+
+fn live_hls_media(url: &str, with_aac: bool) -> Media {
+    Media {
+        content_id: url.to_owned(),
+        stream_type: StreamType::Live,
+        content_type: "application/x-mpegURL".to_owned(),
+        hls_segment_format: Some(if with_aac {
+            HlsSegmentFormat::Aac
+        } else {
+            HlsSegmentFormat::Fmp4
+        }),
+        hls_video_segment_format: Some(HlsVideoSegmentFormat::Fmp4),
+        metadata: None,
+        duration: Some(-1.0),
     }
 }
 
@@ -1706,6 +1728,19 @@ mod tests {
             media.hls_video_segment_format,
             Some(HlsVideoSegmentFormat::Fmp4)
         );
+    }
+
+    #[test]
+    fn describes_live_audio_as_packed_aac_with_fmp4_video() {
+        let media = live_hls_media("http://127.0.0.1/live/master.m3u8", true);
+        assert_eq!(media.hls_segment_format, Some(HlsSegmentFormat::Aac));
+        assert_eq!(
+            media.hls_video_segment_format,
+            Some(HlsVideoSegmentFormat::Fmp4)
+        );
+
+        let video_only = live_hls_media("http://127.0.0.1/live/master.m3u8", false);
+        assert_eq!(video_only.hls_segment_format, Some(HlsSegmentFormat::Fmp4));
     }
 
     #[test]
