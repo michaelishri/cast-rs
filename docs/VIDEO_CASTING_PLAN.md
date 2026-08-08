@@ -1,8 +1,8 @@
 # Local video casting plan
 
-- Status: full-file compatibility validated on a physical receiver; incremental delivery pending validation
+- Status: implementation slices complete; incremental track-selective delivery validated on a physical receiver
 - Target release: `v0.3.0`
-- Planning branch: `codex/video-casting`
+- Implementation branch: `codex/video-codecs`
 
 ## Scope assumption
 
@@ -312,6 +312,25 @@ Implemented after validating incremental delivery with long-form H.264/E-AC-3 me
 Full conversion remains available through `--transcode always`; automatic mode avoids unnecessary
 quality loss and substantially reduces CPU use when only one track is incompatible.
 
+### 9. Incremental delivery resource pacing
+
+Implemented after long-form receiver logs showed the preparation worker running much farther ahead
+than playback required:
+
+1. cap background preparation at two minutes beyond the receiver's current playback position;
+2. wake preparation as playback advances or the receiver seeks forward;
+3. hold the requested `--start-at` position as the initial pacing floor;
+4. keep preparation paused while receiver playback is paused instead of consuming CPU and temporary
+   storage as fast as possible;
+5. reduce explicit Cast media-status polling to once per second while retaining prompt stop commands
+   and unsolicited receiver status handling;
+6. carry repeated receiver positions as silent control events so pacing updates do not produce
+   repetitive terminal messages.
+
+The preparation directory still retains already-published media for backward seeking and is removed
+on shutdown. The lookahead limit bounds how quickly CPU and temporary-storage use can get ahead of
+actual playback without discarding seekable content.
+
 ## Test matrix
 
 Automated tests should not require a receiver:
@@ -326,6 +345,8 @@ Automated tests should not require a receiver:
 - start position validation, including negative, non-finite, and beyond-duration values where the
   duration is known;
 - correct buffered `Media` and `LoadOptions` construction.
+- incremental lookahead blocking, playback-position wakeups, nonzero-start floors, and cancellation;
+- state-transition events plus silent repeated-position updates for preparation pacing.
 
 Manual receiver coverage should include:
 

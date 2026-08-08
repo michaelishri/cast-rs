@@ -26,6 +26,12 @@ const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(20);
 const INCREMENTAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(120);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackCompletion {
+    Finished,
+    Stopped,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TranscodeDelivery {
     Complete,
@@ -232,6 +238,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         &interrupted,
         || server.received_request(),
         || None,
+        |_| {},
     );
     let stop = session.stop();
     drop(temporary);
@@ -244,7 +251,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
     );
 
     match playback {
-        Ok(()) => stop.context("could not close the Cast media session"),
+        Ok(_) => stop.context("could not close the Cast media session"),
         Err(error) => {
             if let Err(stop_error) = stop {
                 log::debug!("Cast session cleanup after playback failure failed: {stop_error:#}");
@@ -262,12 +269,13 @@ fn transcode_with_progress(
     interrupted: &AtomicBool,
 ) -> Result<()> {
     let mut last_printed = -5_i32;
-    media::transcode_to_mp4_with_tracks(input, output, info, tracks, interrupted, |percent| {
-        let whole = percent.floor() as i32;
+    media::transcode_to_mp4_with_tracks(input, output, info, tracks, interrupted, |progress| {
+        let whole = progress.percent.floor() as i32;
         if whole >= last_printed + 5 || whole == 100 {
             println!("Transcoding: {whole}%");
             last_printed = whole;
         }
+        Ok(())
     })
 }
 
@@ -288,8 +296,9 @@ fn cast_incremental_video(
         tracks,
         SocketAddr::new(lan_ip, target.http_port),
         route,
-        move |percent| {
-            let whole = percent.floor() as i32;
+        target.start_at,
+        move |progress| {
+            let whole = progress.percent.floor() as i32;
             if whole >= last_printed + 5 || whole == 100 {
                 println!("Preparing stream: {whole}%");
                 last_printed = whole;
@@ -316,8 +325,10 @@ fn cast_incremental_video(
         &interrupted,
         || preparation.received_request(),
         || preparation.failure(),
+        |position| preparation.update_playback_position(position),
     );
-    let cancelled = interrupted.load(Ordering::SeqCst) || playback.is_err();
+    let cancelled = interrupted.load(Ordering::SeqCst)
+        || matches!(&playback, Ok(PlaybackCompletion::Stopped) | Err(_));
     if cancelled {
         preparation.cancel();
     }
@@ -333,7 +344,7 @@ fn cast_incremental_video(
     );
 
     match playback {
-        Ok(()) => {
+        Ok(_) => {
             if !cancelled {
                 preparation_result.context("incremental media preparation did not finish")?;
             }
@@ -358,13 +369,14 @@ fn monitor_playback(
     interrupted: &AtomicBool,
     received_request: impl Fn() -> bool,
     preparation_failure: impl Fn() -> Option<String>,
-) -> Result<()> {
+    mut update_playback_position: impl FnMut(f64),
+) -> Result<PlaybackCompletion> {
     let started = Instant::now();
     let mut playing = false;
     loop {
         if interrupted.load(Ordering::SeqCst) {
             println!("Stopping local video cast...");
-            return Ok(());
+            return Ok(PlaybackCompletion::Stopped);
         }
         if let Some(failure) = preparation_failure() {
             bail!("incremental media preparation failed: {failure}");
@@ -386,14 +398,20 @@ fn monitor_playback(
             }
             Ok(MediaSessionEvent::State {
                 state: PlaybackState::Buffering,
-                ..
+                current_time,
             }) => {
+                if let Some(position) = current_time {
+                    update_playback_position(position.into());
+                }
                 println!("Receiver is buffering the video...");
             }
             Ok(MediaSessionEvent::State {
                 state: PlaybackState::Playing,
                 current_time,
             }) => {
+                if let Some(position) = current_time {
+                    update_playback_position(position.into());
+                }
                 if !playing {
                     let position = current_time
                         .map(|seconds| format!(" at {seconds:.1}s"))
@@ -406,17 +424,23 @@ fn monitor_playback(
             }
             Ok(MediaSessionEvent::State {
                 state: PlaybackState::Paused,
-                ..
+                current_time,
             }) => {
+                if let Some(position) = current_time {
+                    update_playback_position(position.into());
+                }
                 println!("Receiver paused playback.");
+            }
+            Ok(MediaSessionEvent::Position { current_time }) => {
+                update_playback_position(current_time.into());
             }
             Ok(MediaSessionEvent::Ended(PlaybackEnd::Finished)) => {
                 println!("Receiver finished the video.");
-                return Ok(());
+                return Ok(PlaybackCompletion::Finished);
             }
             Ok(MediaSessionEvent::Ended(PlaybackEnd::Cancelled)) => {
                 println!("Receiver stopped playback.");
-                return Ok(());
+                return Ok(PlaybackCompletion::Stopped);
             }
             Ok(MediaSessionEvent::Ended(PlaybackEnd::Interrupted)) => {
                 bail!("video playback was replaced by another Cast request");

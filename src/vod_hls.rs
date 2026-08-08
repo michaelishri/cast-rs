@@ -21,6 +21,8 @@ use crate::{
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PREPARATION_PACE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_PREPARATION_LOOKAHEAD: Duration = Duration::from_secs(120);
 const TRANSCODED_HLS_PEAK_BANDWIDTH: u64 = 6_500_000;
 const COPIED_HLS_PEAK_BANDWIDTH: u64 = 25_000_000;
 
@@ -70,6 +72,77 @@ struct SharedPreparationStatus {
     changed: Condvar,
 }
 
+struct PreparationPacer {
+    initial_position_millis: u64,
+    playback_position_millis: AtomicU64,
+    changed: Mutex<()>,
+    changed_condition: Condvar,
+}
+
+impl PreparationPacer {
+    fn new(initial_position: f64) -> Self {
+        let initial_position_millis = duration_millis(initial_position);
+        Self {
+            initial_position_millis,
+            playback_position_millis: AtomicU64::new(initial_position_millis),
+            changed: Mutex::new(()),
+            changed_condition: Condvar::new(),
+        }
+    }
+
+    fn update_playback_position(&self, position: f64) {
+        if !position.is_finite() || position < 0.0 {
+            return;
+        }
+        self.playback_position_millis.store(
+            duration_millis(position).max(self.initial_position_millis),
+            Ordering::Release,
+        );
+        self.changed_condition.notify_all();
+    }
+
+    fn wait_until_allowed(&self, prepared_position: f64, cancelled: &AtomicBool) -> Result<()> {
+        let prepared_position_millis = duration_millis(prepared_position);
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                bail!("media preparation was cancelled");
+            }
+            if self.allows(prepared_position_millis) {
+                return Ok(());
+            }
+
+            let state = self
+                .changed
+                .lock()
+                .map_err(|_| anyhow!("incremental preparation pacing lock was poisoned"))?;
+            if self.allows(prepared_position_millis) {
+                continue;
+            }
+            let _ = self
+                .changed_condition
+                .wait_timeout(state, PREPARATION_PACE_POLL_INTERVAL)
+                .map_err(|_| anyhow!("incremental preparation pacing lock was poisoned"))?;
+        }
+    }
+
+    fn allows(&self, prepared_position_millis: u64) -> bool {
+        let playback_position = self.playback_position_millis.load(Ordering::Acquire);
+        prepared_position_millis
+            <= playback_position.saturating_add(MAX_PREPARATION_LOOKAHEAD.as_millis() as u64)
+    }
+
+    fn wake(&self) {
+        self.changed_condition.notify_all();
+    }
+}
+
+fn duration_millis(seconds: f64) -> u64 {
+    if !seconds.is_finite() {
+        return u64::MAX;
+    }
+    (seconds.max(0.0) * 1_000.0).min(u64::MAX as f64) as u64
+}
+
 #[derive(Clone, Copy)]
 struct HlsRendition {
     bandwidth: u64,
@@ -84,6 +157,7 @@ pub struct IncrementalHlsPreparation {
     directory: tempfile::TempDir,
     rendition: HlsRendition,
     cancel: Arc<AtomicBool>,
+    pacer: Arc<PreparationPacer>,
     status: Arc<SharedPreparationStatus>,
     worker: Option<JoinHandle<()>>,
 }
@@ -95,7 +169,8 @@ impl IncrementalHlsPreparation {
         tracks: TranscodeTracks,
         bind_address: SocketAddr,
         route: String,
-        mut progress_callback: impl FnMut(f64) + Send + 'static,
+        initial_position: f64,
+        mut progress_callback: impl FnMut(media::TranscodeProgress) + Send + 'static,
     ) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("cast-hls-")
@@ -121,8 +196,10 @@ impl IncrementalHlsPreparation {
             has_audio: info.audio.is_some(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
+        let pacer = Arc::new(PreparationPacer::new(initial_position));
         let status = Arc::new(SharedPreparationStatus::default());
         let worker_cancel = Arc::clone(&cancel);
+        let worker_pacer = Arc::clone(&pacer);
         let worker_status = Arc::clone(&status);
         let worker = thread::Builder::new()
             .name("cast-hls-transcode".into())
@@ -135,11 +212,13 @@ impl IncrementalHlsPreparation {
                     tracks,
                     &worker_cancel,
                     |progress| {
+                        worker_pacer.wait_until_allowed(progress.position, &worker_cancel)?;
                         if let Ok(mut state) = worker_status.status.lock() {
-                            state.progress = progress;
+                            state.progress = progress.percent;
                             worker_status.changed.notify_all();
                         }
                         progress_callback(progress);
+                        Ok(())
                     },
                 );
                 if let Ok(mut state) = worker_status.status.lock() {
@@ -157,6 +236,7 @@ impl IncrementalHlsPreparation {
             directory,
             rendition,
             cancel,
+            pacer,
             status,
             worker: Some(worker),
         })
@@ -188,6 +268,10 @@ impl IncrementalHlsPreparation {
             .lock()
             .ok()
             .and_then(|state| state.failure.clone())
+    }
+
+    pub fn update_playback_position(&self, position: f64) {
+        self.pacer.update_playback_position(position);
     }
 
     pub fn wait_until_playable(
@@ -231,6 +315,7 @@ impl IncrementalHlsPreparation {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+        self.pacer.wake();
     }
 
     pub fn finish(&mut self) -> Result<()> {
@@ -624,6 +709,8 @@ fn valid_hls_file_name(name: &str, prefix: &str, suffix: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::sync::mpsc;
+
     fn write_ready_playlist(directory: &Path, duration: f64) {
         std::fs::write(directory.join("init.mp4"), b"init").unwrap();
         std::fs::write(directory.join("segment-000000.m4s"), b"segment").unwrap();
@@ -652,6 +739,62 @@ mod tests {
         assert!(playlist_is_playable(directory.path(), 0.0).unwrap());
         assert!(playlist_is_playable(directory.path(), 2.2).unwrap());
         assert!(!playlist_is_playable(directory.path(), 3.0).unwrap());
+    }
+
+    #[test]
+    fn preparation_pacing_blocks_past_the_lookahead_and_wakes_on_progress() {
+        let pacer = Arc::new(PreparationPacer::new(10.0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker_pacer = Arc::clone(&pacer);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = thread::spawn(move || {
+            worker_pacer
+                .wait_until_allowed(131.0, &worker_cancelled)
+                .unwrap();
+            done_sender.send(()).unwrap();
+        });
+
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        pacer.update_playback_position(11.0);
+        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn preparation_pacing_keeps_the_requested_start_as_its_floor() {
+        let pacer = PreparationPacer::new(90.0);
+        pacer.update_playback_position(0.0);
+        assert!(pacer.allows(duration_millis(210.0)));
+        assert!(!pacer.allows(duration_millis(210.001)));
+    }
+
+    #[test]
+    fn preparation_pacing_wakes_for_cancellation() {
+        let pacer = Arc::new(PreparationPacer::new(0.0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker_pacer = Arc::clone(&pacer);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = thread::spawn(move || {
+            done_sender
+                .send(worker_pacer.wait_until_allowed(121.0, &worker_cancelled))
+                .unwrap();
+        });
+
+        cancelled.store(true, Ordering::SeqCst);
+        pacer.wake();
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
     }
 
     #[test]

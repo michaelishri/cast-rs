@@ -147,7 +147,10 @@ track is incompatible, Cast converts that track and copies the other without qua
 example, H.264/E-AC-3 becomes copied H.264 with AAC audio. By default Cast publishes fragmented-MP4
 HLS segments atomically and starts the receiver as soon as the first segment—or the segment covering
 `--start-at`—is ready. Conversion continues in the background while the video plays and the playlist
-becomes a finished VOD playlist at end of input.
+becomes a finished VOD playlist at end of input. Background preparation is paced to stay within two
+minutes of the receiver's current position, pauses when the lookahead is full, and wakes when playback
+advances or seeks forward. Published segments remain available for backward seeking until the
+temporary directory is removed at shutdown.
 
 Use `--transcode never` to reject anything outside the direct-play set, or `--transcode always` to
 normalize even directly playable input. `--content-type` remains an expert direct-play override and

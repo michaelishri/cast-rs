@@ -91,6 +91,10 @@ with E-AC-3 audio keeps its original video and converts only the audio to AAC. C
 after the first fragmented-MP4 segment is ready and keeps converting in the background while the
 receiver plays. For `--start-at`, it first prepares enough segments to cover the requested position.
 Progress is printed in the terminal and `Ctrl-C` cancels preparation.
+Background conversion stays at most about two minutes ahead of the receiver. It pauses when that
+lookahead is full—including while receiver playback is paused—and resumes as playback advances or
+seeks forward. Already prepared segments remain available for backward seeking until Cast exits,
+when the temporary media directory is removed.
 
 To reject media that would require preparation, or to normalize every input, use:
 

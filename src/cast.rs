@@ -21,7 +21,7 @@ use rust_cast::{
 
 pub use rust_cast::channels::media::HlsVideoSegmentFormat;
 
-const BUFFERED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BUFFERED_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFERED_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const CAST_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,6 +60,9 @@ pub enum MediaSessionEvent {
     State {
         state: PlaybackState,
         current_time: Option<f32>,
+    },
+    Position {
+        current_time: f32,
     },
     Ended(PlaybackEnd),
     Failed(MediaFailure),
@@ -813,6 +816,11 @@ fn emit_state(
     events: &Sender<MediaSessionEvent>,
 ) -> bool {
     if *last_state == Some(state) {
+        if let Some(current_time) = current_time {
+            return events
+                .send(MediaSessionEvent::Position { current_time })
+                .is_err();
+        }
         return false;
     }
     *last_state = Some(state);
@@ -1024,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_state_transitions_without_repeating_poll_updates() {
+    fn emits_state_transitions_and_position_only_poll_updates() {
         let (sender, receiver) = mpsc::channel();
         let mut last_state = None;
         assert!(!emit_status_entry(
@@ -1045,7 +1053,10 @@ mod tests {
             &mut last_state,
             &sender,
         ));
-        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            MediaSessionEvent::Position { current_time: 12.5 }
+        );
 
         assert!(!emit_status_entry(
             status_entry(PlayerState::Playing, None),

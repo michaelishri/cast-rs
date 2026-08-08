@@ -1034,7 +1034,7 @@ pub fn transcode_to_mp4_with_tracks(
     info: &MediaInfo,
     tracks: TranscodeTracks,
     cancelled: &AtomicBool,
-    progress: impl FnMut(f64),
+    progress: impl FnMut(TranscodeProgress) -> Result<()>,
 ) -> Result<()> {
     let mut output = format::output_as(output_path, "mp4")
         .with_context(|| format!("could not create temporary MP4 {}", output_path.display()))?;
@@ -1058,7 +1058,7 @@ pub fn transcode_to_hls_with_tracks(
     info: &MediaInfo,
     tracks: TranscodeTracks,
     cancelled: &AtomicBool,
-    progress: impl FnMut(f64),
+    progress: impl FnMut(TranscodeProgress) -> Result<()>,
 ) -> Result<()> {
     let mut output = format::output_as(playlist_path, "hls").with_context(|| {
         format!(
@@ -1100,7 +1100,7 @@ fn transcode_to_output(
     info: &MediaInfo,
     tracks: TranscodeTracks,
     cancelled: &AtomicBool,
-    mut progress: impl FnMut(f64),
+    mut progress: impl FnMut(TranscodeProgress) -> Result<()>,
     output: &mut format::context::Output,
     options: Dictionary<'_>,
 ) -> Result<()> {
@@ -1140,23 +1140,25 @@ fn transcode_to_output(
         .streams()
         .map(|stream| stream.time_base())
         .collect::<Vec<_>>();
-    let mut last_progress = -1.0;
+    let mut last_position = 0.0_f64;
 
     for (stream, packet) in input.packets() {
         if cancelled.load(Ordering::SeqCst) {
             bail!("media preparation was cancelled");
         }
         if stream.index() == info.video.stream_index {
-            if let Some(timestamp) = packet.pts().or_else(|| packet.dts())
-                && let Some(duration) = info.duration
-            {
+            if let Some(timestamp) = packet.pts().or_else(|| packet.dts()) {
                 let seconds = timestamp as f64 * video_input_time_base.numerator() as f64
                     / video_input_time_base.denominator() as f64;
-                let percent = (seconds / duration * 100.0).clamp(0.0, 100.0);
-                if percent - last_progress >= 1.0 {
-                    progress(percent);
-                    last_progress = percent;
-                }
+                last_position = last_position.max(seconds.max(0.0));
+                let percent = info
+                    .duration
+                    .map(|duration| (last_position / duration * 100.0).clamp(0.0, 100.0))
+                    .unwrap_or(0.0);
+                progress(TranscodeProgress {
+                    percent,
+                    position: last_position,
+                })?;
             }
             if let Some(video) = &mut video {
                 let time_base = output_time_bases[video.output_index];
@@ -1197,8 +1199,17 @@ fn transcode_to_output(
     output
         .write_trailer()
         .context("could not finish the compatibility media output")?;
-    progress(100.0);
+    progress(TranscodeProgress {
+        percent: 100.0,
+        position: last_position,
+    })?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TranscodeProgress {
+    pub percent: f64,
+    pub position: f64,
 }
 
 pub fn compatible_dimensions(width: u32, height: u32) -> (u32, u32) {
