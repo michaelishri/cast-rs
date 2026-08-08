@@ -45,6 +45,13 @@ impl VirtualDisplaySession {
         let executable = std::env::current_exe()
             .context("could not locate the Cast executable for the virtual display helper")?;
         let mut command = Command::new(executable);
+        let helper_stderr = if log::log_enabled!(log::Level::Debug) {
+            // The helper's final anyhow error identifies which teardown phase
+            // failed. Surface it alongside the parent's timing at -v/-vv.
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
         command
             .arg("__virtual-display-helper")
             .arg("--width")
@@ -55,7 +62,7 @@ impl VirtualDisplaySession {
             .arg(fps.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(helper_stderr);
 
         // Keep Ctrl-C in the interactive parent from terminating the helper
         // before the parent has stopped capture and closed its lifetime pipe.
@@ -327,12 +334,21 @@ pub fn run_helper(width: u32, height: u32, fps: u32) -> Result<()> {
     let started = Instant::now();
     while display_pair_is_online(display_id, companion_display_id, native_is_online) {
         if started.elapsed() >= SHAREABLE_TIMEOUT {
-            if companion_display_id != 0 && native_is_online(companion_display_id) {
-                bail!(
-                    "virtual display {display_id} or its teardown companion {companion_display_id} remained online after release"
-                );
+            let display_online = native_is_online(display_id);
+            let companion_online =
+                companion_display_id != 0 && native_is_online(companion_display_id);
+            match (display_online, companion_online) {
+                (true, true) => bail!(
+                    "virtual display {display_id} and its teardown companion {companion_display_id} remained online after release"
+                ),
+                (false, true) => bail!(
+                    "teardown companion display {companion_display_id} remained online after release"
+                ),
+                (true, false) => {
+                    bail!("virtual display {display_id} remained online after release")
+                }
+                (false, false) => break,
             }
-            bail!("virtual display {display_id} remained online after release");
         }
         thread::sleep(Duration::from_millis(100));
     }

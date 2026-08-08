@@ -96,6 +96,24 @@ static bool cast_display_is_already_online(CGDirectDisplayID *existing_id) {
     return false;
 }
 
+static bool online_display_list_contains(CGDirectDisplayID display_id) {
+    if (display_id == kCGNullDirectDisplay) {
+        return false;
+    }
+    CGDirectDisplayID displays[MAX_DISPLAYS];
+    uint32_t count = 0;
+    if (CGGetOnlineDisplayList((uint32_t)MAX_DISPLAYS, displays, &count) !=
+        kCGErrorSuccess) {
+        return CGDisplayIsOnline(display_id);
+    }
+    for (uint32_t index = 0; index < count; index++) {
+        if (displays[index] == display_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool private_api_is_usable(Class descriptor_class, Class mode_class,
                                   Class settings_class, Class display_class) {
     return class_getInstanceMethod(descriptor_class, @selector(init)) != NULL &&
@@ -136,7 +154,7 @@ static int32_t right_edge_before_creation(void) {
 
 static bool wait_until_online(CGDirectDisplayID display_id) {
     for (uint32_t attempt = 0; attempt < 50; attempt++) {
-        if (CGDisplayIsOnline(display_id)) {
+        if (online_display_list_contains(display_id)) {
             return true;
         }
         usleep(100000);
@@ -399,7 +417,7 @@ bool cast_virtual_display_destroy(uint32_t *companion_display_id,
         // display-reconfiguration notification is delivered. Give WindowServer
         // one polling interval to finish registering the companion.
         usleep(100000);
-        if (!CGDisplayIsOnline(companion_id)) {
+        if (!online_display_list_contains(companion_id)) {
             release_cast_display();
             companion_display = nil;
             set_error(error_buffer, error_buffer_length,
@@ -426,5 +444,5 @@ bool cast_virtual_display_destroy(uint32_t *companion_display_id,
 }
 
 bool cast_virtual_display_is_online(uint32_t display_id) {
-    return display_id != kCGNullDirectDisplay && CGDisplayIsOnline(display_id);
+    return online_display_list_contains(display_id);
 }

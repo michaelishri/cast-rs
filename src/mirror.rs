@@ -643,7 +643,7 @@ fn run_desktop(
     } else {
         log::debug!("latest-frame-wins queue enabled without a raw-frame deadline");
     }
-    let mut input = if options.synthetic {
+    let input = if options.synthetic {
         println!(
             "Profiling {SYNTHETIC_WORKLOAD_NAME} deterministic 420v frames at {}x{}, {} fps, probe delay {} ms...",
             width,
@@ -783,7 +783,11 @@ fn run_desktop(
     }
     let sampled_for = started.elapsed();
 
-    input.stop()?;
+    input.stop_and_release()?;
+    // Stopping an SCStream does not release the stream or its content filter.
+    // Drop the capture graph before removing a virtual source display so
+    // ScreenCaptureKit cannot keep that display registered with WindowServer.
+    log::debug!("released desktop capture resources before display teardown");
     drop(feedback);
     negotiation
         .control
@@ -3032,8 +3036,8 @@ enum RunningInput {
 }
 
 impl RunningInput {
-    fn stop(&mut self) -> Result<()> {
-        match self {
+    fn stop_and_release(mut self) -> Result<()> {
+        match &mut self {
             Self::Screen(stream, encoder) => {
                 let capture_result = stream
                     .stop_capture()

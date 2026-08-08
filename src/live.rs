@@ -236,6 +236,14 @@ pub fn cast_desktop(mut options: LiveOptions) -> Result<()> {
     stream
         .stop_capture()
         .context("could not stop screen capture")?;
+    // SCStream retains its content filter after capture stops. Release the
+    // complete capture graph before removing a virtual source display.
+    drop(stream);
+    drop(filter);
+    drop(config);
+    drop(displays);
+    drop(content);
+    log::debug!("released desktop capture resources before display teardown");
     stop.store(true, Ordering::SeqCst);
     drop(server);
     let stats = store.stats();
