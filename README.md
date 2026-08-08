@@ -152,6 +152,12 @@ pressed. On `Ctrl-C`, it stops the media, closes the Cast channels, and terminat
 Receiver application. The command does not report success merely because Cast accepted the load
 request: it waits until the receiver reports `PLAYING`.
 
+In a terminal at the default verbosity, `video` displays playback progress and accepts player
+controls without requiring Enter. Press Left/Right to seek backward/forward 10 seconds, Down/Up to
+seek backward/forward 60 seconds, Space to pause or resume, and Escape to stop cleanly. Seeking while
+paused leaves the video paused. Verbose output and redirected input or output retain line-oriented
+status messages and do not enable keyboard controls.
+
 The local server implements full, open-ended, and suffix HTTP byte ranges, so the receiver can seek
 and can read MP4 metadata stored near the end of a large file. File data is read at explicit offsets
 in fixed-size chunks rather than loaded into memory. The listener binds only to the LAN interface

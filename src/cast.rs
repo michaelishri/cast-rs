@@ -13,7 +13,7 @@ use rust_cast::{
         heartbeat::HeartbeatResponse,
         media::{
             HlsSegmentFormat, IdleReason, LoadOptions, Media, MediaDetailedErrorCode,
-            MediaResponse, PlayerState, Status, StatusEntry, StreamType,
+            MediaResponse, PlayerState, ResumeState, Status, StatusEntry, StreamType,
         },
         receiver::CastDeviceApp,
     },
@@ -21,16 +21,34 @@ use rust_cast::{
 
 pub use rust_cast::channels::media::HlsVideoSegmentFormat;
 
-const BUFFERED_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BUFFERED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BUFFERED_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const CAST_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MEDIA_COMMAND_PAUSE: u32 = 1;
+const MEDIA_COMMAND_SEEK: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackState {
     Buffering,
     Playing,
     Paused,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaybackStatus {
+    pub state: PlaybackState,
+    pub current_time: Option<f32>,
+    pub duration: Option<f32>,
+    pub playback_rate: f32,
+    pub can_pause: bool,
+    pub can_seek: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaControl {
+    PlayPause,
+    Seek,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,19 +75,28 @@ pub struct MediaFailure {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MediaSessionEvent {
     Loading,
-    State {
-        state: PlaybackState,
-        current_time: Option<f32>,
-    },
-    Position {
-        current_time: f32,
+    Status(PlaybackStatus),
+    ControlError {
+        control: MediaControl,
+        detail: String,
     },
     Ended(PlaybackEnd),
     Failed(MediaFailure),
 }
 
 enum MediaSessionCommand {
+    TogglePlayback,
+    SeekBy(f32),
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BufferedPlaybackSnapshot {
+    state: Option<PlaybackState>,
+    current_time: Option<f32>,
+    duration: Option<f32>,
+    playback_rate: f32,
+    supported_media_commands: u32,
 }
 
 pub struct BufferedMediaSession {
@@ -94,6 +121,7 @@ struct BufferedMediaLoad {
     start_at: f64,
     duration: Option<f64>,
     fmp4_hls: bool,
+    interactive: bool,
 }
 
 impl BufferedMediaSession {
@@ -103,8 +131,20 @@ impl BufferedMediaSession {
         url: String,
         content_type: String,
         start_at: f64,
+        interactive: bool,
     ) -> Result<Self> {
-        Self::start_with_options(host, port, url, content_type, start_at, None, false)
+        Self::start_with_options(
+            host,
+            port,
+            BufferedMediaLoad {
+                url,
+                content_type,
+                start_at,
+                duration: None,
+                fmp4_hls: false,
+                interactive,
+            },
+        )
     }
 
     pub fn start_fmp4_hls(
@@ -113,34 +153,23 @@ impl BufferedMediaSession {
         url: String,
         start_at: f64,
         duration: Option<f64>,
+        interactive: bool,
     ) -> Result<Self> {
         Self::start_with_options(
             host,
             port,
-            url,
-            "application/x-mpegURL".to_owned(),
-            start_at,
-            duration,
-            true,
+            BufferedMediaLoad {
+                url,
+                content_type: "application/x-mpegURL".to_owned(),
+                start_at,
+                duration,
+                fmp4_hls: true,
+                interactive,
+            },
         )
     }
 
-    fn start_with_options(
-        host: IpAddr,
-        port: u16,
-        url: String,
-        content_type: String,
-        start_at: f64,
-        duration: Option<f64>,
-        fmp4_hls: bool,
-    ) -> Result<Self> {
-        let media_load = BufferedMediaLoad {
-            url,
-            content_type,
-            start_at,
-            duration,
-            fmp4_hls,
-        };
+    fn start_with_options(host: IpAddr, port: u16, media_load: BufferedMediaLoad) -> Result<Self> {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
@@ -188,6 +217,7 @@ impl BufferedMediaSession {
                 let outcome = match run_buffered_media_session(
                     &device,
                     &media_load,
+                    media_load.interactive,
                     &command_receiver,
                     &event_sender,
                 ) {
@@ -239,6 +269,21 @@ impl BufferedMediaSession {
         timeout: Duration,
     ) -> std::result::Result<MediaSessionEvent, RecvTimeoutError> {
         self.events.recv_timeout(timeout)
+    }
+
+    pub fn toggle_playback(&self) -> Result<()> {
+        self.commands
+            .send(MediaSessionCommand::TogglePlayback)
+            .context("Cast control session ended before play/pause could be requested")
+    }
+
+    pub fn seek_by(&self, seconds: f32) -> Result<()> {
+        if !seconds.is_finite() || seconds == 0.0 {
+            return Err(anyhow!("seek offset must be a finite non-zero number"));
+        }
+        self.commands
+            .send(MediaSessionCommand::SeekBy(seconds))
+            .context("Cast control session ended before seek could be requested")
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -365,6 +410,7 @@ fn cast_url_with_options(
 fn run_buffered_media_session(
     device: &CastDevice<'_>,
     media_load: &BufferedMediaLoad,
+    interactive: bool,
     commands: &Receiver<MediaSessionCommand>,
     events: &Sender<MediaSessionEvent>,
 ) -> Result<()> {
@@ -376,7 +422,9 @@ fn run_buffered_media_session(
         .heartbeat
         .ping()
         .context("could not initialize the Cast heartbeat")?;
-    eprintln!("Launching the Default Media Receiver...");
+    if !interactive {
+        eprintln!("Launching the Default Media Receiver...");
+    }
     let application = device
         .receiver
         .launch_app(&CastDeviceApp::DefaultMediaReceiver)
@@ -400,7 +448,9 @@ fn run_buffered_media_session(
         media_load.start_at,
         media_load.fmp4_hls
     );
-    eprintln!("Loading the buffered media URL...");
+    if !interactive {
+        eprintln!("Loading the buffered media URL...");
+    }
     let status = match device.media.load_with_opts(
         application.transport_id.clone(),
         application.session_id.clone(),
@@ -431,8 +481,8 @@ fn run_buffered_media_session(
         "Cast buffered LOAD response selected media session {media_session_id}: {status:?}"
     );
 
-    let mut last_state = None;
-    if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
+    let mut snapshot = BufferedPlaybackSnapshot::default();
+    if drain_buffered_messages(device, media_session_id, &mut snapshot, events)? {
         return stop_buffered_cast_session(
             device,
             &application.transport_id,
@@ -440,7 +490,7 @@ fn run_buffered_media_session(
             media_session_id,
         );
     }
-    if emit_status(status, media_session_id, &mut last_state, events) {
+    if emit_status(status, media_session_id, &mut snapshot, events) {
         return stop_buffered_cast_session(
             device,
             &application.transport_id,
@@ -450,7 +500,7 @@ fn run_buffered_media_session(
     }
 
     loop {
-        if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
+        if drain_buffered_messages(device, media_session_id, &mut snapshot, events)? {
             return stop_buffered_cast_session(
                 device,
                 &application.transport_id,
@@ -460,6 +510,39 @@ fn run_buffered_media_session(
         }
 
         match commands.recv_timeout(BUFFERED_STATUS_POLL_INTERVAL) {
+            Ok(MediaSessionCommand::TogglePlayback) => {
+                if toggle_buffered_playback(
+                    device,
+                    &application.transport_id,
+                    media_session_id,
+                    &mut snapshot,
+                    events,
+                ) {
+                    return stop_buffered_cast_session(
+                        device,
+                        &application.transport_id,
+                        &application.session_id,
+                        media_session_id,
+                    );
+                }
+            }
+            Ok(MediaSessionCommand::SeekBy(seconds)) => {
+                if seek_buffered_playback(
+                    device,
+                    &application.transport_id,
+                    media_session_id,
+                    seconds,
+                    &mut snapshot,
+                    events,
+                ) {
+                    return stop_buffered_cast_session(
+                        device,
+                        &application.transport_id,
+                        &application.session_id,
+                        media_session_id,
+                    );
+                }
+            }
             Ok(MediaSessionCommand::Stop) => {
                 stop_buffered_cast_session(
                     device,
@@ -477,7 +560,7 @@ fn run_buffered_media_session(
             .media
             .get_status(&application.transport_id, Some(media_session_id))
             .context("could not poll buffered media status")?;
-        if drain_buffered_messages(device, media_session_id, &mut last_state, events)? {
+        if drain_buffered_messages(device, media_session_id, &mut snapshot, events)? {
             return stop_buffered_cast_session(
                 device,
                 &application.transport_id,
@@ -485,7 +568,7 @@ fn run_buffered_media_session(
                 media_session_id,
             );
         }
-        if emit_status(status, media_session_id, &mut last_state, events) {
+        if emit_status(status, media_session_id, &mut snapshot, events) {
             return stop_buffered_cast_session(
                 device,
                 &application.transport_id,
@@ -506,6 +589,130 @@ fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
         metadata: None,
         duration: media_load.duration.map(|duration| duration as f32),
     }
+}
+
+fn toggle_buffered_playback(
+    device: &CastDevice<'_>,
+    transport_id: &str,
+    media_session_id: i32,
+    snapshot: &mut BufferedPlaybackSnapshot,
+    events: &Sender<MediaSessionEvent>,
+) -> bool {
+    let result = match snapshot.state {
+        Some(PlaybackState::Playing)
+            if snapshot.supported_media_commands & MEDIA_COMMAND_PAUSE != 0 =>
+        {
+            device.media.pause(transport_id, media_session_id)
+        }
+        Some(PlaybackState::Paused) => device.media.play(transport_id, media_session_id),
+        Some(PlaybackState::Playing) => {
+            return emit_control_error(
+                events,
+                MediaControl::PlayPause,
+                "receiver does not advertise pause support",
+            );
+        }
+        Some(PlaybackState::Buffering) | None => {
+            return emit_control_error(
+                events,
+                MediaControl::PlayPause,
+                "play/pause is unavailable until playback is ready",
+            );
+        }
+    };
+
+    match result {
+        Ok(entry) => emit_status_entry(entry, snapshot, events),
+        Err(error) => {
+            log::debug!("receiver rejected play/pause control: {error}");
+            emit_control_error(
+                events,
+                MediaControl::PlayPause,
+                &format!("receiver rejected play/pause: {error}"),
+            )
+        }
+    }
+}
+
+fn seek_buffered_playback(
+    device: &CastDevice<'_>,
+    transport_id: &str,
+    media_session_id: i32,
+    seconds: f32,
+    snapshot: &mut BufferedPlaybackSnapshot,
+    events: &Sender<MediaSessionEvent>,
+) -> bool {
+    if snapshot.supported_media_commands & MEDIA_COMMAND_SEEK == 0 {
+        return emit_control_error(
+            events,
+            MediaControl::Seek,
+            "receiver does not advertise seek support",
+        );
+    }
+    let Some(resume_state) = seek_resume_state(snapshot.state) else {
+        return emit_control_error(
+            events,
+            MediaControl::Seek,
+            "seek is unavailable until playback is ready",
+        );
+    };
+    let Some(current_time) = snapshot.current_time else {
+        return emit_control_error(
+            events,
+            MediaControl::Seek,
+            "receiver has not reported the current playback position",
+        );
+    };
+    let target = seek_target(current_time, seconds, snapshot.duration);
+    if (target - current_time).abs() < f32::EPSILON {
+        return false;
+    }
+
+    match device.media.seek(
+        transport_id,
+        media_session_id,
+        Some(target),
+        Some(resume_state),
+    ) {
+        Ok(entry) => emit_status_entry(entry, snapshot, events),
+        Err(error) => {
+            log::debug!("receiver rejected seek control: {error}");
+            emit_control_error(
+                events,
+                MediaControl::Seek,
+                &format!("receiver rejected seek: {error}"),
+            )
+        }
+    }
+}
+
+fn seek_target(current_time: f32, seconds: f32, duration: Option<f32>) -> f32 {
+    let mut target = (current_time + seconds).max(0.0);
+    if let Some(duration) = duration.filter(|value| value.is_finite() && *value >= 0.0) {
+        target = target.min(duration);
+    }
+    target
+}
+
+fn seek_resume_state(state: Option<PlaybackState>) -> Option<ResumeState> {
+    match state {
+        Some(PlaybackState::Playing) => Some(ResumeState::PlaybackStart),
+        Some(PlaybackState::Paused) => Some(ResumeState::PlaybackPause),
+        Some(PlaybackState::Buffering) | None => None,
+    }
+}
+
+fn emit_control_error(
+    events: &Sender<MediaSessionEvent>,
+    control: MediaControl,
+    detail: &str,
+) -> bool {
+    events
+        .send(MediaSessionEvent::ControlError {
+            control,
+            detail: detail.to_owned(),
+        })
+        .is_err()
 }
 
 fn stop_buffered_cast_session(
@@ -552,7 +759,7 @@ fn stop_buffered_cast_session(
 fn drain_buffered_messages(
     device: &CastDevice<'_>,
     media_session_id: i32,
-    last_state: &mut Option<PlaybackState>,
+    snapshot: &mut BufferedPlaybackSnapshot,
     events: &Sender<MediaSessionEvent>,
 ) -> Result<bool> {
     let mut messages = Vec::new();
@@ -565,10 +772,10 @@ fn drain_buffered_messages(
 
     if let Some(index) = messages.iter().position(is_detailed_terminal_message) {
         let message = messages.swap_remove(index);
-        return handle_buffered_message(device, message, media_session_id, last_state, events);
+        return handle_buffered_message(device, message, media_session_id, snapshot, events);
     }
     for message in messages {
-        if handle_buffered_message(device, message, media_session_id, last_state, events)? {
+        if handle_buffered_message(device, message, media_session_id, snapshot, events)? {
             return Ok(true);
         }
     }
@@ -636,7 +843,7 @@ fn handle_buffered_message(
     device: &CastDevice<'_>,
     message: ChannelMessage,
     media_session_id: i32,
-    last_state: &mut Option<PlaybackState>,
+    snapshot: &mut BufferedPlaybackSnapshot,
     events: &Sender<MediaSessionEvent>,
 ) -> Result<bool> {
     match message {
@@ -654,7 +861,7 @@ fn handle_buffered_message(
             log::debug!("unrecognized buffered receiver heartbeat: {message:?}");
         }
         ChannelMessage::Media(MediaResponse::Status(status)) => {
-            return Ok(emit_status(status, media_session_id, last_state, events));
+            return Ok(emit_status(status, media_session_id, snapshot, events));
         }
         ChannelMessage::Media(MediaResponse::Error(error)) => {
             return Ok(send_terminal_event(
@@ -739,7 +946,7 @@ fn handle_buffered_message(
 fn emit_status(
     status: Status,
     media_session_id: i32,
-    last_state: &mut Option<PlaybackState>,
+    snapshot: &mut BufferedPlaybackSnapshot,
     events: &Sender<MediaSessionEvent>,
 ) -> bool {
     let Some(entry) = status
@@ -753,12 +960,12 @@ fn emit_status(
         );
         return false;
     };
-    emit_status_entry(entry, last_state, events)
+    emit_status_entry(entry, snapshot, events)
 }
 
 fn emit_status_entry(
     entry: StatusEntry,
-    last_state: &mut Option<PlaybackState>,
+    snapshot: &mut BufferedPlaybackSnapshot,
     events: &Sender<MediaSessionEvent>,
 ) -> bool {
     log::debug!(
@@ -788,47 +995,55 @@ fn emit_status_entry(
             ),
             None => false,
         },
-        PlayerState::Buffering => emit_state(
-            PlaybackState::Buffering,
-            entry.current_time,
-            last_state,
-            events,
-        ),
-        PlayerState::Playing => emit_state(
-            PlaybackState::Playing,
-            entry.current_time,
-            last_state,
-            events,
-        ),
-        PlayerState::Paused => emit_state(
-            PlaybackState::Paused,
-            entry.current_time,
-            last_state,
-            events,
-        ),
+        PlayerState::Buffering => {
+            emit_playback_status(PlaybackState::Buffering, &entry, snapshot, events)
+        }
+        PlayerState::Playing => {
+            emit_playback_status(PlaybackState::Playing, &entry, snapshot, events)
+        }
+        PlayerState::Paused => {
+            emit_playback_status(PlaybackState::Paused, &entry, snapshot, events)
+        }
     }
 }
 
-fn emit_state(
+fn emit_playback_status(
     state: PlaybackState,
-    current_time: Option<f32>,
-    last_state: &mut Option<PlaybackState>,
+    entry: &StatusEntry,
+    snapshot: &mut BufferedPlaybackSnapshot,
     events: &Sender<MediaSessionEvent>,
 ) -> bool {
-    if *last_state == Some(state) {
-        if let Some(current_time) = current_time {
-            return events
-                .send(MediaSessionEvent::Position { current_time })
-                .is_err();
-        }
-        return false;
+    snapshot.state = Some(state);
+    if let Some(current_time) = entry
+        .current_time
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        snapshot.current_time = Some(current_time);
     }
-    *last_state = Some(state);
+    if let Some(duration) = entry
+        .media
+        .as_ref()
+        .and_then(|media| media.duration)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        snapshot.duration = Some(duration);
+    }
+    snapshot.playback_rate = if entry.playback_rate.is_finite() {
+        entry.playback_rate
+    } else {
+        0.0
+    };
+    snapshot.supported_media_commands = entry.supported_media_commands;
+
     events
-        .send(MediaSessionEvent::State {
+        .send(MediaSessionEvent::Status(PlaybackStatus {
             state,
-            current_time,
-        })
+            current_time: snapshot.current_time,
+            duration: snapshot.duration,
+            playback_rate: snapshot.playback_rate,
+            can_pause: snapshot.supported_media_commands & MEDIA_COMMAND_PAUSE != 0,
+            can_seek: snapshot.supported_media_commands & MEDIA_COMMAND_SEEK != 0,
+        }))
         .is_err()
 }
 
@@ -1032,43 +1247,62 @@ mod tests {
     }
 
     #[test]
-    fn emits_state_transitions_and_position_only_poll_updates() {
+    fn emits_every_status_update_and_retains_reported_duration() {
         let (sender, receiver) = mpsc::channel();
-        let mut last_state = None;
-        assert!(!emit_status_entry(
-            status_entry(PlayerState::Buffering, None),
-            &mut last_state,
-            &sender,
-        ));
+        let mut snapshot = BufferedPlaybackSnapshot::default();
+        let mut first = status_entry(PlayerState::Buffering, None);
+        first.media = Some(Media {
+            content_id: "video".to_owned(),
+            stream_type: StreamType::Buffered,
+            content_type: "video/mp4".to_owned(),
+            hls_segment_format: None,
+            hls_video_segment_format: None,
+            metadata: None,
+            duration: Some(90.0),
+        });
+        assert!(!emit_status_entry(first, &mut snapshot, &sender));
         assert_eq!(
             receiver.recv().unwrap(),
-            MediaSessionEvent::State {
+            MediaSessionEvent::Status(PlaybackStatus {
                 state: PlaybackState::Buffering,
                 current_time: Some(12.5),
-            }
+                duration: Some(90.0),
+                playback_rate: 1.0,
+                can_pause: true,
+                can_seek: true,
+            })
         );
 
-        assert!(!emit_status_entry(
-            status_entry(PlayerState::Buffering, None),
-            &mut last_state,
-            &sender,
-        ));
+        let mut second = status_entry(PlayerState::Buffering, None);
+        second.current_time = Some(13.0);
+        assert!(!emit_status_entry(second, &mut snapshot, &sender));
         assert_eq!(
             receiver.recv().unwrap(),
-            MediaSessionEvent::Position { current_time: 12.5 }
+            MediaSessionEvent::Status(PlaybackStatus {
+                state: PlaybackState::Buffering,
+                current_time: Some(13.0),
+                duration: Some(90.0),
+                playback_rate: 1.0,
+                can_pause: true,
+                can_seek: true,
+            })
         );
 
         assert!(!emit_status_entry(
             status_entry(PlayerState::Playing, None),
-            &mut last_state,
+            &mut snapshot,
             &sender,
         ));
         assert_eq!(
             receiver.recv().unwrap(),
-            MediaSessionEvent::State {
+            MediaSessionEvent::Status(PlaybackStatus {
                 state: PlaybackState::Playing,
                 current_time: Some(12.5),
-            }
+                duration: Some(90.0),
+                playback_rate: 1.0,
+                can_pause: true,
+                can_seek: true,
+            })
         );
     }
 
@@ -1089,9 +1323,10 @@ mod tests {
             ),
         ] {
             let (sender, receiver) = mpsc::channel();
+            let mut snapshot = BufferedPlaybackSnapshot::default();
             assert!(emit_status_entry(
                 status_entry(PlayerState::Idle, Some(reason)),
-                &mut None,
+                &mut snapshot,
                 &sender,
             ));
             assert_eq!(receiver.recv().unwrap(), expected);
@@ -1106,6 +1341,7 @@ mod tests {
             start_at: 12.0,
             duration: Some(90.0),
             fmp4_hls: true,
+            interactive: false,
         });
         assert_eq!(media.stream_type, StreamType::Buffered);
         assert_eq!(media.duration, Some(90.0));
@@ -1114,6 +1350,27 @@ mod tests {
             media.hls_video_segment_format,
             Some(HlsVideoSegmentFormat::Fmp4)
         );
+    }
+
+    #[test]
+    fn relative_seek_targets_are_clamped_to_media_bounds() {
+        assert_eq!(seek_target(5.0, -10.0, Some(100.0)), 0.0);
+        assert_eq!(seek_target(50.0, 10.0, Some(100.0)), 60.0);
+        assert_eq!(seek_target(80.0, 60.0, Some(100.0)), 100.0);
+        assert_eq!(seek_target(80.0, 60.0, None), 140.0);
+    }
+
+    #[test]
+    fn seeking_preserves_the_current_play_pause_state() {
+        assert_eq!(
+            seek_resume_state(Some(PlaybackState::Playing)),
+            Some(ResumeState::PlaybackStart)
+        );
+        assert_eq!(
+            seek_resume_state(Some(PlaybackState::Paused)),
+            Some(ResumeState::PlaybackPause)
+        );
+        assert_eq!(seek_resume_state(Some(PlaybackState::Buffering)), None);
     }
 
     #[test]

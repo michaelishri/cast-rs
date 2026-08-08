@@ -88,8 +88,17 @@ cast video \
 ```
 
 Keep Cast running while the video plays. The Chromecast fetches the file directly from the Mac,
-so both devices must remain on the same reachable network. Press `Ctrl-C` to stop playback, close
-the Cast session, and return the receiver to its home screen.
+so both devices must remain on the same reachable network. In a terminal, Cast shows playback
+progress and accepts these controls without requiring Enter:
+
+- Left/Right: seek backward/forward 10 seconds;
+- Down/Up: seek backward/forward 60 seconds;
+- Space: pause or resume;
+- Escape or `Ctrl-C`: stop playback, close the Cast session, and return the receiver to its home
+  screen.
+
+Seeking while paused leaves the video paused. Interactive controls are disabled with `-v` or `-vv`
+and when input or output is redirected, so diagnostic and scripted output remains line-oriented.
 
 Begin at a particular position, in seconds:
 

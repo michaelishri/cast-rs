@@ -12,6 +12,7 @@ repository = "https://github.com/michaelishri/cast-rs"
 aes = "0.8"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
 ctrlc = "3.5"
 ctr = "0.9"
 env_logger = "0.11"
