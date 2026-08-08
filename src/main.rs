@@ -1,3 +1,4 @@
+mod audio;
 mod capture;
 mod cast;
 mod discovery;
@@ -173,6 +174,9 @@ enum Command {
         /// Create one temporary extended display per receiver using an experimental private macOS API.
         #[arg(long, conflicts_with = "display")]
         extend: bool,
+        /// Include system and application audio (microphone audio is never captured).
+        #[arg(long)]
+        audio: bool,
         /// Receiver playout buffer for the mirroring transport, in milliseconds.
         #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..=5000))]
         target_delay_ms: u64,
@@ -372,6 +376,7 @@ fn main() -> Result<()> {
                 max_frame_age: max_frame_age_ms.map(Duration::from_millis),
                 adaptive_bitrate: !fixed_bitrate,
                 prioritize_encoding_speed: !quality_priority,
+                audio: false,
             },
             auto_tune,
         )?,
@@ -381,6 +386,7 @@ fn main() -> Result<()> {
             transport,
             display,
             extend,
+            audio,
             target_delay_ms,
             http_port,
             fps,
@@ -412,6 +418,7 @@ fn main() -> Result<()> {
                     max_frame_age: max_frame_age_ms.map(Duration::from_millis),
                     adaptive_bitrate: !fixed_bitrate,
                     prioritize_encoding_speed: !quality_priority,
+                    audio,
                 })?;
             }
             DesktopTransport::Hls => {
@@ -432,6 +439,7 @@ fn main() -> Result<()> {
                     bitrate,
                     duration: seconds.map(Duration::from_secs),
                     serve_only,
+                    audio,
                 })?;
             }
         },
@@ -496,7 +504,7 @@ fn write_row<T: AsRef<str>>(output: &mut String, row: &[T], widths: &[usize]) {
 }
 
 #[cfg(test)]
-mod tests {
+mod device_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{discovery, format_devices};
@@ -569,6 +577,16 @@ mod tests {
         let cli =
             Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--extend"]).unwrap();
         assert!(matches!(cli.command, Command::Desktop { extend: true, .. }));
+    }
+
+    #[test]
+    fn desktop_audio_is_opt_in() {
+        let cli =
+            Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--audio"]).unwrap();
+        assert!(matches!(cli.command, Command::Desktop { audio: true, .. }));
+
+        let cli = Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1"]).unwrap();
+        assert!(matches!(cli.command, Command::Desktop { audio: false, .. }));
     }
 
     #[test]
