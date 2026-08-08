@@ -20,8 +20,8 @@ use crossterm::{
 
 use crate::{
     cast::{
-        BufferedMediaSession, MediaControl, MediaFailure, MediaFailureKind, MediaSessionEvent,
-        PlaybackEnd, PlaybackState, PlaybackStatus,
+        BufferedMediaDescription, BufferedMediaSession, MediaControl, MediaFailure,
+        MediaFailureKind, MediaSessionEvent, PlaybackEnd, PlaybackState, PlaybackStatus,
     },
     media::{self, CompatibilityMode, PreparationPlan},
     media_server::MediaFileServer,
@@ -76,6 +76,7 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("could not resolve local video {}", options.file.display()))?;
     let media_name = display_file_name(&path);
+    let media_title = display_video_title(&path);
     let source_file = File::open(&path)
         .with_context(|| format!("could not open local video {}", path.display()))?;
     let metadata = source_file
@@ -246,7 +247,10 @@ pub fn cast_video(options: VideoOptions) -> Result<()> {
         url,
         content_type,
         options.start_at,
-        media_duration,
+        BufferedMediaDescription {
+            title: media_title,
+            duration: media_duration,
+        },
         options.interactive,
     )?;
     let playback = monitor_playback(
@@ -331,13 +335,17 @@ fn cast_incremental_video(
     let url = preparation.url();
     println!("Incremental stream ready at {url}");
     let media_name = display_file_name(path);
+    let media_title = display_video_title(path);
 
     let mut session = BufferedMediaSession::start_fmp4_hls(
         target.cast_host,
         target.cast_port,
         url,
         target.start_at,
-        info.duration,
+        BufferedMediaDescription {
+            title: media_title,
+            duration: info.duration,
+        },
         target.interactive,
     )?;
     let playback = monitor_playback(
@@ -968,10 +976,19 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn display_file_name(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
+    sanitized_path_name(path.file_name().unwrap_or(path.as_os_str()))
+}
+
+fn display_video_title(path: &Path) -> String {
+    sanitized_path_name(
+        path.file_stem()
+            .or_else(|| path.file_name())
+            .unwrap_or(path.as_os_str()),
+    )
+}
+
+fn sanitized_path_name(name: &std::ffi::OsStr) -> String {
+    let name = name.to_string_lossy();
     let sanitized: String = name
         .chars()
         .map(|character| {
@@ -1160,10 +1177,16 @@ mod tests {
     #[test]
     fn names_the_connected_video_without_terminal_control_characters() {
         assert_eq!(display_file_name(Path::new("/tmp/video.mp4")), "video.mp4");
+        assert_eq!(display_video_title(Path::new("/tmp/video.mp4")), "video");
+        assert_eq!(
+            display_video_title(Path::new("/tmp/holiday.final.mp4")),
+            "holiday.final"
+        );
         assert_eq!(
             display_file_name(Path::new("/tmp/video\n.mp4")),
             "video�.mp4"
         );
+        assert_eq!(display_video_title(Path::new("/tmp/video\n.mp4")), "video�");
         assert_eq!(
             connected_playing_message("video.mp4"),
             "Connected and playing video.mp4."
