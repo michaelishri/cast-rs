@@ -98,7 +98,10 @@ impl PreparationPlan {
                     format!("H.264/AAC compatibility transcode ({})", reasons.join(", "))
                 }
                 (true, false) => {
-                    format!("H.264 video compatibility transcode ({})", reasons.join(", "))
+                    format!(
+                        "H.264 video compatibility transcode ({})",
+                        reasons.join(", ")
+                    )
                 }
                 (false, true) => format!(
                     "AAC audio transcode with H.264 video copy ({})",
@@ -580,11 +583,8 @@ impl VideoTranscoder {
             if packet.duration() <= 0 {
                 packet.set_duration(1);
             }
-            let (dts, pts) = monotonic_packet_timestamps(
-                packet.dts(),
-                packet.pts(),
-                &mut self.last_output_dts,
-            );
+            let (dts, pts) =
+                monotonic_packet_timestamps(packet.dts(), packet.pts(), &mut self.last_output_dts);
             packet.set_dts(dts);
             packet.set_pts(pts);
             packet.set_position(-1);
@@ -997,11 +997,8 @@ impl CopiedStream {
         output: &mut format::context::Output,
         description: &str,
     ) -> Result<()> {
-        let (dts, pts) = monotonic_packet_timestamps(
-            packet.dts(),
-            packet.pts(),
-            &mut self.last_output_dts,
-        );
+        let (dts, pts) =
+            monotonic_packet_timestamps(packet.dts(), packet.pts(), &mut self.last_output_dts);
         packet.set_dts(dts);
         packet.set_pts(pts);
         self.next_missing_dts = dts.map(|dts| dts.saturating_add(packet.duration().max(1)));
@@ -1031,23 +1028,6 @@ impl CopiedStream {
     }
 }
 
-pub fn transcode_to_mp4(
-    input_path: &Path,
-    output_path: &Path,
-    info: &MediaInfo,
-    cancelled: &AtomicBool,
-    progress: impl FnMut(f64),
-) -> Result<()> {
-    transcode_to_mp4_with_tracks(
-        input_path,
-        output_path,
-        info,
-        TranscodeTracks::all(info.audio.is_some()),
-        cancelled,
-        progress,
-    )
-}
-
 pub fn transcode_to_mp4_with_tracks(
     input_path: &Path,
     output_path: &Path,
@@ -1068,25 +1048,6 @@ pub fn transcode_to_mp4_with_tracks(
         progress,
         &mut output,
         options,
-    )
-}
-
-pub fn transcode_to_hls(
-    input_path: &Path,
-    playlist_path: &Path,
-    segment_pattern: &Path,
-    info: &MediaInfo,
-    cancelled: &AtomicBool,
-    progress: impl FnMut(f64),
-) -> Result<()> {
-    transcode_to_hls_with_tracks(
-        input_path,
-        playlist_path,
-        segment_pattern,
-        info,
-        TranscodeTracks::all(info.audio.is_some()),
-        cancelled,
-        progress,
     )
 }
 
@@ -1345,8 +1306,7 @@ mod tests {
             &media("matroska", codec::Id::HEVC, Some(codec::Id::OPUS)),
             CompatibilityMode::Auto,
         )
-        .unwrap()
-        else {
+        .unwrap() else {
             panic!("incompatible media was not selected for transcoding");
         };
         assert_eq!(tracks, TranscodeTracks::all(true));
@@ -1355,8 +1315,7 @@ mod tests {
     #[test]
     fn transcodes_only_the_incompatible_track() {
         let PreparationPlan::Transcode {
-            tracks: audio_only,
-            ..
+            tracks: audio_only, ..
         } = plan(
             &media("matroska", codec::Id::H264, Some(codec::Id::EAC3)),
             CompatibilityMode::Auto,
@@ -1374,8 +1333,7 @@ mod tests {
         );
 
         let PreparationPlan::Transcode {
-            tracks: video_only,
-            ..
+            tracks: video_only, ..
         } = plan(
             &media("matroska", codec::Id::HEVC, Some(codec::Id::AAC)),
             CompatibilityMode::Auto,
