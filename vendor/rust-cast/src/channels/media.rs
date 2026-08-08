@@ -1759,6 +1759,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_media_status_without_metadata_images() {
+        let message = CastMessage {
+            namespace: CHANNEL_NAMESPACE.to_string(),
+            source: DEFAULT_RECEIVER_ID.to_string(),
+            destination: DEFAULT_SENDER_ID.to_string(),
+            payload: CastMessagePayload::String(
+                r#"{
+                    "requestId": 0,
+                    "status": [{
+                        "currentTime": 0.0,
+                        "disableStreamGrouping": true,
+                        "media": {
+                            "contentId": "",
+                            "contentType": "video/webm",
+                            "metadata": {
+                                "metadataType": 0,
+                                "title": "Chrome tab casting"
+                            },
+                            "streamType": "LIVE"
+                        },
+                        "mediaSessionId": 0,
+                        "playbackRate": 1.0,
+                        "playerState": "PLAYING",
+                        "supportedMediaCommands": 0,
+                        "volume": {
+                            "level": 1.0,
+                            "muted": false
+                        }
+                    }],
+                    "type": "MEDIA_STATUS"
+                }"#
+                .to_owned(),
+            ),
+        };
+        let channel = MediaChannel {
+            sender: Cow::from(DEFAULT_SENDER_ID),
+            message_manager: Lrc::new(MessageManager::new(MockTcpStream::new())),
+        };
+
+        let MediaResponse::Status(status) = channel.parse(&message).unwrap() else {
+            panic!("expected a media status response");
+        };
+        let entry = status.entries.first().expect("expected one status entry");
+        let Some(Metadata::Generic(metadata)) = entry
+            .media
+            .as_ref()
+            .and_then(|media| media.metadata.as_ref())
+        else {
+            panic!("expected generic media metadata");
+        };
+
+        assert_eq!(metadata.title.as_deref(), Some("Chrome tab casting"));
+        assert!(metadata.images.is_empty());
+    }
+
+    #[test]
     fn test_stop_without_wait_sends_stop_request_without_reading() {
         let stream = MockTcpStream::new();
         let channel = MediaChannel {

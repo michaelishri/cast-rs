@@ -220,6 +220,7 @@ pub mod media {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub composer: Option<String>,
 
+        #[serde(default)]
         pub images: Vec<Image>,
 
         #[serde(skip_serializing_if = "Option::is_none", rename = "releaseDate")]
