@@ -363,6 +363,7 @@ struct PipeWireAudioData {
     capture_epoch: CaptureEpoch,
     failure: Arc<Mutex<Option<String>>>,
     startup: Option<mpsc::Sender<Result<(), String>>>,
+    started: Arc<AtomicBool>,
 }
 
 pub(crate) struct PipeWireAudioCapture {
@@ -392,6 +393,7 @@ impl PipeWireAudioCapture {
                     &thread_stop,
                     Arc::clone(&thread_failure),
                     startup_tx,
+                    Arc::clone(&thread_started),
                 ) {
                     let message = format!("{error:#}");
                     if thread_started.load(Ordering::SeqCst) {
@@ -452,6 +454,7 @@ fn run_pipewire_audio(
     stop: &Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     startup: mpsc::Sender<Result<(), String>>,
+    started: Arc<AtomicBool>,
 ) -> Result<()> {
     pw::init();
     let mainloop =
@@ -481,27 +484,15 @@ fn run_pipewire_audio(
             capture_epoch,
             failure: Arc::clone(&failure),
             startup: Some(startup),
+            started,
         })
-        .state_changed(move |_, data, _, state| match state {
-            pw::stream::StreamState::Streaming => {
-                if let Some(startup) = data.startup.take() {
-                    let _ = startup.send(Ok(()));
-                }
-            }
-            pw::stream::StreamState::Error(message) => {
-                if let Some(startup) = data.startup.take() {
-                    let _ = startup.send(Err(message.clone()));
-                } else {
-                    store_failure(
-                        &data.failure,
-                        &format!("PipeWire audio stream error: {message}"),
-                    );
-                }
+        .state_changed(move |_, data, _, state| {
+            if let pw::stream::StreamState::Error(message) = state {
+                report_stream_error(&mut data.startup, &data.started, &data.failure, &message);
                 if let Some(mainloop) = loop_for_state.upgrade() {
                     mainloop.quit();
                 }
             }
-            _ => {}
         })
         .param_changed(|_, data, id, param| {
             let Some(param) = param else { return };
@@ -534,6 +525,10 @@ fn run_pipewire_audio(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            if let Some(startup) = data.startup.take() {
+                data.started.store(true, Ordering::SeqCst);
+                let _ = startup.send(Ok(()));
+            }
             if let Err(error) = copy_pipewire_audio(&mut buffer, data) {
                 store_failure(
                     &data.failure,
@@ -576,6 +571,19 @@ fn run_pipewire_audio(
     stream
         .disconnect()
         .context("could not disconnect the PipeWire audio stream")
+}
+
+fn report_stream_error(
+    startup: &mut Option<mpsc::Sender<Result<(), String>>>,
+    started: &AtomicBool,
+    failure: &Mutex<Option<String>>,
+    message: &str,
+) {
+    if let Some(startup) = startup.take() {
+        let _ = startup.send(Err(message.to_owned()));
+    } else if started.load(Ordering::SeqCst) {
+        store_failure(failure, &format!("PipeWire audio stream error: {message}"));
+    }
 }
 
 fn audio_format_parameter() -> Result<Vec<u8>> {
@@ -844,6 +852,35 @@ mod tests {
         assert_eq!(
             failure.into_inner().unwrap().as_deref(),
             Some("encoder stopped")
+        );
+    }
+
+    #[test]
+    fn startup_stream_errors_do_not_leak_into_runtime_failure_state() {
+        let (startup_tx, startup_rx) = mpsc::channel();
+        let mut startup = Some(startup_tx);
+        let started = AtomicBool::new(false);
+        let failure = Mutex::new(None);
+
+        report_stream_error(&mut startup, &started, &failure, "no target node available");
+        assert_eq!(
+            startup_rx.recv().unwrap().unwrap_err(),
+            "no target node available"
+        );
+        report_stream_error(&mut startup, &started, &failure, "disconnected");
+        assert!(failure.into_inner().unwrap().is_none());
+    }
+
+    #[test]
+    fn running_stream_errors_reach_runtime_failure_state() {
+        let mut startup = None;
+        let started = AtomicBool::new(true);
+        let failure = Mutex::new(None);
+
+        report_stream_error(&mut startup, &started, &failure, "disconnected");
+        assert_eq!(
+            failure.into_inner().unwrap().as_deref(),
+            Some("PipeWire audio stream error: disconnected")
         );
     }
 }
