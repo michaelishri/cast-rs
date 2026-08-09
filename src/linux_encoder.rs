@@ -395,10 +395,16 @@ fn open_encoder_named(name: &'static str, config: OpenEncoderConfig) -> Result<O
 
 fn encoder_options(name: &str, priority: EncodingPriority) -> Dictionary<'static> {
     let mut options = Dictionary::new();
-    // Cast receivers are offered Baseline profile in both RTSP and HLS. Keep the
-    // encoded SPS consistent with that offer; in particular, OpenH264 rejects
-    // FFmpeg's numeric constrained-baseline profile but accepts baseline.
-    options.set("profile", "baseline");
+    // Cast receivers are offered Baseline profile in both RTSP and HLS. FFmpeg's
+    // provider AVOptions use different names for that profile family.
+    options.set(
+        "profile",
+        if name == "h264_nvenc" {
+            "baseline"
+        } else {
+            "constrained_baseline"
+        },
+    );
     options.set("repeat_headers", "1");
     match name {
         "h264_nvenc" => {
@@ -490,16 +496,19 @@ mod tests {
         let quality_nvenc = encoder_options("h264_nvenc", EncodingPriority::Quality);
         assert_eq!(fast_nvenc.get("preset"), Some("p1"));
         assert_eq!(quality_nvenc.get("preset"), Some("p5"));
+        assert_eq!(fast_nvenc.get("profile"), Some("baseline"));
 
         let fast_vaapi = encoder_options("h264_vaapi", EncodingPriority::Speed);
         let quality_vaapi = encoder_options("h264_vaapi", EncodingPriority::Quality);
         assert_eq!(fast_vaapi.get("quality"), Some("7"));
         assert_eq!(quality_vaapi.get("quality"), Some("1"));
+        assert_eq!(fast_vaapi.get("profile"), Some("constrained_baseline"));
 
         let fast_openh264 = encoder_options("libopenh264", EncodingPriority::Speed);
         let quality_openh264 = encoder_options("libopenh264", EncodingPriority::Quality);
         assert_eq!(fast_openh264.get("rc_mode"), Some("bitrate"));
         assert_eq!(quality_openh264.get("rc_mode"), Some("quality"));
+        assert_eq!(fast_openh264.get("profile"), Some("constrained_baseline"));
         assert_ne!(
             EncodingPriority::Speed.scaler_flags(),
             EncodingPriority::Quality.scaler_flags()
