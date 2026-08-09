@@ -13,7 +13,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -350,6 +350,8 @@ struct App {
     log_scroll: usize,
     regions: Regions,
     last_click: Option<LastClick>,
+    shift_held: bool,
+    shift_hint_until: Option<Instant>,
     quit: bool,
 }
 
@@ -390,6 +392,8 @@ impl App {
             log_scroll: 0,
             regions: Regions::default(),
             last_click: None,
+            shift_held: false,
+            shift_hint_until: None,
             quit: false,
         })
     }
@@ -627,8 +631,24 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+        ) {
+            self.shift_held = key.kind != KeyEventKind::Release;
+            if !self.shift_held {
+                self.shift_hint_until = None;
+            }
+            return;
+        }
         if key.kind == KeyEventKind::Release {
             return;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            self.shift_hint_until = Some(Instant::now() + Duration::from_millis(500));
+        } else {
+            self.shift_held = false;
+            self.shift_hint_until = None;
         }
         if self.help || self.logs_open || self.receiver_picker {
             self.handle_overlay_key(key);
@@ -647,7 +667,7 @@ impl App {
             (KeyCode::Char('?'), _) => self.help = true,
             (KeyCode::Char('l'), _) => self.logs_open = true,
             (KeyCode::Char(' '), _) => self.toggle_playback(),
-            (KeyCode::Char('s'), _) => {
+            (KeyCode::Esc, _) => {
                 self.stop_playback();
                 self.status = "Stopped".to_owned();
             }
@@ -657,7 +677,7 @@ impl App {
                     self.start_current();
                 }
             }
-            (KeyCode::Char('m'), _) => {
+            (KeyCode::Char('m' | 'M'), _) => {
                 if let Some(playback) = &self.playback {
                     let _ = playback.set_muted(!self.volume.muted.unwrap_or(false));
                 }
@@ -727,7 +747,7 @@ impl App {
                 (KeyCode::Delete | KeyCode::Backspace, _) => self.remove_selected(),
                 _ => {}
             },
-            Focus::Player => match player_key_action(key.code) {
+            Focus::Player => match player_key_action(key.code, key.modifiers) {
                 Some(PlayerKeyAction::Seek(seconds)) => self.seek_by(seconds),
                 Some(PlayerKeyAction::Volume(delta)) => self.adjust_volume(delta),
                 None => {}
@@ -855,11 +875,12 @@ impl App {
         if self.regions.transport.contains(point) {
             let offset = point.x.saturating_sub(self.regions.transport.x);
             let action = usize::from(offset) * 6 / usize::from(self.regions.transport.width.max(1));
+            let large_seek = self.show_shift_controls();
             match action {
                 0 => self.previous(),
-                1 => self.seek_by(-10.0),
+                1 => self.seek_by(if large_seek { -60.0 } else { -10.0 }),
                 2 => self.toggle_playback(),
-                3 => self.seek_by(30.0),
+                3 => self.seek_by(if large_seek { 60.0 } else { 10.0 }),
                 4 => {
                     if self.playlist.advance().is_some() {
                         self.start_current();
@@ -939,6 +960,13 @@ impl App {
             at: now,
         });
         double
+    }
+
+    fn show_shift_controls(&self) -> bool {
+        self.shift_held
+            || self
+                .shift_hint_until
+                .is_some_and(|deadline| Instant::now() <= deadline)
     }
 }
 
@@ -1226,7 +1254,11 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         rows[1],
     );
 
-    let controls = "[ previous   ← -10s   Space play/pause   +30s →   ] next   s stop";
+    let controls = if app.show_shift_controls() {
+        "[ previous   ⇧← -60s   Space play/pause   +60s ⇧→   ] next   Esc stop"
+    } else {
+        "[ previous   ← -10s   Space play/pause   +10s →   ] next   Esc stop"
+    };
     app.regions.transport = rows[2];
     frame.render_widget(
         Paragraph::new(controls).alignment(Alignment::Center),
@@ -1303,11 +1335,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(concat!(
             "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs\n",
-            "  Space play/pause  s stop  [/] previous/next  m mute  +/- volume\n\n",
+            "  Space play/pause  Esc stop  [/] previous/next  M mute  +/- volume\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
             "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
-            "Player\n  ← seek -10s  → seek +30s  ↓/↑ volume -/+5%\n\n",
+            "Player\n  ←/→ seek -/+10s  Shift-←/→ seek -/+60s  ↓/↑ volume -/+5%\n\n",
             "Receiver\n  Enter choose receiver  r rescan\n\n",
             "Mouse\n  Click to focus/select, double-click to activate, wheel to scroll,\n",
             "  click progress/volume gauges to set them. Escape closes overlays."
@@ -1442,10 +1474,16 @@ fn supported_video(path: &Path) -> bool {
         })
 }
 
-fn player_key_action(code: KeyCode) -> Option<PlayerKeyAction> {
+fn player_key_action(code: KeyCode, modifiers: KeyModifiers) -> Option<PlayerKeyAction> {
     match code {
+        KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(PlayerKeyAction::Seek(-60.0))
+        }
+        KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(PlayerKeyAction::Seek(60.0))
+        }
         KeyCode::Left => Some(PlayerKeyAction::Seek(-10.0)),
-        KeyCode::Right => Some(PlayerKeyAction::Seek(30.0)),
+        KeyCode::Right => Some(PlayerKeyAction::Seek(10.0)),
         KeyCode::Down => Some(PlayerKeyAction::Volume(-0.05)),
         KeyCode::Up => Some(PlayerKeyAction::Volume(0.05)),
         _ => None,
@@ -1568,21 +1606,29 @@ mod tests {
     }
 
     #[test]
-    fn player_arrows_map_to_asymmetric_seeks_and_volume_steps() {
+    fn player_arrows_map_to_normal_and_shifted_seeks_and_volume_steps() {
         assert_eq!(
-            player_key_action(KeyCode::Left),
+            player_key_action(KeyCode::Left, KeyModifiers::NONE),
             Some(PlayerKeyAction::Seek(-10.0))
         );
         assert_eq!(
-            player_key_action(KeyCode::Right),
-            Some(PlayerKeyAction::Seek(30.0))
+            player_key_action(KeyCode::Right, KeyModifiers::NONE),
+            Some(PlayerKeyAction::Seek(10.0))
         );
         assert_eq!(
-            player_key_action(KeyCode::Down),
+            player_key_action(KeyCode::Left, KeyModifiers::SHIFT),
+            Some(PlayerKeyAction::Seek(-60.0))
+        );
+        assert_eq!(
+            player_key_action(KeyCode::Right, KeyModifiers::SHIFT),
+            Some(PlayerKeyAction::Seek(60.0))
+        );
+        assert_eq!(
+            player_key_action(KeyCode::Down, KeyModifiers::NONE),
             Some(PlayerKeyAction::Volume(-0.05))
         );
         assert_eq!(
-            player_key_action(KeyCode::Up),
+            player_key_action(KeyCode::Up, KeyModifiers::NONE),
             Some(PlayerKeyAction::Volume(0.05))
         );
     }
@@ -1667,6 +1713,63 @@ mod tests {
         app.playlist.enqueue("two.mp4".into());
         app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
         assert!(app.playlist.entries.is_empty());
+    }
+
+    #[test]
+    fn escape_stops_and_s_is_no_longer_a_stop_key() {
+        let directory = tempdir().unwrap();
+        let options = TuiOptions {
+            directory: directory.path().to_owned(),
+            host: Some("192.0.2.1".parse().unwrap()),
+            cast_port: 8009,
+            http_port: 0,
+            compatibility_mode: CompatibilityMode::Auto,
+            transcode_delivery: TranscodeDelivery::Incremental,
+        };
+        let mut app = App::new(options).unwrap();
+        app.focus = Focus::Player;
+        let initial = app.status.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.status, initial);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.status, "Stopped");
+    }
+
+    #[test]
+    fn shifted_seek_hints_are_rendered_only_while_shift_is_active() {
+        let directory = tempdir().unwrap();
+        let options = TuiOptions {
+            directory: directory.path().to_owned(),
+            host: Some("192.0.2.1".parse().unwrap()),
+            cast_port: 8009,
+            http_port: 0,
+            compatibility_mode: CompatibilityMode::Auto,
+            transcode_delivery: TranscodeDelivery::Incremental,
+        };
+        let mut app = App::new(options).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let normal = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(normal.contains("-10s"));
+        assert!(!normal.contains("-60s"));
+
+        app.shift_held = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shifted = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(shifted.contains("-60s"));
+        assert!(!shifted.contains("-10s"));
     }
 
     #[test]
