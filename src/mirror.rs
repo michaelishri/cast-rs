@@ -131,6 +131,8 @@ fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
 
 pub fn cast_desktop(options: MirrorOptions) -> Result<()> {
     validate_cast_hosts(&options.cast_hosts)?;
+    #[cfg(target_os = "linux")]
+    preflight_linux_encoder(&options)?;
     let interrupted = install_interrupt_handler()?;
     if options.extend && options.cast_hosts.len() > 1 {
         run_extended_desktop(
@@ -159,6 +161,8 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
     if options.duration.is_none() {
         bail!("latency profiling requires a fixed duration");
     }
+    #[cfg(target_os = "linux")]
+    preflight_linux_encoder(&options)?;
     let interrupted = install_interrupt_handler()?;
     if auto_tune {
         auto_tune_profile(options, interrupted.as_ref())
@@ -182,6 +186,21 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
         )
         .map(|_| ())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_linux_encoder(options: &MirrorOptions) -> Result<()> {
+    if options.bitrate <= 0 {
+        bail!("bitrate must be greater than zero");
+    }
+    LinuxVideoEncoder::preflight(
+        options.provider,
+        even(options.width),
+        even(options.height),
+        options.fps,
+        options.bitrate as u32,
+    )
+    .context("Linux H.264 provider preflight failed")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -958,6 +977,15 @@ fn run_desktop(
         (true, None) => Some(start_extended_display(width, height, options.fps, 1)?),
         (false, display) => display,
     };
+    #[cfg(target_os = "linux")]
+    if virtual_display.is_none() && !options.synthetic {
+        // Complete the privacy/capability preflight before launching a Cast
+        // receiver. Ownership moves into PipeWireCapture after negotiation.
+        virtual_display = Some(crate::portal::select(
+            PortalSourceKind::Normal,
+            options.select_source,
+        )?);
+    }
     #[cfg(target_os = "macos")]
     if let Some(session) = virtual_display.as_ref() {
         options.display_id = Some(session.display_id());

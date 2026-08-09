@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::Cursor,
+    mem::{align_of, size_of},
     os::{fd::OwnedFd, unix::fs::PermissionsExt},
     path::PathBuf,
     sync::{
@@ -23,7 +24,7 @@ use pw::{properties::properties, spa};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::linux_encoder::RawPixelFormat;
+use crate::{linux_encoder::RawPixelFormat, linux_pipewire::DequeuedBuffer};
 
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_FILE: &str = "screencast-source.json";
@@ -68,12 +69,12 @@ impl PortalCapabilities {
     }
 
     fn cursor_mode(self) -> Result<CursorMode> {
-        if self.cursor_embedded {
+        if self.cursor_metadata {
+            Ok(CursorMode::Metadata)
+        } else if self.cursor_embedded {
             Ok(CursorMode::Embedded)
         } else {
-            bail!(
-                "this desktop portal does not offer embedded cursor capture (metadata-only cursors require a newer PipeWire runtime)"
-            )
+            bail!("this desktop portal offers no supported cursor capture mode")
         }
     }
 }
@@ -205,6 +206,7 @@ pub(crate) struct PortalSelection {
     runtime: Arc<tokio::runtime::Runtime>,
     session: Arc<Session<Screencast>>,
     stream: PortalStream,
+    cursor_mode: CursorMode,
     remote: Option<OwnedFd>,
     closed: Arc<AtomicBool>,
 }
@@ -220,6 +222,10 @@ impl PortalSelection {
 
     pub(crate) fn size(&self) -> Option<(i32, i32)> {
         self.stream.size()
+    }
+
+    fn cursor_mode(&self) -> CursorMode {
+        self.cursor_mode
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -342,6 +348,7 @@ async fn open_selection(
         .await
         .context("could not connect to the XDG ScreenCast portal")?;
     let capabilities = capabilities_with(&portal).await?;
+    let cursor_mode = capabilities.cursor_mode()?;
     let session = Arc::new(
         portal
             .create_session(Default::default())
@@ -352,7 +359,7 @@ async fn open_selection(
         .select_sources(
             &session,
             SelectSourcesOptions::default()
-                .set_cursor_mode(capabilities.cursor_mode()?)
+                .set_cursor_mode(cursor_mode)
                 .set_sources(capabilities.source_types(kind)?)
                 .set_multiple(false)
                 .set_restore_token(restore_token)
@@ -399,6 +406,7 @@ async fn open_selection(
         runtime: Arc::clone(runtime),
         session,
         stream,
+        cursor_mode,
         remote: Some(remote),
         closed,
     })
@@ -445,6 +453,8 @@ struct PipeWireUserData {
     format: spa::param::video::VideoInfoRaw,
     sink: Arc<dyn FrameSink>,
     capture_started: Instant,
+    cursor_metadata: bool,
+    last_cursor: Option<CursorImage>,
     failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -459,6 +469,7 @@ impl PipeWireCapture {
     pub(crate) fn start(mut selection: PortalSelection, sink: Arc<dyn FrameSink>) -> Result<Self> {
         let remote = selection.take_remote()?;
         let node_id = selection.node_id();
+        let cursor_metadata = selection.cursor_mode() == CursorMode::Metadata;
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let thread_stop = Arc::clone(&stop);
@@ -471,6 +482,7 @@ impl PipeWireCapture {
                     remote,
                     node_id,
                     sink,
+                    cursor_metadata,
                     &thread_stop,
                     &portal_closed,
                     Arc::clone(&thread_failure),
@@ -524,6 +536,7 @@ fn run_pipewire(
     remote: OwnedFd,
     node_id: u32,
     sink: Arc<dyn FrameSink>,
+    cursor_metadata: bool,
     stop: &Arc<AtomicBool>,
     portal_closed: &Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
@@ -552,6 +565,8 @@ fn run_pipewire(
             format: Default::default(),
             sink,
             capture_started: Instant::now(),
+            cursor_metadata,
+            last_cursor: None,
             failure: Arc::clone(&failure),
         })
         .state_changed(move |_, user_data, _, state| {
@@ -591,7 +606,7 @@ fn run_pipewire(
             }
         })
         .process(|stream, user_data| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            let Some(mut buffer) = DequeuedBuffer::dequeue(stream) else {
                 return;
             };
             if let Err(error) = copy_pipewire_frame(&mut buffer, user_data) {
@@ -679,7 +694,7 @@ fn video_format_parameter() -> Result<Vec<u8>> {
 }
 
 fn copy_pipewire_frame(
-    buffer: &mut pw::buffer::Buffer<'_>,
+    buffer: &mut DequeuedBuffer<'_>,
     user_data: &mut PipeWireUserData,
 ) -> Result<()> {
     let size = user_data.format.size();
@@ -689,6 +704,12 @@ fn copy_pipewire_frame(
         return Ok(());
     }
     let format = raw_pixel_format(user_data.format.format())?;
+    if user_data.cursor_metadata {
+        update_cursor_metadata(
+            buffer.metadata(spa::sys::SPA_META_Cursor),
+            &mut user_data.last_cursor,
+        )?;
+    }
     let timestamp = u64::try_from(user_data.capture_started.elapsed().as_nanos())
         .unwrap_or(u64::MAX)
         .saturating_mul(90_000)
@@ -721,9 +742,96 @@ fn copy_pipewire_frame(
         height,
         format,
         timestamp,
-        cursor: None,
+        cursor: user_data
+            .cursor_metadata
+            .then_some(user_data.last_cursor.clone())
+            .flatten(),
     });
     Ok(())
+}
+
+fn update_cursor_metadata(
+    metadata: Option<&[u8]>,
+    current: &mut Option<CursorImage>,
+) -> Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let cursor = metadata_struct::<spa::sys::spa_meta_cursor>(metadata, 0, "cursor")?;
+    if cursor.id == 0 {
+        return Ok(());
+    }
+    let position = (cursor.position.x, cursor.position.y);
+    let hotspot = (cursor.hotspot.x, cursor.hotspot.y);
+    if cursor.bitmap_offset == 0 {
+        if let Some(image) = current {
+            image.position = position;
+            image.hotspot = hotspot;
+        }
+        return Ok(());
+    }
+    let bitmap_offset = usize::try_from(cursor.bitmap_offset)?;
+    if bitmap_offset < size_of::<spa::sys::spa_meta_cursor>() {
+        bail!("PipeWire cursor bitmap overlaps its cursor metadata");
+    }
+    let bitmap =
+        metadata_struct::<spa::sys::spa_meta_bitmap>(metadata, bitmap_offset, "cursor bitmap")?;
+    if bitmap.format == 0 {
+        if let Some(image) = current {
+            image.position = position;
+            image.hotspot = hotspot;
+        }
+        return Ok(());
+    }
+    if bitmap.offset == 0 {
+        *current = None;
+        return Ok(());
+    }
+    let width = bitmap.size.width;
+    let height = bitmap.size.height;
+    let stride = usize::try_from(bitmap.stride.unsigned_abs())?;
+    let minimum_stride = usize::try_from(width)?.saturating_mul(4);
+    if width == 0 || height == 0 || stride < minimum_stride {
+        bail!("PipeWire cursor bitmap has invalid dimensions or stride");
+    }
+    let pixel_offset = bitmap_offset
+        .checked_add(usize::try_from(bitmap.offset)?)
+        .ok_or_else(|| anyhow!("PipeWire cursor bitmap offset overflowed"))?;
+    let pixel_length = stride
+        .checked_mul(usize::try_from(height)?)
+        .ok_or_else(|| anyhow!("PipeWire cursor bitmap size overflowed"))?;
+    let pixel_end = pixel_offset
+        .checked_add(pixel_length)
+        .ok_or_else(|| anyhow!("PipeWire cursor bitmap range overflowed"))?;
+    let pixels = metadata
+        .get(pixel_offset..pixel_end)
+        .ok_or_else(|| anyhow!("PipeWire cursor bitmap exceeds its metadata buffer"))?
+        .to_vec();
+    *current = Some(CursorImage {
+        position,
+        hotspot,
+        width,
+        height,
+        stride,
+        format: raw_pixel_format(spa::param::video::VideoFormat::from_raw(bitmap.format))?,
+        pixels,
+    });
+    Ok(())
+}
+
+fn metadata_struct<'a, T>(metadata: &'a [u8], offset: usize, label: &str) -> Result<&'a T> {
+    let end = offset
+        .checked_add(size_of::<T>())
+        .ok_or_else(|| anyhow!("PipeWire {label} metadata range overflowed"))?;
+    let bytes = metadata
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("PipeWire {label} metadata is truncated"))?;
+    if !(bytes.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
+        bail!("PipeWire {label} metadata is misaligned");
+    }
+    // SAFETY: The range and alignment were validated above. SPA metadata is a
+    // C allocation containing the requested plain-old-data structure.
+    Ok(unsafe { &*bytes.as_ptr().cast::<T>() })
 }
 
 fn raw_pixel_format(format: spa::param::video::VideoFormat) -> Result<RawPixelFormat> {
@@ -833,19 +941,116 @@ mod tests {
                 .source_types(PortalSourceKind::Virtual)
                 .is_err()
         );
-        assert_eq!(capabilities.cursor_mode().unwrap(), CursorMode::Embedded);
+        assert_eq!(capabilities.cursor_mode().unwrap(), CursorMode::Metadata);
 
-        let metadata_only = PortalCapabilities {
+        let embedded_only = PortalCapabilities {
+            cursor_metadata: false,
+            ..capabilities
+        };
+        assert_eq!(embedded_only.cursor_mode().unwrap(), CursorMode::Embedded);
+
+        let no_cursor = PortalCapabilities {
+            cursor_metadata: false,
             cursor_embedded: false,
             ..capabilities
         };
-        assert!(
-            metadata_only
-                .cursor_mode()
-                .unwrap_err()
-                .to_string()
-                .contains("embedded cursor capture")
-        );
+        assert!(no_cursor.cursor_mode().is_err());
+    }
+
+    #[test]
+    fn cursor_metadata_updates_bitmap_and_position_safely() {
+        #[repr(C)]
+        struct CursorFixture {
+            cursor: spa::sys::spa_meta_cursor,
+            bitmap: spa::sys::spa_meta_bitmap,
+            pixels: [u8; 16],
+        }
+
+        let bitmap_offset = std::mem::offset_of!(CursorFixture, bitmap);
+        let pixel_offset = std::mem::offset_of!(CursorFixture, pixels) - bitmap_offset;
+        let fixture = CursorFixture {
+            cursor: spa::sys::spa_meta_cursor {
+                id: 1,
+                flags: 0,
+                position: spa::sys::spa_point { x: 4, y: 5 },
+                hotspot: spa::sys::spa_point { x: 1, y: 1 },
+                bitmap_offset: bitmap_offset as u32,
+            },
+            bitmap: spa::sys::spa_meta_bitmap {
+                format: spa::param::video::VideoFormat::BGRA.as_raw(),
+                size: spa::sys::spa_rectangle {
+                    width: 2,
+                    height: 2,
+                },
+                stride: 8,
+                offset: pixel_offset as u32,
+            },
+            pixels: [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        };
+        // SAFETY: The fixture is repr(C), alive for the slice lifetime, and the
+        // byte length covers the complete allocation.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&fixture).cast::<u8>(),
+                size_of::<CursorFixture>(),
+            )
+        };
+        let mut current = None;
+        update_cursor_metadata(Some(bytes), &mut current).unwrap();
+        let image = current.as_ref().unwrap();
+        assert_eq!(image.position, (4, 5));
+        assert_eq!(image.hotspot, (1, 1));
+        assert_eq!((image.width, image.height, image.stride), (2, 2, 8));
+        assert_eq!(image.format, RawPixelFormat::Bgra);
+        assert_eq!(image.pixels, fixture.pixels);
+
+        let moved = spa::sys::spa_meta_cursor {
+            id: 1,
+            flags: 0,
+            position: spa::sys::spa_point { x: 8, y: 9 },
+            hotspot: spa::sys::spa_point { x: 2, y: 3 },
+            bitmap_offset: 0,
+        };
+        // SAFETY: `moved` is alive, correctly aligned, and represented by the
+        // exact size of the C metadata structure.
+        let moved_bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&moved).cast::<u8>(),
+                size_of::<spa::sys::spa_meta_cursor>(),
+            )
+        };
+        update_cursor_metadata(Some(moved_bytes), &mut current).unwrap();
+        let image = current.as_ref().unwrap();
+        assert_eq!(image.position, (8, 9));
+        assert_eq!(image.hotspot, (2, 3));
+        assert_eq!(image.pixels, fixture.pixels);
+
+        let unchanged = spa::sys::spa_meta_cursor { id: 0, ..moved };
+        // SAFETY: `unchanged` is alive and represented by the exact size of the
+        // C metadata structure.
+        let unchanged_bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&unchanged).cast::<u8>(),
+                size_of::<spa::sys::spa_meta_cursor>(),
+            )
+        };
+        update_cursor_metadata(Some(unchanged_bytes), &mut current).unwrap();
+        assert_eq!(current.as_ref().unwrap().position, (8, 9));
+
+        let mut hidden = fixture;
+        hidden.cursor.position = spa::sys::spa_point { x: 10, y: 11 };
+        hidden.bitmap.offset = 0;
+        // SAFETY: `hidden` is repr(C), alive for the slice lifetime, and the
+        // byte length covers the complete allocation.
+        let hidden_bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&hidden).cast::<u8>(),
+                size_of::<CursorFixture>(),
+            )
+        };
+        update_cursor_metadata(Some(hidden_bytes), &mut current).unwrap();
+        assert!(current.is_none());
+        assert!(update_cursor_metadata(Some(&[0; 4]), &mut current).is_err());
     }
 
     #[test]

@@ -105,6 +105,26 @@ pub(crate) struct LinuxVideoEncoder {
 }
 
 impl LinuxVideoEncoder {
+    pub(crate) fn preflight(
+        provider: H264Provider,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<()> {
+        open_encoder(
+            provider,
+            width,
+            height,
+            width,
+            height,
+            fps,
+            bitrate,
+            ffmpeg::format::Pixel::BGRA,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn new(
         provider: H264Provider,
         width: u32,

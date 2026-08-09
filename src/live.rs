@@ -90,6 +90,15 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
     #[cfg(target_os = "linux")]
+    LinuxVideoEncoder::preflight(
+        options.provider,
+        even(options.width),
+        even(options.height),
+        options.fps,
+        options.bitrate as u32,
+    )
+    .context("Linux H.264 provider preflight failed")?;
+    #[cfg(target_os = "linux")]
     let prepared_audio = if options.audio {
         match audio::prepare() {
             Ok(encoder) => Some(encoder),

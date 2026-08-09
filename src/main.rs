@@ -11,6 +11,8 @@ mod linux_audio;
 mod linux_desktop;
 #[cfg(target_os = "linux")]
 mod linux_encoder;
+#[cfg(target_os = "linux")]
+mod linux_pipewire;
 mod live;
 mod media;
 mod media_server;
