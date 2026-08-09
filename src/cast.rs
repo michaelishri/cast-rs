@@ -266,7 +266,11 @@ impl BufferedMediaSession {
         let thread = thread::Builder::new()
             .name("cast-buffered-cast-control".into())
             .spawn(move || {
-                eprintln!("Connecting to Cast receiver at {host}:{port}...");
+                log::debug!("Connecting to Cast receiver at {host}:{port}...");
+                if let Some(notice) = buffered_connection_notice(host, port, media_load.interactive)
+                {
+                    eprintln!("{notice}");
+                }
                 let device = match CastDevice::connect_without_host_verification_timeout(
                     host.to_string(),
                     port,
@@ -899,6 +903,10 @@ fn run_buffered_media_session(
             );
         }
     }
+}
+
+fn buffered_connection_notice(host: IpAddr, port: u16, interactive: bool) -> Option<String> {
+    (!interactive).then(|| format!("Connecting to Cast receiver at {host}:{port}..."))
 }
 
 fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
@@ -1988,6 +1996,16 @@ mod tests {
         let options = buffered_load_options(&load);
         assert_eq!(options.current_time, Some(42.0));
         assert!(!options.autoplay);
+    }
+
+    #[test]
+    fn buffered_connection_notice_is_hidden_only_for_interactive_output() {
+        let host = "192.0.2.1".parse().unwrap();
+        assert_eq!(buffered_connection_notice(host, 8009, true), None);
+        assert_eq!(
+            buffered_connection_notice(host, 8009, false).as_deref(),
+            Some("Connecting to Cast receiver at 192.0.2.1:8009...")
+        );
     }
 
     #[test]
