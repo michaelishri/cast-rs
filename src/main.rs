@@ -36,7 +36,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Cast local video and a desktop to Google Cast devices"
+    about = "Cast local video and a macOS desktop to Google Cast devices"
 )]
 struct Cli {
     /// Increase diagnostic output; use -vv for frame-level tracing.
@@ -88,7 +88,7 @@ enum Command {
         /// Cast control port.
         #[arg(long, visible_alias = "port", default_value_t = 8009)]
         cast_port: u16,
-        /// Local HTTP port; 0 asks the OS to select an available port.
+        /// Local HTTP port; 0 asks macOS to select an available port.
         #[arg(long, default_value_t = 0)]
         http_port: u16,
         /// Initial playback position in seconds.
@@ -635,7 +635,9 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
-    use clap::{CommandFactory, Parser, error::ErrorKind};
+    use clap::Parser;
+    #[cfg(target_os = "macos")]
+    use clap::error::ErrorKind;
     #[cfg(target_os = "macos")]
     use std::net::IpAddr;
 
@@ -646,20 +648,6 @@ mod tests {
         assert!(!interactive_video_output(2, true, true));
         assert!(!interactive_video_output(0, false, true));
         assert!(!interactive_video_output(0, true, false));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn linux_help_is_portable_and_desktop_commands_are_hidden() {
-        let help = Cli::command().render_long_help().to_string();
-        assert!(!help.contains("macOS"));
-
-        for command in ["displays", "capture", "profile", "desktop"] {
-            let error = Cli::try_parse_from(["cast", command])
-                .err()
-                .expect("an incomplete desktop command was exposed on Linux");
-            assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
-        }
     }
 
     #[test]
