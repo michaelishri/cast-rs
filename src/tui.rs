@@ -35,6 +35,7 @@ use crate::{
     discovery::{self, CastService, DeviceCapability, DiscoveryEvent, DiscoverySession},
     media::CompatibilityMode,
     playback::{PlaybackEvent, PlaybackHandle, PlaybackOptions, PreparationStage},
+    system_volume::{SystemVolumeEvent, SystemVolumeMonitor},
     video::TranscodeDelivery,
 };
 
@@ -70,7 +71,6 @@ enum Focus {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PlayerKeyAction {
     Seek(f32),
-    Volume(f32),
 }
 
 impl Focus {
@@ -343,6 +343,7 @@ struct App {
     playback: Option<PlaybackHandle>,
     playback_status: Option<(PlaybackStatus, Instant)>,
     volume: ReceiverVolume,
+    system_volume: SystemVolumeMonitor,
     preparation: Option<(PreparationStage, Option<f64>)>,
     status: String,
     help: bool,
@@ -385,6 +386,7 @@ impl App {
             playback: None,
             playback_status: None,
             volume: ReceiverVolume::default(),
+            system_volume: SystemVolumeMonitor::start()?,
             preparation: None,
             status: "Select a video and press Enter to enqueue it".to_owned(),
             help: false,
@@ -408,6 +410,22 @@ impl App {
         }
         self.poll_discovery();
         self.poll_playback();
+        self.poll_system_volume();
+    }
+
+    fn poll_system_volume(&mut self) {
+        for event in self.system_volume.drain_events(8) {
+            let Some(playback) = &self.playback else {
+                continue;
+            };
+            let result = match event {
+                SystemVolumeEvent::Volume(level) => playback.set_volume(level),
+                SystemVolumeEvent::Muted(muted) => playback.set_muted(muted),
+            };
+            if let Err(error) = result {
+                self.status = format!("Receiver volume control failed: {error:#}");
+            }
+        }
     }
 
     fn poll_discovery(&mut self) {
@@ -655,6 +673,10 @@ impl App {
             self.handle_overlay_key(key);
             return;
         }
+        if let Some(PlayerKeyAction::Seek(seconds)) = player_key_action(key.code, key.modifiers) {
+            self.seek_by(seconds);
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true
@@ -667,6 +689,7 @@ impl App {
             (KeyCode::Tab, _) => self.focus = self.focus.next(),
             (KeyCode::Char('?'), _) => self.help = true,
             (KeyCode::Char('l'), _) => self.logs_open = true,
+            (KeyCode::Char('c' | 'C'), _) => self.receiver_picker = true,
             (KeyCode::Char(' '), _) => self.toggle_playback(),
             (KeyCode::Esc, _) => {
                 self.stop_playback();
@@ -748,11 +771,7 @@ impl App {
                 (KeyCode::Delete | KeyCode::Backspace, _) => self.remove_selected(),
                 _ => {}
             },
-            Focus::Player => match player_key_action(key.code, key.modifiers) {
-                Some(PlayerKeyAction::Seek(seconds)) => self.seek_by(seconds),
-                Some(PlayerKeyAction::Volume(delta)) => self.adjust_volume(delta),
-                None => {}
-            },
+            Focus::Player => {}
             Focus::Receiver => match key.code {
                 KeyCode::Enter => self.receiver_picker = true,
                 KeyCode::Char('r') => self.rescan(),
@@ -1323,7 +1342,7 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
     } else {
         frame.render_widget(
-            Paragraph::new("? help   l logs   Tab focus   q quit")
+            Paragraph::new("? help   c receiver   l logs   Tab focus   q quit")
                 .style(Style::default().fg(Color::DarkGray)),
             rows[4],
         );
@@ -1335,12 +1354,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(concat!(
-            "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs\n",
-            "  Space play/pause  Esc stop  [/] previous/next  M mute  +/- volume\n\n",
+            "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs  c receiver\n",
+            "  Space play/pause  Esc stop  [/] previous/next  M mute  +/- volume\n",
+            "  ←/→ seek -/+10s  Shift-←/→ seek -/+60s  macOS volume keys control receiver\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
             "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
-            "Player\n  ←/→ seek -/+10s  Shift-←/→ seek -/+60s  ↓/↑ volume -/+5%\n\n",
+            "Player\n  Transport controls remain active while any section is focused\n\n",
             "Receiver\n  Enter choose receiver  r rescan\n\n",
             "Mouse\n  Click to focus/select, double-click to activate, wheel to scroll,\n",
             "  click progress/volume gauges to set them. Escape closes overlays."
@@ -1485,8 +1505,6 @@ fn player_key_action(code: KeyCode, modifiers: KeyModifiers) -> Option<PlayerKey
         }
         KeyCode::Left => Some(PlayerKeyAction::Seek(-10.0)),
         KeyCode::Right => Some(PlayerKeyAction::Seek(10.0)),
-        KeyCode::Down => Some(PlayerKeyAction::Volume(-0.05)),
-        KeyCode::Up => Some(PlayerKeyAction::Volume(0.05)),
         _ => None,
     }
 }
@@ -1607,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn player_arrows_map_to_normal_and_shifted_seeks_and_volume_steps() {
+    fn player_arrows_map_to_normal_and_shifted_seeks_only() {
         assert_eq!(
             player_key_action(KeyCode::Left, KeyModifiers::NONE),
             Some(PlayerKeyAction::Seek(-10.0))
@@ -1624,14 +1642,8 @@ mod tests {
             player_key_action(KeyCode::Right, KeyModifiers::SHIFT),
             Some(PlayerKeyAction::Seek(60.0))
         );
-        assert_eq!(
-            player_key_action(KeyCode::Down, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Volume(-0.05))
-        );
-        assert_eq!(
-            player_key_action(KeyCode::Up, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Volume(0.05))
-        );
+        assert_eq!(player_key_action(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(player_key_action(KeyCode::Up, KeyModifiers::NONE), None);
     }
 
     #[test]
@@ -1693,6 +1705,19 @@ mod tests {
         assert!(!app.help);
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert!(app.logs_open);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        for focus in [
+            Focus::Files,
+            Focus::Playlist,
+            Focus::Player,
+            Focus::Receiver,
+        ] {
+            app.focus = focus;
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+            assert!(app.receiver_picker);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!app.receiver_picker);
+        }
     }
 
     #[test]

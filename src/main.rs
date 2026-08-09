@@ -14,6 +14,7 @@ mod network;
 mod playback;
 #[cfg(target_os = "macos")]
 mod synthetic;
+mod system_volume;
 mod tui;
 mod video;
 #[cfg(target_os = "macos")]
