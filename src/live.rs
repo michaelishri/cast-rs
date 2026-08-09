@@ -2147,14 +2147,14 @@ mod tests {
         media::H264Provider,
         portal::{CapturedFrame, FrameSink},
     };
-    #[cfg(target_os = "linux")]
-    use std::time::Duration;
     use std::{
         collections::HashMap,
         collections::VecDeque,
         net::IpAddr,
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{Arc, atomic::AtomicBool},
     };
+    #[cfg(target_os = "linux")]
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn detects_idr_in_avcc() {
