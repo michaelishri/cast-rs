@@ -256,6 +256,7 @@ pub(crate) trait LatestFrameObserver: Send + Sync + 'static {
     fn expired(&self);
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct LatestFrameMetrics {
     submitted: AtomicU64,
@@ -263,8 +264,8 @@ pub(crate) struct LatestFrameMetrics {
     expired: AtomicU64,
 }
 
+#[cfg(test)]
 impl LatestFrameMetrics {
-    #[cfg(test)]
     fn snapshot(&self) -> (u64, u64, u64) {
         (
             self.submitted.load(Ordering::Relaxed),
@@ -274,6 +275,7 @@ impl LatestFrameMetrics {
     }
 }
 
+#[cfg(test)]
 impl LatestFrameObserver for LatestFrameMetrics {
     fn submitted(&self) {
         self.submitted.fetch_add(1, Ordering::Relaxed);

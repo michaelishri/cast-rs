@@ -35,11 +35,12 @@ use videotoolbox::prelude::*;
 
 use crate::audio::{self, AudioFrameHandler, AudioWorker, LocalOutputRedirect};
 use crate::desktop::{
-    AdaptiveRateControl, AdaptiveRateObserver, EncodedVideoFrame as EncodedFrame, EncodedVideoSink,
-    H264Level, LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker,
-    MediaClock, RateWindowHealth, ReceiverControlSink, ReceiverVolumeCommand,
-    SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticPhase,
-    VideoFrameTimings as FrameTimings, fan_out_receiver_control, fan_out_video, phase_for_frame,
+    AdaptiveRateControl, AdaptiveRateObserver, EncodedAudioFrame, EncodedAudioSink,
+    EncodedVideoFrame as EncodedFrame, EncodedVideoSink, H264Level, LatestFrameBackend,
+    LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker, MediaClock, RateWindowHealth,
+    ReceiverControlSink, ReceiverVolumeCommand, SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME,
+    SyntheticPhase, VideoFrameTimings as FrameTimings, fan_out_audio, fan_out_receiver_control,
+    fan_out_video, phase_for_frame,
 };
 use crate::synthetic::SyntheticFrameGenerator;
 use crate::virtual_display::VirtualDisplaySession;
@@ -859,26 +860,7 @@ fn run_desktop(
             prepared_audio.expect("audio was prepared before it was offered"),
             Arc::clone(&clock),
             Arc::clone(&failure),
-            move |audio_frame| {
-                let frame = EncodedFrame {
-                    rtp_timestamp: audio_frame.timestamp as u32,
-                    keyframe: true,
-                    data: Arc::new(audio_frame.data),
-                    timings: FrameTimings {
-                        pipeline_started_at: Instant::now(),
-                        capture_age_micros: None,
-                        queue_wait_micros: 0,
-                        encode_micros: 0,
-                        prepare_micros: 0,
-                        sender_lock_wait_micros: 0,
-                    },
-                    synthetic_phase: None,
-                };
-                for output in &audio_outputs {
-                    output.submit(frame.clone())?;
-                }
-                Ok(())
-            },
+            move |audio_frame| fan_out_audio(&audio_outputs, audio_frame),
         )
         .context("could not start the desktop audio encoder after receiver negotiation")?;
         (Some(submitter), Some(worker))
@@ -4088,6 +4070,25 @@ impl SenderSubmitter {
 impl EncodedVideoSink for SenderSubmitter {
     fn submit_video(&self, frame: EncodedFrame) -> Result<()> {
         self.submit(frame)
+    }
+}
+
+impl EncodedAudioSink for SenderSubmitter {
+    fn submit_audio(&self, frame: EncodedAudioFrame) -> Result<()> {
+        self.submit(EncodedFrame {
+            rtp_timestamp: frame.timestamp as u32,
+            keyframe: true,
+            data: Arc::new(frame.data),
+            timings: FrameTimings {
+                pipeline_started_at: Instant::now(),
+                capture_age_micros: None,
+                queue_wait_micros: 0,
+                encode_micros: 0,
+                prepare_micros: 0,
+                sender_lock_wait_micros: 0,
+            },
+            synthetic_phase: None,
+        })
     }
 }
 
