@@ -1,6 +1,8 @@
 /target
 /.build
-/vendor
+/vendor/*
+!/vendor/libspa/
+!/vendor/libspa/**
 *.h264
 *.avcc
 *.m3u8

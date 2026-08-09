@@ -24,6 +24,10 @@ On Ubuntu, replace the Homebrew command with:
 sudo apt-get install build-essential libpipewire-0.3-dev libva-dev nasm pkg-config
 ```
 
+`vendor/libspa` is the pinned pipewire-rs 0.9.2 crate with a narrow compatibility patch for the
+`spa_video_info_raw` layout shipped by Ubuntu 22.04. Keep its version aligned with the `pipewire`
+dependency and verify changes against both the Ubuntu 22.04 release runner and current headers.
+
 The helper builds FFmpeg 8.0.1 shared libraries without FFmpeg command-line programs. Release archives include those libraries, so end users do not need this setup.
 
 ## Run and verify

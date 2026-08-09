@@ -38,6 +38,11 @@ sha2 = "0.10"
 tokio = { version = "1.47", features = ["rt-multi-thread"] }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
+[patch.crates-io]
+# pipewire-rs 0.9.2 exposes post-0.3.65 video fields without guarding them,
+# which prevents builds against the Ubuntu 22.04 PipeWire headers.
+libspa = { path = "vendor/libspa" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8.0", features = ["macos_13_0"] }
 videotoolbox = { version = "0.18", features = ["compression"] }
