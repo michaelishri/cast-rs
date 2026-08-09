@@ -744,22 +744,27 @@ fn copy_pipewire_frame(
     let chunk = data.chunk();
     let offset = usize::try_from(chunk.offset())?;
     let bytes = usize::try_from(chunk.size())?;
-    let stride = if chunk.stride() == 0 {
-        usize::try_from(width)?.saturating_mul(4)
-    } else {
-        usize::try_from(chunk.stride().unsigned_abs())?
-    };
+    let signed_stride = chunk.stride();
     let mapped = data
         .data()
         .ok_or_else(|| anyhow!("PipeWire frame data was not memory-mapped"))?;
-    let end = offset
-        .checked_add(bytes)
-        .ok_or_else(|| anyhow!("PipeWire frame size overflowed"))?;
-    if end > mapped.len() || stride < usize::try_from(width)?.saturating_mul(4) {
-        bail!("PipeWire frame dimensions exceed its mapped buffer");
-    }
+    // SPA defines chunk offsets modulo the data block's maximum size.
+    let offset = if mapped.is_empty() {
+        offset
+    } else {
+        offset % mapped.len()
+    };
+    let (pixels, stride) = normalize_strided_image(
+        mapped,
+        offset,
+        bytes.min(mapped.len()),
+        signed_stride,
+        width,
+        height,
+        "PipeWire frame",
+    )?;
     user_data.sink.submit(CapturedFrame {
-        data: mapped[offset..end].to_vec(),
+        data: pixels,
         stride,
         width,
         height,
@@ -812,7 +817,12 @@ fn update_cursor_metadata(
     }
     let width = bitmap.size.width;
     let height = bitmap.size.height;
-    let stride = usize::try_from(bitmap.stride.unsigned_abs())?;
+    let signed_stride = bitmap.stride;
+    let stride = if signed_stride == 0 {
+        usize::try_from(width)?.saturating_mul(4)
+    } else {
+        usize::try_from(signed_stride.unsigned_abs())?
+    };
     let minimum_stride = usize::try_from(width)?.saturating_mul(4);
     if width == 0 || height == 0 || stride < minimum_stride {
         bail!("PipeWire cursor bitmap has invalid dimensions or stride");
@@ -823,13 +833,15 @@ fn update_cursor_metadata(
     let pixel_length = stride
         .checked_mul(usize::try_from(height)?)
         .ok_or_else(|| anyhow!("PipeWire cursor bitmap size overflowed"))?;
-    let pixel_end = pixel_offset
-        .checked_add(pixel_length)
-        .ok_or_else(|| anyhow!("PipeWire cursor bitmap range overflowed"))?;
-    let pixels = metadata
-        .get(pixel_offset..pixel_end)
-        .ok_or_else(|| anyhow!("PipeWire cursor bitmap exceeds its metadata buffer"))?
-        .to_vec();
+    let (pixels, stride) = normalize_strided_image(
+        metadata,
+        pixel_offset,
+        pixel_length,
+        signed_stride,
+        width,
+        height,
+        "PipeWire cursor bitmap",
+    )?;
     *current = Some(CursorImage {
         position,
         hotspot,
@@ -857,6 +869,65 @@ fn metadata_struct<'a, T>(metadata: &'a [u8], offset: usize, label: &str) -> Res
     Ok(unsafe { &*bytes.as_ptr().cast::<T>() })
 }
 
+fn normalize_strided_image(
+    source: &[u8],
+    offset: usize,
+    available: usize,
+    signed_stride: i32,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(Vec<u8>, usize)> {
+    if source.is_empty() {
+        bail!("{label} has an empty mapped buffer");
+    }
+    let row_bytes = usize::try_from(width)?
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("{label} row size overflowed"))?;
+    let height = usize::try_from(height)?;
+    let stride = if signed_stride == 0 {
+        row_bytes
+    } else {
+        usize::try_from(signed_stride.unsigned_abs())?
+    };
+    if row_bytes == 0 || height == 0 || stride < row_bytes {
+        bail!("{label} has invalid dimensions or stride");
+    }
+    let span = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(row_bytes))
+        .ok_or_else(|| anyhow!("{label} row span overflowed"))?;
+    if span > available {
+        bail!("{label} is shorter than its dimensions and stride require");
+    }
+
+    let first_row = offset;
+    let output_len = stride
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("{label} output size overflowed"))?;
+    let mut output = vec![0; output_len];
+    for row in 0..height {
+        let distance = row
+            .checked_mul(stride)
+            .ok_or_else(|| anyhow!("{label} row offset overflowed"))?;
+        let source_start = if signed_stride < 0 {
+            first_row.checked_sub(distance)
+        } else {
+            first_row.checked_add(distance)
+        }
+        .ok_or_else(|| anyhow!("{label} row falls outside its mapped buffer"))?;
+        let source_end = source_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| anyhow!("{label} row range overflowed"))?;
+        let source_row = source
+            .get(source_start..source_end)
+            .ok_or_else(|| anyhow!("{label} row exceeds its mapped buffer"))?;
+        let destination_start = row * stride;
+        output[destination_start..destination_start + row_bytes].copy_from_slice(source_row);
+    }
+    Ok((output, stride))
+}
+
 fn raw_pixel_format(format: spa::param::video::VideoFormat) -> Result<RawPixelFormat> {
     match format {
         value if value == spa::param::video::VideoFormat::BGRA => Ok(RawPixelFormat::Bgra),
@@ -878,6 +949,43 @@ fn store_failure(failure: &Mutex<Option<String>>, message: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_positive_and_negative_video_strides() {
+        let rows = [
+            1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 3, 3, 3, 3, 0, 0, 0, 0,
+        ];
+        let (positive, stride) =
+            normalize_strided_image(&rows, 0, rows.len(), 8, 1, 3, "test image").unwrap();
+        assert_eq!(stride, 8);
+        assert_eq!(&positive[0..4], &[1; 4]);
+        assert_eq!(&positive[8..12], &[2; 4]);
+        assert_eq!(&positive[16..20], &[3; 4]);
+
+        let (negative, stride) =
+            normalize_strided_image(&rows, 16, rows.len(), -8, 1, 3, "test image").unwrap();
+        assert_eq!(stride, 8);
+        assert_eq!(&negative[0..4], &[3; 4]);
+        assert_eq!(&negative[8..12], &[2; 4]);
+        assert_eq!(&negative[16..20], &[1; 4]);
+    }
+
+    #[test]
+    fn rejects_truncated_and_out_of_range_strided_images() {
+        let rows = [0_u8; 24];
+        assert!(
+            normalize_strided_image(&rows, 0, 12, 8, 1, 3, "test image")
+                .unwrap_err()
+                .to_string()
+                .contains("shorter")
+        );
+        assert!(
+            normalize_strided_image(&rows, 0, rows.len(), -8, 1, 3, "test image")
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+    }
 
     #[test]
     fn token_round_trip_is_owner_only_and_atomic() {
