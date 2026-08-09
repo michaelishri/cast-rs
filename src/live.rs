@@ -964,6 +964,7 @@ impl LivePipeline {
 #[cfg(target_os = "linux")]
 struct LiveCapture {
     capture: Option<PipeWireCapture>,
+    cadence: Option<LinuxFrameCadence>,
     encoder_worker: Option<LatestFrameWorker<CapturedFrame>>,
     store: Arc<HlsStore>,
 }
@@ -1006,7 +1007,9 @@ impl LiveCapture {
             observer,
             "cast-linux-hls-encoder",
         )?;
-        let sink: Arc<dyn FrameSink> = Arc::new(LivePortalSink { submitter });
+        let (sink, cadence) =
+            LinuxFrameCadence::start(submitter, options.fps, Arc::clone(&failure))?;
+        let sink: Arc<dyn FrameSink> = Arc::new(sink);
         let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
         println!(
             "Capturing the selected portal source into {}x{}, {} fps HLS...",
@@ -1016,6 +1019,7 @@ impl LiveCapture {
         );
         Ok(Self {
             capture: Some(capture),
+            cadence: Some(cadence),
             encoder_worker: Some(worker),
             store,
         })
@@ -1037,6 +1041,9 @@ impl LiveCapture {
         if let Some(mut capture) = self.capture.take() {
             capture.stop()?;
         }
+        if let Some(mut cadence) = self.cadence.take() {
+            cadence.stop()?;
+        }
         if let Some(mut worker) = self.encoder_worker.take() {
             worker.stop()?;
         }
@@ -1055,15 +1062,171 @@ impl Drop for LiveCapture {
 
 #[cfg(target_os = "linux")]
 struct LivePortalSink {
-    submitter: LatestFrameSubmitter<CapturedFrame>,
+    state: Arc<LinuxFrameCadenceState>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(target_os = "linux")]
 impl FrameSink for LivePortalSink {
     fn submit(&self, frame: CapturedFrame) {
-        if let Err(error) = self.submitter.submit(frame) {
-            log::debug!("PipeWire frame arrived after HLS encoding stopped: {error}");
+        match self.state.frame.lock() {
+            Ok(mut pending) => {
+                *pending = Some(frame);
+                self.state.available.notify_one();
+            }
+            Err(_) => {
+                record_live_failure(&self.failure, "Linux HLS cadence frame lock was poisoned");
+            }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxFrameCadenceState {
+    frame: Mutex<Option<CapturedFrame>>,
+    available: Condvar,
+    stopping: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxFrameCadence {
+    state: Arc<LinuxFrameCadenceState>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxFrameCadence {
+    fn start(
+        submitter: LatestFrameSubmitter<CapturedFrame>,
+        fps: u32,
+        failure: Arc<Mutex<Option<String>>>,
+    ) -> Result<(LivePortalSink, Self)> {
+        let state = Arc::new(LinuxFrameCadenceState {
+            frame: Mutex::new(None),
+            available: Condvar::new(),
+            stopping: AtomicBool::new(false),
+        });
+        let thread_state = Arc::clone(&state);
+        let frame_period = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+        let timestamp_step = TIMESCALE.div_ceil(u64::from(fps.max(1)));
+        let thread_failure = Arc::clone(&failure);
+        let thread = thread::Builder::new()
+            .name("cast-linux-hls-cadence".to_owned())
+            .spawn(move || {
+                let mut current: Option<CapturedFrame> = None;
+                let mut last_timestamp = None;
+                let mut next_tick = Instant::now();
+                loop {
+                    let mut pending = match thread_state.frame.lock() {
+                        Ok(pending) => pending,
+                        Err(_) => {
+                            record_live_failure(
+                                &thread_failure,
+                                "Linux HLS cadence frame lock was poisoned",
+                            );
+                            return;
+                        }
+                    };
+                    while current.is_none()
+                        && pending.is_none()
+                        && !thread_state.stopping.load(Ordering::SeqCst)
+                    {
+                        pending = match thread_state.available.wait(pending) {
+                            Ok(pending) => pending,
+                            Err(_) => {
+                                record_live_failure(
+                                    &thread_failure,
+                                    "Linux HLS cadence frame wait was poisoned",
+                                );
+                                return;
+                            }
+                        };
+                    }
+                    if thread_state.stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(frame) = pending.take() {
+                        current = Some(frame);
+                    }
+                    let now = Instant::now();
+                    if now < next_tick {
+                        let timeout = next_tick.saturating_duration_since(now);
+                        drop(
+                            match thread_state.available.wait_timeout(pending, timeout) {
+                                Ok((pending, _)) => pending,
+                                Err(_) => {
+                                    record_live_failure(
+                                        &thread_failure,
+                                        "Linux HLS cadence frame wait was poisoned",
+                                    );
+                                    return;
+                                }
+                            },
+                        );
+                        continue;
+                    }
+                    drop(pending);
+
+                    let mut frame = current
+                        .as_ref()
+                        .expect("cadence waits for its first captured frame")
+                        .clone();
+                    frame.timestamp =
+                        advance_timestamp(last_timestamp, frame.timestamp, timestamp_step);
+                    last_timestamp = Some(frame.timestamp);
+                    if let Err(error) = submitter.submit(frame) {
+                        log::debug!("HLS cadence stopped after its encoder queue closed: {error}");
+                        return;
+                    }
+                    next_tick += frame_period;
+                    if next_tick <= now {
+                        next_tick = now + frame_period;
+                    }
+                }
+            })
+            .context("could not start Linux HLS frame cadence worker")?;
+        Ok((
+            LivePortalSink {
+                state: Arc::clone(&state),
+                failure,
+            },
+            Self {
+                state,
+                thread: Some(thread),
+            },
+        ))
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.state.stopping.store(true, Ordering::SeqCst);
+        self.state.available.notify_all();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("Linux HLS frame cadence worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxFrameCadence {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            log::warn!("could not stop Linux HLS frame cadence worker: {error:#}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_live_failure(failure: &Mutex<Option<String>>, message: &str) {
+    match failure.lock() {
+        Ok(mut failure) => {
+            if failure.is_none() {
+                *failure = Some(message.to_owned());
+            }
+        }
+        Err(_) => log::error!("could not store Linux live capture failure: {message}"),
     }
 }
 
@@ -1971,14 +2134,18 @@ mod tests {
         routed_response, validate_cast_hosts, validate_serve_only,
     };
     #[cfg(target_os = "linux")]
-    use super::{LinuxLivePipeline, annex_b_to_avcc, annex_b_units};
+    use super::{
+        LinuxFrameCadence, LinuxLivePipeline, LiveQueueObserver, annex_b_to_avcc, annex_b_units,
+    };
     #[cfg(target_os = "macos")]
     use crate::audio;
     use crate::desktop::EncodedAudioFrame;
     #[cfg(target_os = "linux")]
     use crate::{
-        desktop::LatestFrameBackend, linux_encoder::RawPixelFormat, media::H264Provider,
-        portal::CapturedFrame,
+        desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameWorker},
+        linux_encoder::RawPixelFormat,
+        media::H264Provider,
+        portal::{CapturedFrame, FrameSink},
     };
     #[cfg(target_os = "linux")]
     use std::time::Duration;
@@ -1986,7 +2153,7 @@ mod tests {
         collections::HashMap,
         collections::VecDeque,
         net::IpAddr,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{Arc, Mutex, atomic::AtomicBool},
     };
 
     #[test]
@@ -2060,6 +2227,55 @@ mod tests {
         assert!(store.wait_until_ready(Duration::ZERO, 1));
         assert!(store.response("/master.m3u8", false).unwrap().is_some());
         assert!(store.response("/segment-0.m4s", false).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_cadence_publishes_hls_from_one_damage_frame_when_module_is_available() {
+        if crate::setup::find_compatible().unwrap().is_none() {
+            return;
+        }
+        let store = Arc::new(HlsStore::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let pipeline = LinuxLivePipeline {
+            encoder: None,
+            muxer: None,
+            store: Arc::clone(&store),
+            frame_index: 0,
+            frames_in_segment: 0,
+            segment_start_timestamp: None,
+            fps: 10,
+            width: 64,
+            height: 64,
+            bitrate: 1_000_000,
+            provider: H264Provider::Openh264,
+            audio_submitter: None,
+        };
+        let observer: Arc<dyn LatestFrameObserver> = Arc::new(LiveQueueObserver);
+        let (submitter, mut encoder_worker) = LatestFrameWorker::start(
+            pipeline,
+            None,
+            Arc::clone(&failure),
+            observer,
+            "test-linux-hls-encoder",
+        )
+        .unwrap();
+        let (sink, mut cadence) =
+            LinuxFrameCadence::start(submitter, 10, Arc::clone(&failure)).unwrap();
+        sink.submit(CapturedFrame {
+            data: vec![0_u8; 64 * 64 * 4],
+            stride: 64 * 4,
+            width: 64,
+            height: 64,
+            format: RawPixelFormat::Bgra,
+            timestamp: 0,
+            cursor: None,
+        });
+
+        assert!(store.wait_until_ready(Duration::from_secs(3), 1));
+        cadence.stop().unwrap();
+        encoder_worker.stop().unwrap();
+        assert_eq!(*failure.lock().unwrap(), None);
     }
 
     #[test]
