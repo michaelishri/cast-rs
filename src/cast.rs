@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::{
     net::IpAddr,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -51,6 +53,8 @@ pub struct PlaybackStatus {
 pub enum MediaControl {
     PlayPause,
     Seek,
+    Volume,
+    Mute,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +82,7 @@ pub struct MediaFailure {
 pub enum MediaSessionEvent {
     Loading,
     Status(PlaybackStatus),
+    ReceiverVolume(ReceiverVolume),
     ControlError {
         control: MediaControl,
         detail: String,
@@ -89,7 +94,16 @@ pub enum MediaSessionEvent {
 enum MediaSessionCommand {
     TogglePlayback,
     SeekBy(f32),
+    SeekTo(f32),
+    SetVolume(f32),
+    SetMuted(bool),
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReceiverVolume {
+    pub level: Option<f32>,
+    pub muted: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -142,6 +156,7 @@ struct BufferedMediaLoad {
     duration: Option<f64>,
     fmp4_hls: bool,
     interactive: bool,
+    autoplay: bool,
 }
 
 impl BufferedMediaSession {
@@ -165,6 +180,7 @@ impl BufferedMediaSession {
                 duration: description.duration,
                 fmp4_hls: false,
                 interactive,
+                autoplay: true,
             },
         )
     }
@@ -188,6 +204,56 @@ impl BufferedMediaSession {
                 duration: description.duration,
                 fmp4_hls: true,
                 interactive,
+                autoplay: true,
+            },
+        )
+    }
+
+    pub fn start_with_autoplay(
+        host: IpAddr,
+        port: u16,
+        url: String,
+        content_type: String,
+        start_at: f64,
+        description: BufferedMediaDescription,
+        autoplay: bool,
+    ) -> Result<Self> {
+        Self::start_with_options(
+            host,
+            port,
+            BufferedMediaLoad {
+                url,
+                content_type,
+                start_at,
+                title: description.title,
+                duration: description.duration,
+                fmp4_hls: false,
+                interactive: true,
+                autoplay,
+            },
+        )
+    }
+
+    pub fn start_fmp4_hls_with_autoplay(
+        host: IpAddr,
+        port: u16,
+        url: String,
+        start_at: f64,
+        description: BufferedMediaDescription,
+        autoplay: bool,
+    ) -> Result<Self> {
+        Self::start_with_options(
+            host,
+            port,
+            BufferedMediaLoad {
+                url,
+                content_type: "application/x-mpegURL".to_owned(),
+                start_at,
+                title: description.title,
+                duration: description.duration,
+                fmp4_hls: true,
+                interactive: true,
+                autoplay,
             },
         )
     }
@@ -247,10 +313,8 @@ impl BufferedMediaSession {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         let detail = format!("Cast control session failed: {error:#}");
-                        let _ = event_sender.send(MediaSessionEvent::Failed(MediaFailure {
-                            kind: MediaFailureKind::Other,
-                            detail: detail.clone(),
-                        }));
+                        let _ = event_sender
+                            .send(MediaSessionEvent::Failed(classify_session_error(&detail)));
                         Err(detail)
                     }
                 };
@@ -307,6 +371,32 @@ impl BufferedMediaSession {
         self.commands
             .send(MediaSessionCommand::SeekBy(seconds))
             .context("Cast control session ended before seek could be requested")
+    }
+
+    pub fn seek_to(&self, seconds: f32) -> Result<()> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(anyhow!(
+                "seek position must be a finite non-negative number"
+            ));
+        }
+        self.commands
+            .send(MediaSessionCommand::SeekTo(seconds))
+            .context("Cast control session ended before seek could be requested")
+    }
+
+    pub fn set_volume(&self, level: f32) -> Result<()> {
+        if !level.is_finite() {
+            return Err(anyhow!("volume must be a finite number"));
+        }
+        self.commands
+            .send(MediaSessionCommand::SetVolume(level.clamp(0.0, 1.0)))
+            .context("Cast control session ended before volume could be requested")
+    }
+
+    pub fn set_muted(&self, muted: bool) -> Result<()> {
+        self.commands
+            .send(MediaSessionCommand::SetMuted(muted))
+            .context("Cast control session ended before mute could be requested")
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -622,14 +712,18 @@ fn run_buffered_media_session(
         .connect(&application.transport_id)
         .context("could not connect to the receiver application")?;
 
+    if let Ok(status) = device.receiver.get_status() {
+        let _ = events.send(MediaSessionEvent::ReceiverVolume(ReceiverVolume {
+            level: status.volume.level,
+            muted: status.volume.muted,
+        }));
+    }
+
     events
         .send(MediaSessionEvent::Loading)
         .map_err(|_| anyhow!("local video caller stopped waiting for the Cast receiver"))?;
     let media = buffered_media(media_load);
-    let load_options = LoadOptions {
-        current_time: Some(media_load.start_at),
-        autoplay: true,
-    };
+    let load_options = buffered_load_options(media_load);
     log::debug!(
         "loading buffered media: content_type={}, start_position={:.3}s, fmp4_hls={}",
         media_load.content_type,
@@ -734,6 +828,43 @@ fn run_buffered_media_session(
                     );
                 }
             }
+            Ok(MediaSessionCommand::SeekTo(seconds)) => {
+                if seek_buffered_playback_to(
+                    device,
+                    &application.transport_id,
+                    media_session_id,
+                    seconds,
+                    &mut snapshot,
+                    events,
+                ) {
+                    return stop_buffered_cast_session(
+                        device,
+                        &application.transport_id,
+                        &application.session_id,
+                        media_session_id,
+                    );
+                }
+            }
+            Ok(MediaSessionCommand::SetVolume(level)) => {
+                if set_receiver_volume(device, level, events) {
+                    return stop_buffered_cast_session(
+                        device,
+                        &application.transport_id,
+                        &application.session_id,
+                        media_session_id,
+                    );
+                }
+            }
+            Ok(MediaSessionCommand::SetMuted(muted)) => {
+                if set_receiver_muted(device, muted, events) {
+                    return stop_buffered_cast_session(
+                        device,
+                        &application.transport_id,
+                        &application.session_id,
+                        media_session_id,
+                    );
+                }
+            }
             Ok(MediaSessionCommand::Stop) => {
                 stop_buffered_cast_session(
                     device,
@@ -782,6 +913,13 @@ fn buffered_media(media_load: &BufferedMediaLoad) -> Media {
             ..GenericMediaMetadata::default()
         })),
         duration: normalized_duration(media_load.duration),
+    }
+}
+
+fn buffered_load_options(media_load: &BufferedMediaLoad) -> LoadOptions {
+    LoadOptions {
+        current_time: Some(media_load.start_at),
+        autoplay: media_load.autoplay,
     }
 }
 
@@ -886,12 +1024,98 @@ fn seek_buffered_playback(
     }
 }
 
-fn seek_target(current_time: f32, seconds: f32, duration: Option<f32>) -> f32 {
-    let mut target = (current_time + seconds).max(0.0);
+fn seek_buffered_playback_to(
+    device: &CastDevice<'_>,
+    transport_id: &str,
+    media_session_id: i32,
+    seconds: f32,
+    snapshot: &mut BufferedPlaybackSnapshot,
+    events: &Sender<MediaSessionEvent>,
+) -> bool {
+    if snapshot.supported_media_commands & MEDIA_COMMAND_SEEK == 0 {
+        return emit_control_error(
+            events,
+            MediaControl::Seek,
+            "receiver does not advertise seek support",
+        );
+    }
+    let Some(resume_state) = seek_resume_state(snapshot.state) else {
+        return emit_control_error(
+            events,
+            MediaControl::Seek,
+            "seek is unavailable until playback is ready",
+        );
+    };
+    let target = clamp_seek_position(seconds, snapshot.duration);
+    match device.media.seek(
+        transport_id,
+        media_session_id,
+        Some(target),
+        Some(resume_state),
+    ) {
+        Ok(entry) => emit_status_entry(entry, snapshot, events),
+        Err(error) => emit_control_error(
+            events,
+            MediaControl::Seek,
+            &format!("receiver rejected seek: {error}"),
+        ),
+    }
+}
+
+fn clamp_seek_position(seconds: f32, duration: Option<f32>) -> f32 {
+    let mut target = if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
+    };
     if let Some(duration) = duration.filter(|value| value.is_finite() && *value >= 0.0) {
         target = target.min(duration);
     }
     target
+}
+
+fn set_receiver_volume(
+    device: &CastDevice<'_>,
+    level: f32,
+    events: &Sender<MediaSessionEvent>,
+) -> bool {
+    match device.receiver.set_volume(level.clamp(0.0, 1.0)) {
+        Ok(volume) => events
+            .send(MediaSessionEvent::ReceiverVolume(ReceiverVolume {
+                level: volume.level,
+                muted: volume.muted,
+            }))
+            .is_err(),
+        Err(error) => emit_control_error(
+            events,
+            MediaControl::Volume,
+            &format!("receiver rejected volume: {error}"),
+        ),
+    }
+}
+
+fn set_receiver_muted(
+    device: &CastDevice<'_>,
+    muted: bool,
+    events: &Sender<MediaSessionEvent>,
+) -> bool {
+    match device.receiver.set_volume(muted) {
+        Ok(volume) => events
+            .send(MediaSessionEvent::ReceiverVolume(ReceiverVolume {
+                level: volume.level,
+                muted: volume.muted,
+            }))
+            .is_err(),
+        Err(error) => emit_control_error(
+            events,
+            MediaControl::Mute,
+            &format!("receiver rejected mute: {error}"),
+        ),
+    }
+}
+
+fn seek_target(current_time: f32, seconds: f32, duration: Option<f32>) -> f32 {
+    clamp_seek_position(current_time + seconds, duration)
 }
 
 fn seek_resume_state(state: Option<PlaybackState>) -> Option<ResumeState> {
@@ -1271,6 +1495,24 @@ fn detailed_media_failure(code: MediaDetailedErrorCode, message_type: &str) -> M
     MediaFailure {
         kind,
         detail: format!("receiver media error {code:?} ({message_type})"),
+    }
+}
+
+fn classify_session_error(detail: &str) -> MediaFailure {
+    let lower = detail.to_ascii_lowercase();
+    let kind = if lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("socket")
+        || lower.contains("heartbeat")
+        || lower.contains("receiver did not")
+    {
+        MediaFailureKind::Network
+    } else {
+        MediaFailureKind::Other
+    };
+    MediaFailure {
+        kind,
+        detail: detail.to_owned(),
     }
 }
 
@@ -1716,6 +1958,7 @@ mod tests {
             duration: Some(90.0),
             fmp4_hls: true,
             interactive: false,
+            autoplay: true,
         });
         assert_eq!(media.stream_type, StreamType::Buffered);
         assert_eq!(media.duration, Some(90.0));
@@ -1728,6 +1971,23 @@ mod tests {
             media.hls_video_segment_format,
             Some(HlsVideoSegmentFormat::Fmp4)
         );
+    }
+
+    #[test]
+    fn buffered_load_options_preserve_autoplay_intent() {
+        let load = BufferedMediaLoad {
+            url: "http://127.0.0.1/media".to_owned(),
+            content_type: "video/mp4".to_owned(),
+            start_at: 42.0,
+            title: "Video".to_owned(),
+            duration: Some(90.0),
+            fmp4_hls: false,
+            interactive: true,
+            autoplay: false,
+        };
+        let options = buffered_load_options(&load);
+        assert_eq!(options.current_time, Some(42.0));
+        assert!(!options.autoplay);
     }
 
     #[test]
@@ -1749,6 +2009,14 @@ mod tests {
         assert_eq!(seek_target(50.0, 10.0, Some(100.0)), 60.0);
         assert_eq!(seek_target(80.0, 60.0, Some(100.0)), 100.0);
         assert_eq!(seek_target(80.0, 60.0, None), 140.0);
+    }
+
+    #[test]
+    fn absolute_seek_targets_are_validated_and_clamped() {
+        assert_eq!(clamp_seek_position(-10.0, Some(100.0)), 0.0);
+        assert_eq!(clamp_seek_position(50.0, Some(100.0)), 50.0);
+        assert_eq!(clamp_seek_position(150.0, Some(100.0)), 100.0);
+        assert_eq!(clamp_seek_position(f32::NAN, Some(100.0)), 0.0);
     }
 
     #[test]
@@ -1781,6 +2049,18 @@ mod tests {
         );
         assert_eq!(
             detailed_media_failure(MediaDetailedErrorCode::Generic, "MEDIA_ERROR").kind,
+            MediaFailureKind::Other
+        );
+    }
+
+    #[test]
+    fn classifies_runtime_connectivity_errors_separately() {
+        assert_eq!(
+            classify_session_error("Cast control session failed: connection reset").kind,
+            MediaFailureKind::Network
+        );
+        assert_eq!(
+            classify_session_error("Cast control session failed: invalid response").kind,
             MediaFailureKind::Other
         );
     }

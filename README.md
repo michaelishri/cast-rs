@@ -112,6 +112,29 @@ cast video --host 192.168.1.50 --transcode-delivery complete movie.mkv
 
 DRM-protected and corrupt files cannot be converted. Embedded subtitles and alternate audio tracks are not included yet. To use a fixed local-server port for a firewall rule, pass `--http-port 8080`.
 
+## Browse and play with the TUI
+
+Open the full-screen local-video interface in the current directory, or pass a starting directory:
+
+```sh
+cast tui
+cast tui ~/Movies
+```
+
+Cast discovers receivers without blocking the interface. To preselect a known receiver and skip the initial scan, use `cast tui --host 192.168.1.50`. The TUI accepts the same local-server and compatibility choices as `video`: `--cast-port`, `--http-port`, `--transcode auto|never|always`, and `--transcode-delivery incremental|complete`. It requires interactive terminal input and output and shows a safe reduced screen below 60×18.
+
+The upper half is split between the file explorer and the session playlist. The full-width player below them shows preparation or playback progress, transport controls, volume/mute, status, and the active receiver. Tab cycles File Explorer → Playlist → Player → Receiver; Shift-Tab reverses the cycle. Press `?` for the in-app help and `l` for the scrollable warning/diagnostic log. `-v` and `-vv` increase the detail captured there without writing over the alternate screen.
+
+Keyboard controls:
+
+- Global: `q`/`Ctrl-C` quits, Space plays or pauses, Escape stops, `[`/`]` selects previous/next, `M` mutes, and `+`/`-` changes volume by 5%.
+- File explorer: arrows, Page Up/Down, Home/End select; Enter opens a directory or enqueues a file; Backspace opens the parent; `p` plays now; `f` toggles all regular files. Hidden entries remain hidden.
+- Playlist: arrows, Page Up/Down, Home/End select; Enter plays; Delete or Backspace removes; Alt-Up/Down reorders.
+- Player: Left/Right seeks backward/forward 10 seconds, Shift-Left/Shift-Right seeks backward/forward 60 seconds, and Down/Up changes volume by 5%. The larger seek controls appear in the player only while Shift is held.
+- Receiver: Enter opens the picker and `r` rescans. Escape closes any overlay.
+
+The mouse can focus panes, select rows, double-click to activate, scroll the pane under the pointer, choose a receiver, and set playback position or volume by clicking their gauges. The playlist is session-only: duplicates are allowed, there is no repeat or shuffle, natural completion advances linearly, and stopping retains the current item. Media-specific failures skip to the next item; receiver/network failures pause the queue. Switching receivers reuses the prepared source, resumes near the current position, preserves paused/playing intent, and reads the new receiver's own volume.
+
 ## Multiple receivers and extended displays
 
 Repeat `--host` to cast one captured desktop to a receiver group:
@@ -187,6 +210,8 @@ cast desktop --host 192.168.1.50 --transport hls
 ```
 
 **A local video does not start** — Allow incoming connections through the macOS firewall and confirm that guest/client isolation is disabled. Use `--transcode always` to normalize a file initially selected for direct playback.
+
+**The TUI cannot start or looks damaged** — Run it directly in a terminal rather than through a pipe or redirected file. Resize to at least 60×18. Cast restores raw mode, the cursor, mouse tracking, and the primary screen on exit; if the terminal itself was force-killed, run `reset`.
 
 **An extended display is unavailable or blank** — Your macOS version may not support the experimental `CGVirtualDisplay` API. Re-check Screen Recording permission and cast an existing display instead.
 

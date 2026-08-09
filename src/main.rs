@@ -1,14 +1,22 @@
+#[cfg(target_os = "macos")]
 mod audio;
+#[cfg(target_os = "macos")]
 mod capture;
 mod cast;
 mod discovery;
+#[cfg(target_os = "macos")]
 mod live;
 mod media;
 mod media_server;
+#[cfg(target_os = "macos")]
 mod mirror;
 mod network;
+mod playback;
+#[cfg(target_os = "macos")]
 mod synthetic;
+mod tui;
 mod video;
+#[cfg(target_os = "macos")]
 mod virtual_display;
 mod vod_hls;
 
@@ -45,6 +53,7 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         timeout: u64,
     },
+    #[cfg(target_os = "macos")]
     /// List displays visible to macOS ScreenCaptureKit.
     Displays,
     /// Ask a Cast device to play an existing media URL.
@@ -94,6 +103,28 @@ enum Command {
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
     },
+    /// Browse local videos, manage a queue, and control playback in a full-screen interface.
+    Tui {
+        /// Directory to browse; defaults to the current directory.
+        #[arg(default_value = ".")]
+        directory: PathBuf,
+        /// Chromecast IP address; when omitted the TUI discovers receivers.
+        #[arg(long)]
+        host: Option<IpAddr>,
+        /// Cast control port.
+        #[arg(long, visible_alias = "port", default_value_t = 8009)]
+        cast_port: u16,
+        /// Local HTTP port; 0 asks the OS to select an available port.
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
+        /// Convert incompatible containers/codecs using linked media libraries.
+        #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
+        transcode: TranscodeMode,
+        /// Deliver transcoded media incrementally or after a complete MP4 is ready.
+        #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
+        transcode_delivery: TranscodeDeliveryMode,
+    },
+    #[cfg(target_os = "macos")]
     /// Capture and hardware-encode a short H.264/AVCC diagnostic sample.
     Capture {
         /// CoreGraphics display ID; defaults to the first display.
@@ -109,6 +140,7 @@ enum Command {
         #[arg(long, default_value = "capture.avcc")]
         output: PathBuf,
     },
+    #[cfg(target_os = "macos")]
     /// Measure the mirroring path and recommend receiver latency settings.
     Profile {
         /// Chromecast IP address; repeat --host to profile a receiver group.
@@ -158,6 +190,7 @@ enum Command {
         #[arg(long)]
         quality_priority: bool,
     },
+    #[cfg(target_os = "macos")]
     /// Capture this Mac's desktop and cast it to one or more Google Cast receivers.
     Desktop {
         /// Chromecast IP address; repeat --host to cast to multiple receivers.
@@ -209,6 +242,7 @@ enum Command {
         #[arg(long)]
         serve_only: bool,
     },
+    #[cfg(target_os = "macos")]
     /// Internal owner process for a temporary virtual display.
     #[command(name = "__virtual-display-helper", hide = true)]
     VirtualDisplayHelper {
@@ -263,7 +297,11 @@ fn main() -> Result<()> {
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
     );
-    init_logging(cli.verbose);
+    let log_capture = matches!(&cli.command, Command::Tui { .. }).then(tui::LogCapture::new);
+    init_logging(
+        cli.verbose,
+        log_capture.as_ref().map(tui::LogCapture::writer),
+    );
     match cli.command {
         Command::Devices { timeout } => {
             let devices = discovery::discover(Duration::from_secs(timeout))?;
@@ -273,6 +311,7 @@ fn main() -> Result<()> {
                 print_devices(&devices);
             }
         }
+        #[cfg(target_os = "macos")]
         Command::Displays => capture::list_displays()?,
         Command::Url {
             host,
@@ -331,6 +370,34 @@ fn main() -> Result<()> {
             },
             interactive: interactive_video,
         })?,
+        Command::Tui {
+            directory,
+            host,
+            cast_port,
+            http_port,
+            transcode,
+            transcode_delivery,
+        } => tui::run(
+            tui::TuiOptions {
+                directory,
+                host,
+                cast_port,
+                http_port,
+                compatibility_mode: match transcode {
+                    TranscodeMode::Auto => media::CompatibilityMode::Auto,
+                    TranscodeMode::Never => media::CompatibilityMode::Never,
+                    TranscodeMode::Always => media::CompatibilityMode::Always,
+                },
+                transcode_delivery: match transcode_delivery {
+                    TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
+                    TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
+                },
+            },
+            log_capture
+                .expect("TUI log capture was initialized")
+                .receiver,
+        )?,
+        #[cfg(target_os = "macos")]
         Command::Capture {
             display,
             seconds,
@@ -344,6 +411,7 @@ fn main() -> Result<()> {
             bitrate,
             output,
         })?,
+        #[cfg(target_os = "macos")]
         Command::Profile {
             host,
             cast_port,
@@ -380,6 +448,7 @@ fn main() -> Result<()> {
             },
             auto_tune,
         )?,
+        #[cfg(target_os = "macos")]
         Command::Desktop {
             host,
             cast_port,
@@ -443,6 +512,7 @@ fn main() -> Result<()> {
                 })?;
             }
         },
+        #[cfg(target_os = "macos")]
         Command::VirtualDisplayHelper {
             width,
             height,
@@ -539,18 +609,22 @@ mod device_tests {
     }
 }
 
-fn init_logging(verbosity: u8) {
+fn init_logging(verbosity: u8, target: Option<tui::LogWriter>) {
     let level = match verbosity {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
-    env_logger::Builder::new()
+    let mut builder = env_logger::Builder::new();
+    builder
         .filter_level(log::LevelFilter::Warn)
         .filter_module("cast", level)
         .filter_module("rust_cast", level)
-        .format_timestamp_millis()
-        .init();
+        .format_timestamp_millis();
+    if let Some(target) = target {
+        builder.target(env_logger::Target::Pipe(Box::new(target)));
+    }
+    builder.init();
 }
 
 fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal: bool) -> bool {
@@ -559,8 +633,11 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, interactive_video_output};
-    use clap::{Parser, error::ErrorKind};
+    use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
+    use clap::Parser;
+    #[cfg(target_os = "macos")]
+    use clap::error::ErrorKind;
+    #[cfg(target_os = "macos")]
     use std::net::IpAddr;
 
     #[test]
@@ -573,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn desktop_accepts_extend_as_a_switch() {
         let cli =
             Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--extend"]).unwrap();
@@ -580,6 +658,51 @@ mod tests {
     }
 
     #[test]
+    fn tui_parses_defaults_and_every_option() {
+        let cli = Cli::try_parse_from(["cast", "tui"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tui {
+                ref directory,
+                host: None,
+                cast_port: 8009,
+                http_port: 0,
+                transcode: TranscodeMode::Auto,
+                transcode_delivery: TranscodeDeliveryMode::Incremental,
+            } if directory == std::path::Path::new(".")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "cast",
+            "tui",
+            "/tmp",
+            "--host",
+            "192.0.2.1",
+            "--cast-port",
+            "9000",
+            "--http-port",
+            "8080",
+            "--transcode",
+            "always",
+            "--transcode-delivery",
+            "complete",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tui {
+                ref directory,
+                host: Some(_),
+                cast_port: 9000,
+                http_port: 8080,
+                transcode: TranscodeMode::Always,
+                transcode_delivery: TranscodeDeliveryMode::Complete,
+            } if directory == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn desktop_audio_is_opt_in() {
         let cli =
             Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--audio"]).unwrap();
@@ -590,6 +713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn extend_conflicts_with_an_explicit_display() {
         let result = Cli::try_parse_from([
             "cast",
@@ -605,6 +729,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn profile_extend_conflicts_with_synthetic_input() {
         let result = Cli::try_parse_from([
             "cast",
@@ -619,6 +744,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn desktop_preserves_repeated_host_order() {
         let cli = Cli::try_parse_from([
             "cast",
@@ -642,6 +768,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn profile_accepts_a_receiver_group() {
         let cli = Cli::try_parse_from([
             "cast",

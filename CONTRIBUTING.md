@@ -7,7 +7,7 @@ Thanks for helping improve Cast. This guide covers the local development setup, 
 Developing Cast requires:
 
 - macOS 13 or newer;
-- Rust 1.85 or newer;
+- Rust 1.88 or newer;
 - Xcode 15 or newer, including its Swift toolchain;
 - Homebrew packages `nasm` and `pkg-config`.
 
@@ -32,6 +32,7 @@ cargo run -- displays
 cargo run --release -- desktop --host 192.168.1.50
 cargo run --release -- desktop --host 192.168.1.50 --audio
 cargo run --release -- profile --host 192.168.1.50 --synthetic
+cargo run --release -- tui ~/Movies
 ```
 
 Before opening a pull request, run the local quality gate:
@@ -50,6 +51,12 @@ cargo build --locked --release
 Cast discovers receivers with mDNS and controls them through the vendored `rust-cast` client. Local video is served only from the receiver-facing LAN interface at a fresh random URL; the server supports HTTP ranges so receivers can seek and read MP4 metadata efficiently.
 
 The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. The `desktop` path uses ScreenCaptureKit, VideoToolbox, and (when `--audio` is set) an AudioToolbox AAC-LC encoder. The low-latency path performs the Cast Streaming offer/answer exchange and sends H.264 and AAC as separately encrypted Cast RTP streams. HLS remains a compatibility fallback, with fMP4 video and an alternate packed-AAC rendition.
+
+The reusable local-video playback controller owns inspection, preparation, the private HTTP/HLS server, Cast control, and cleanup on a worker thread. Presentation adapters consume structured preparation, status, volume, completion, and categorized-failure events. Receiver handoff deliberately keeps the prepared source alive, interpolates the latest receiver position, and loads it on the new receiver with the same paused/playing intent. Keep the existing line-oriented `video` adapter compatible when changing this layer.
+
+The Ratatui application keeps all Crossterm input and drawing on the main thread with a 100 ms tick. Receiver discovery and playback run in cancellable workers; TUI logging uses a bounded nonblocking channel and retains the newest 500 entries. The terminal guard must remain idempotent and restore raw mode, cursor visibility, mouse capture, and the primary screen on every exit path, including unwind. Reducer and TestBackend tests should cover UI behavior without real devices.
+
+For TUI changes, manually check a normal and sub-60×18 terminal, direct/remux/incremental media, multi-item advancement, pause/seek/stop, mouse progress and volume, receiver rescan and handoff, media/network failures, and clean exit on a real macOS Cast setup.
 
 The mirroring capture callback must never wait for VideoToolbox or the network. It uses a latest-frame-wins, one-frame mailbox; old raw frames can expire before encoding, but encoded H.264 reference frames are not discarded arbitrarily. RTP sender reports establish the media clock, and receiver feedback drives retransmission, history cleanup, and adaptive bitrate. Preserve these properties when modifying the capture, encoder, or network pipeline.
 

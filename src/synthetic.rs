@@ -73,7 +73,7 @@ pub(crate) struct SyntheticFrameGenerator {
 
 impl SyntheticFrameGenerator {
     pub(crate) fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
-        if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+        if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("synthetic frame dimensions must be even and at least 2x2");
         }
         if fps == 0 {
