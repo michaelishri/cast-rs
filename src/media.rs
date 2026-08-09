@@ -474,6 +474,106 @@ fn resolve_linux_provider(
         })
 }
 
+#[cfg(target_os = "linux")]
+struct VaapiFrames {
+    device: *mut ffmpeg::ffi::AVBufferRef,
+    frames: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for VaapiFrames {}
+
+#[cfg(target_os = "linux")]
+impl VaapiFrames {
+    fn attach(encoder: &mut encoder::video::Video, width: u32, height: u32) -> Result<Self> {
+        let mut device = std::ptr::null_mut();
+        let status = unsafe {
+            ffmpeg::ffi::av_hwdevice_ctx_create(
+                &mut device,
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            bail!(
+                "could not open the default VA-API device: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let frames = unsafe { ffmpeg::ffi::av_hwframe_ctx_alloc(device) };
+        if frames.is_null() {
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device) };
+            bail!("could not allocate a VA-API frame context");
+        }
+        let context = unsafe { (*frames).data.cast::<ffmpeg::ffi::AVHWFramesContext>() };
+        unsafe {
+            (*context).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*context).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*context).width = width as i32;
+            (*context).height = height as i32;
+            (*context).initial_pool_size = 8;
+        }
+        let status = unsafe { ffmpeg::ffi::av_hwframe_ctx_init(frames) };
+        if status < 0 {
+            let mut frames = frames;
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut frames);
+                ffmpeg::ffi::av_buffer_unref(&mut device);
+            }
+            bail!(
+                "could not initialize VA-API frames: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let encoder_frames = unsafe { ffmpeg::ffi::av_buffer_ref(frames) };
+        if encoder_frames.is_null() {
+            let mut frames = frames;
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut frames);
+                ffmpeg::ffi::av_buffer_unref(&mut device);
+            }
+            bail!("could not retain the VA-API frame context");
+        }
+        unsafe { (*encoder.as_mut_ptr()).hw_frames_ctx = encoder_frames };
+        Ok(Self { device, frames })
+    }
+
+    fn upload(&self, source: &frame::Video) -> Result<frame::Video> {
+        let mut target = frame::Video::empty();
+        let status =
+            unsafe { ffmpeg::ffi::av_hwframe_get_buffer(self.frames, target.as_mut_ptr(), 0) };
+        if status < 0 {
+            bail!(
+                "could not allocate a VA-API video surface: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let status = unsafe {
+            ffmpeg::ffi::av_hwframe_transfer_data(target.as_mut_ptr(), source.as_ptr(), 0)
+        };
+        if status < 0 {
+            bail!(
+                "could not upload a video frame to VA-API: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        target.set_pts(source.pts());
+        Ok(target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VaapiFrames {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.frames);
+            ffmpeg::ffi::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
 struct VideoTranscoder {
     output_index: usize,
     input_time_base: Rational,
@@ -485,6 +585,8 @@ struct VideoTranscoder {
     output_height: u32,
     frame_duration: i64,
     last_output_dts: Option<i64>,
+    #[cfg(target_os = "linux")]
+    vaapi: Option<VaapiFrames>,
 }
 
 impl VideoTranscoder {
@@ -519,7 +621,11 @@ impl VideoTranscoder {
             .formats()
             .map(|formats| formats.collect::<Vec<_>>())
             .unwrap_or_default();
-        let output_format = if advertised_formats.contains(&Pixel::NV12) {
+        #[cfg(target_os = "linux")]
+        let uses_vaapi = selected_encoder.name() == "h264_vaapi";
+        let output_format = if advertised_formats.contains(&Pixel::NV12)
+            || cfg!(target_os = "linux") && selected_encoder.name() == "h264_vaapi"
+        {
             Pixel::NV12
         } else {
             Pixel::YUV420P
@@ -541,6 +647,13 @@ impl VideoTranscoder {
         encoder.set_width(output_width);
         encoder.set_height(output_height);
         encoder.set_aspect_ratio(decoder.aspect_ratio());
+        #[cfg(target_os = "linux")]
+        encoder.set_format(if uses_vaapi {
+            Pixel::VAAPI
+        } else {
+            output_format
+        });
+        #[cfg(target_os = "macos")]
         encoder.set_format(output_format);
         encoder.set_bit_rate(VIDEO_BIT_RATE);
         encoder.set_max_bit_rate(VIDEO_BIT_RATE);
@@ -571,6 +684,10 @@ impl VideoTranscoder {
             encoder_flags.insert(codec::Flags::GLOBAL_HEADER);
         }
         encoder.set_flags(encoder_flags);
+        #[cfg(target_os = "linux")]
+        let vaapi = uses_vaapi
+            .then(|| VaapiFrames::attach(&mut encoder, output_width, output_height))
+            .transpose()?;
         let mut options = Dictionary::new();
         options.set(
             "profile",
@@ -615,6 +732,8 @@ impl VideoTranscoder {
             output_height,
             frame_duration,
             last_output_dts: None,
+            #[cfg(target_os = "linux")]
+            vaapi,
         })
     }
 
@@ -664,6 +783,18 @@ impl VideoTranscoder {
                 .context("could not convert a decoded video frame")?;
             converted.set_pts(decoded.timestamp());
             converted.set_kind(ffmpeg::picture::Type::None);
+            #[cfg(target_os = "linux")]
+            if let Some(vaapi) = &self.vaapi {
+                let uploaded = vaapi.upload(&converted)?;
+                self.encoder
+                    .send_frame(&uploaded)
+                    .context("VA-API H.264 encoder rejected a video frame")?;
+            } else {
+                self.encoder
+                    .send_frame(&converted)
+                    .context("H.264 encoder rejected a video frame")?;
+            }
+            #[cfg(target_os = "macos")]
             self.encoder
                 .send_frame(&converted)
                 .context("H.264 encoder rejected a video frame")?;
