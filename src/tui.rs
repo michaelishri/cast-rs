@@ -35,6 +35,10 @@ use crate::{
     discovery::{self, CastService, DeviceCapability, DiscoveryEvent, DiscoverySession},
     media::CompatibilityMode,
     playback::{PlaybackEvent, PlaybackHandle, PlaybackOptions, PreparationStage},
+    player_controls::{
+        LARGE_SEEK_BACKWARD_SECONDS, LARGE_SEEK_FORWARD_SECONDS, SEEK_BACKWARD_SECONDS,
+        SEEK_FORWARD_SECONDS, VOLUME_STEP,
+    },
     video::TranscodeDelivery,
 };
 
@@ -922,9 +926,17 @@ impl App {
             let action = usize::from(offset) * 3 / usize::from(self.regions.transport.width.max(1));
             let large_seek = self.show_shift_controls();
             match action {
-                0 => self.seek_by(if large_seek { -60.0 } else { -10.0 }),
+                0 => self.seek_by(if large_seek {
+                    LARGE_SEEK_BACKWARD_SECONDS
+                } else {
+                    SEEK_BACKWARD_SECONDS
+                }),
                 1 => self.toggle_playback(),
-                _ => self.seek_by(if large_seek { 60.0 } else { 10.0 }),
+                _ => self.seek_by(if large_seek {
+                    LARGE_SEEK_FORWARD_SECONDS
+                } else {
+                    SEEK_FORWARD_SECONDS
+                }),
             }
             return;
         }
@@ -1318,7 +1330,7 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let controls = if app.show_shift_controls() {
         "⇧← -60s   Space play/pause   +60s ⇧→"
     } else {
-        "← -10s   Space play/pause   +10s →"
+        "← -10s   Space play/pause   +30s →"
     };
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
@@ -1370,7 +1382,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(concat!(
             "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs  c receiver\n",
             "  Space play/pause  Esc stop  [/] previous/next  M mute  -/+ receiver volume\n",
-            "  ←/→ seek -/+10s  Shift-←/→ seek -/+60s\n\n",
+            "  ← seek -10s  → seek +30s  Shift-←/→ seek -/+60s\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
             "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
@@ -1512,21 +1524,21 @@ fn supported_video(path: &Path) -> bool {
 fn player_key_action(code: KeyCode, modifiers: KeyModifiers) -> Option<PlayerKeyAction> {
     match code {
         KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(PlayerKeyAction::Seek(-60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_BACKWARD_SECONDS))
         }
         KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(PlayerKeyAction::Seek(60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_FORWARD_SECONDS))
         }
-        KeyCode::Left => Some(PlayerKeyAction::Seek(-10.0)),
-        KeyCode::Right => Some(PlayerKeyAction::Seek(10.0)),
+        KeyCode::Left => Some(PlayerKeyAction::Seek(SEEK_BACKWARD_SECONDS)),
+        KeyCode::Right => Some(PlayerKeyAction::Seek(SEEK_FORWARD_SECONDS)),
         _ => None,
     }
 }
 
 fn volume_key_delta(character: char) -> Option<f32> {
     match character {
-        '+' | '=' => Some(0.05),
-        '-' => Some(-0.05),
+        '+' | '=' => Some(VOLUME_STEP),
+        '-' => Some(-VOLUME_STEP),
         _ => None,
     }
 }
@@ -1663,19 +1675,19 @@ mod tests {
     fn player_arrows_map_to_normal_and_shifted_seeks_only() {
         assert_eq!(
             player_key_action(KeyCode::Left, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Seek(-10.0))
+            Some(PlayerKeyAction::Seek(SEEK_BACKWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Right, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Seek(10.0))
+            Some(PlayerKeyAction::Seek(SEEK_FORWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Left, KeyModifiers::SHIFT),
-            Some(PlayerKeyAction::Seek(-60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_BACKWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Right, KeyModifiers::SHIFT),
-            Some(PlayerKeyAction::Seek(60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_FORWARD_SECONDS))
         );
         assert_eq!(player_key_action(KeyCode::Down, KeyModifiers::NONE), None);
         assert_eq!(player_key_action(KeyCode::Up, KeyModifiers::NONE), None);
@@ -1683,9 +1695,9 @@ mod tests {
 
     #[test]
     fn plus_and_minus_map_to_receiver_volume_steps() {
-        assert_eq!(volume_key_delta('+'), Some(0.05));
-        assert_eq!(volume_key_delta('='), Some(0.05));
-        assert_eq!(volume_key_delta('-'), Some(-0.05));
+        assert_eq!(volume_key_delta('+'), Some(VOLUME_STEP));
+        assert_eq!(volume_key_delta('='), Some(VOLUME_STEP));
+        assert_eq!(volume_key_delta('-'), Some(-VOLUME_STEP));
         assert_eq!(volume_key_delta('m'), None);
     }
 
@@ -1912,6 +1924,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(normal.contains("-10s"));
+        assert!(normal.contains("+30s"));
         assert!(!normal.contains("-60s"));
 
         app.shift_held = true;
