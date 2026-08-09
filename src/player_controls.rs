@@ -1,0 +1,5 @@
+pub const SEEK_BACKWARD_SECONDS: f32 = -10.0;
+pub const SEEK_FORWARD_SECONDS: f32 = 30.0;
+pub const LARGE_SEEK_BACKWARD_SECONDS: f32 = -60.0;
+pub const LARGE_SEEK_FORWARD_SECONDS: f32 = 60.0;
+pub const VOLUME_STEP: f32 = 0.05;

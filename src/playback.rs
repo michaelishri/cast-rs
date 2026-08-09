@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -28,6 +28,7 @@ use crate::{
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PREPARATION_TIMEOUT: Duration = Duration::from_secs(120);
+const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct PlaybackOptions {
@@ -66,18 +67,74 @@ pub enum PlaybackEvent {
     Failed(MediaFailure),
 }
 
+struct PreparationProgressEmitter {
+    events: Sender<PlaybackEvent>,
+    last_sent: Option<Instant>,
+}
+
+impl PreparationProgressEmitter {
+    fn new(events: Sender<PlaybackEvent>) -> Self {
+        Self {
+            events,
+            last_sent: None,
+        }
+    }
+
+    fn report(&mut self, percent: f64) {
+        self.report_at(percent, Instant::now());
+    }
+
+    fn report_at(&mut self, percent: f64, now: Instant) {
+        if self.last_sent.is_some_and(|last| {
+            now.saturating_duration_since(last) < PROGRESS_EVENT_INTERVAL && percent < 100.0
+        }) {
+            return;
+        }
+        self.last_sent = Some(now);
+        let _ = self.events.send(PlaybackEvent::Preparing {
+            stage: PreparationStage::Transcoding,
+            percent: Some(percent),
+        });
+    }
+}
+
 enum PlaybackCommand {
     Toggle,
     SeekBy(f32),
     SeekTo(f32),
-    Volume(f32),
+    Volume,
     Mute(bool),
     SwitchReceiver(IpAddr),
     Stop,
 }
 
+#[derive(Default)]
+struct VolumeMailbox {
+    pending: Mutex<Option<f32>>,
+}
+
+impl VolumeMailbox {
+    fn submit(&self, level: f32) -> bool {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let should_wake = pending.is_none();
+        *pending = Some(level.clamp(0.0, 1.0));
+        should_wake
+    }
+
+    fn take(&self) -> Option<f32> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
 pub struct PlaybackHandle {
     commands: Sender<PlaybackCommand>,
+    volume: Arc<VolumeMailbox>,
     events: Receiver<PlaybackEvent>,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -89,11 +146,18 @@ impl PlaybackHandle {
         let (event_sender, events) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let volume = Arc::new(VolumeMailbox::default());
+        let worker_volume = Arc::clone(&volume);
         let worker = thread::Builder::new()
             .name("cast-video-playback".to_owned())
             .spawn(move || {
-                if let Err(error) = run(options, &command_receiver, &event_sender, &worker_cancel)
-                    && !worker_cancel.load(Ordering::SeqCst)
+                if let Err(error) = run(
+                    options,
+                    &command_receiver,
+                    &event_sender,
+                    &worker_cancel,
+                    &worker_volume,
+                ) && !worker_cancel.load(Ordering::SeqCst)
                 {
                     let _ = event_sender.send(PlaybackEvent::Failed(classify_error(&error)));
                 }
@@ -101,14 +165,15 @@ impl PlaybackHandle {
             .context("could not start local-video playback worker")?;
         Ok(Self {
             commands,
+            volume,
             events,
             cancel,
             worker: Some(worker),
         })
     }
 
-    pub fn try_recv(&self) -> std::result::Result<PlaybackEvent, mpsc::TryRecvError> {
-        self.events.try_recv()
+    pub fn drain_events(&self, limit: usize) -> Vec<PlaybackEvent> {
+        drain_receiver(&self.events, limit)
     }
 
     pub fn toggle(&self) -> Result<()> {
@@ -124,7 +189,13 @@ impl PlaybackHandle {
     }
 
     pub fn set_volume(&self, level: f32) -> Result<()> {
-        self.send(PlaybackCommand::Volume(level))
+        if self.volume.submit(level)
+            && let Err(error) = self.send(PlaybackCommand::Volume)
+        {
+            let _ = self.volume.take();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn set_muted(&self, muted: bool) -> Result<()> {
@@ -155,6 +226,10 @@ impl PlaybackHandle {
             .join()
             .map_err(|_| anyhow!("local-video playback worker panicked"))
     }
+}
+
+fn drain_receiver<T>(receiver: &Receiver<T>, limit: usize) -> Vec<T> {
+    receiver.try_iter().take(limit).collect()
 }
 
 impl Drop for PlaybackHandle {
@@ -243,6 +318,7 @@ fn run(
     commands: &Receiver<PlaybackCommand>,
     events: &Sender<PlaybackEvent>,
     cancel: &Arc<AtomicBool>,
+    volume: &VolumeMailbox,
 ) -> Result<()> {
     let source = prepare(&options, events, cancel)?;
     if cancel.load(Ordering::SeqCst) {
@@ -264,7 +340,11 @@ fn run(
                 PlaybackCommand::Toggle => session.toggle_playback()?,
                 PlaybackCommand::SeekBy(seconds) => session.seek_by(seconds)?,
                 PlaybackCommand::SeekTo(seconds) => session.seek_to(seconds)?,
-                PlaybackCommand::Volume(level) => session.set_volume(level)?,
+                PlaybackCommand::Volume => {
+                    if let Some(level) = volume.take() {
+                        session.set_volume(level)?;
+                    }
+                }
                 PlaybackCommand::Mute(muted) => session.set_muted(muted)?,
                 PlaybackCommand::SwitchReceiver(next) if next != receiver => {
                     let position = interpolated_position(status, Instant::now());
@@ -336,7 +416,7 @@ fn prepare(
         percent: None,
     });
     let path = validate_path(&options.path)?;
-    let info = media::inspect(&path)?;
+    let info = media::inspect_quiet(&path)?;
     let plan = media::plan(&info, options.compatibility_mode)?;
     let title = display_title(&path);
     let duration = info.duration;
@@ -402,7 +482,7 @@ fn prepare_transcode(
             local_ip_for(options.receiver, options.cast_port)?,
             options.http_port,
         );
-        let sender = events.clone();
+        let mut progress_events = PreparationProgressEmitter::new(events.clone());
         let preparation = IncrementalHlsPreparation::start(
             path.to_owned(),
             info.clone(),
@@ -411,10 +491,7 @@ fn prepare_transcode(
             private_route()?,
             0.0,
             move |progress| {
-                let _ = sender.send(PlaybackEvent::Preparing {
-                    stage: PreparationStage::Transcoding,
-                    percent: Some(progress.percent),
-                });
+                progress_events.report(progress.percent);
             },
         )?;
         preparation.wait_until_playable(0.0, cancel, PREPARATION_TIMEOUT)?;
@@ -429,7 +506,7 @@ fn prepare_transcode(
         })
     } else {
         let (directory, output) = media::temporary_mp4_path()?;
-        let sender = events.clone();
+        let mut progress_events = PreparationProgressEmitter::new(events.clone());
         media::transcode_to_mp4_with_tracks(
             path,
             &output,
@@ -437,10 +514,7 @@ fn prepare_transcode(
             tracks,
             cancel,
             move |progress| {
-                let _ = sender.send(PlaybackEvent::Preparing {
-                    stage: PreparationStage::Transcoding,
-                    percent: Some(progress.percent),
-                });
+                progress_events.report(progress.percent);
                 Ok(())
             },
         )?;
@@ -594,5 +668,45 @@ mod tests {
             classify_error(&anyhow!("transcode failed")).kind,
             MediaFailureKind::Decode
         );
+    }
+
+    #[test]
+    fn progress_rate_and_per_tick_drain_are_bounded_under_load() {
+        let (sender, receiver) = mpsc::channel();
+        let mut progress = PreparationProgressEmitter::new(sender);
+        let started = Instant::now();
+        for index in 0_u32..1_000 {
+            progress.report_at(
+                f64::from(index) / 10.0,
+                started + Duration::from_millis(u64::from(index)),
+            );
+        }
+        let first_tick = drain_receiver(&receiver, 4);
+        assert_eq!(first_tick.len(), 4);
+        let remaining = drain_receiver(&receiver, usize::MAX);
+        assert!(remaining.len() <= 7);
+    }
+
+    #[test]
+    fn volume_mailbox_coalesces_pending_levels_into_one_wakeup() {
+        let volume = VolumeMailbox::default();
+        assert!(volume.submit(0.35));
+        assert!(!volume.submit(0.4));
+        assert!(!volume.submit(0.45));
+        assert_eq!(volume.take(), Some(0.45));
+        assert_eq!(volume.take(), None);
+    }
+
+    #[test]
+    fn volume_changes_during_an_inflight_request_schedule_one_latest_followup() {
+        let volume = VolumeMailbox::default();
+        assert!(volume.submit(0.5));
+        assert_eq!(volume.take(), Some(0.5));
+
+        assert!(volume.submit(0.55));
+        assert!(!volume.submit(0.6));
+        assert!(!volume.submit(0.65));
+        assert_eq!(volume.take(), Some(0.65));
+        assert_eq!(volume.take(), None);
     }
 }

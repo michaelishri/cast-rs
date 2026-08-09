@@ -23,6 +23,7 @@ use rust_cast::{
     channels::{
         connection::ConnectionResponse, heartbeat::HeartbeatResponse, receiver::CastDeviceApp,
     },
+    errors::Error as CastError,
     message_manager::{CastMessage, CastMessagePayload},
 };
 use screencapturekit::IOSurface;
@@ -32,7 +33,9 @@ use serde_json::Value;
 use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
-use crate::audio::{self, AudioFrameHandler, AudioWorker, MediaClock};
+use crate::audio::{
+    self, AudioFrameHandler, AudioWorker, LocalOutputControl, LocalOutputRedirect, MediaClock,
+};
 use crate::synthetic::{
     SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticFrameGenerator, SyntheticPhase,
     phase_for_frame,
@@ -896,6 +899,32 @@ fn run_desktop(
     } else {
         log::debug!("latest-frame-wins queue enabled without a raw-frame deadline");
     }
+    let volume_controls = targets
+        .iter()
+        .filter(|target| target.transport.audio.is_some())
+        .map(|target| Arc::clone(&target.transport.control))
+        .collect::<Vec<_>>();
+    let local_output_redirect = if audio_submitter.is_some() {
+        match LocalOutputRedirect::start(move |control| {
+            let command = match control {
+                LocalOutputControl::Volume(level) => ReceiverVolumeCommand::SetLevel(level),
+                LocalOutputControl::ToggleMute => ReceiverVolumeCommand::ToggleMute,
+            };
+            for target in &volume_controls {
+                target.request_volume(command);
+            }
+        }) {
+            Ok(redirect) => Some(redirect),
+            Err(error) => {
+                eprintln!(
+                    "Could not suppress local desktop audio or route volume controls to the receiver: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let input = if options.synthetic {
         println!(
             "Profiling {SYNTHETIC_WORKLOAD_NAME} deterministic 420v frames at {}x{}, {} fps, probe delay {} ms...",
@@ -1062,6 +1091,7 @@ fn run_desktop(
     }
 
     let input_result = input.stop_and_release();
+    let output_result = local_output_redirect.map_or(Ok(()), LocalOutputRedirect::stop);
     // Stopping an SCStream does not release the stream or its content filter.
     // Drop the capture graph before removing a virtual source display so
     // ScreenCaptureKit cannot keep that display registered with WindowServer.
@@ -1082,7 +1112,11 @@ fn run_desktop(
             Err(error) => Err(error),
         };
     }
-    if run_result.is_err() || input_result.is_err() || sender_result.is_err() {
+    if run_result.is_err()
+        || input_result.is_err()
+        || output_result.is_err()
+        || sender_result.is_err()
+    {
         interrupted.store(true, Ordering::SeqCst);
     }
     for target in &mut targets {
@@ -1146,6 +1180,7 @@ fn run_desktop(
 
     run_result?;
     input_result?;
+    output_result?;
     sender_result?;
     display_result?;
     profile_result
@@ -2323,11 +2358,38 @@ impl Drop for NegotiatedTarget {
     }
 }
 
-#[derive(Default)]
 struct CastStreamingControlState {
     close_expected: AtomicBool,
     ready: AtomicBool,
     failure: Mutex<Option<String>>,
+    volume_commands: mpsc::Sender<ReceiverVolumeCommand>,
+}
+
+impl CastStreamingControlState {
+    fn request_volume(&self, command: ReceiverVolumeCommand) {
+        if self.volume_commands.send(command).is_err() {
+            log::warn!("Cast Streaming volume control channel has closed");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for CastStreamingControlState {
+    fn default() -> Self {
+        let (volume_commands, _) = mpsc::channel();
+        Self {
+            close_expected: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            failure: Mutex::new(None),
+            volume_commands,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiverVolumeCommand {
+    SetLevel(f32),
+    ToggleMute,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2427,7 +2489,13 @@ fn negotiate_cast_streaming(
         h264_level,
     );
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-    let thread_control = Arc::new(CastStreamingControlState::default());
+    let (volume_commands, volume_command_receiver) = mpsc::channel();
+    let thread_control = Arc::new(CastStreamingControlState {
+        close_expected: AtomicBool::new(false),
+        ready: AtomicBool::new(false),
+        failure: Mutex::new(None),
+        volume_commands,
+    });
     thread::Builder::new()
         .name("cast-mirror-control".into())
         .spawn(move || {
@@ -2438,6 +2506,7 @@ fn negotiate_cast_streaming(
                 offer,
                 &ready_sender,
                 Arc::clone(&thread_control),
+                volume_command_receiver,
             );
             if let Err(error) = result {
                 let message = format!("{error:#}");
@@ -2471,6 +2540,7 @@ fn negotiate_cast_streaming_inner(
     offer: CastStreamingOfferMessage,
     ready: &mpsc::SyncSender<Result<NegotiatedTransport>>,
     shared_control: Arc<CastStreamingControlState>,
+    volume_commands: mpsc::Receiver<ReceiverVolumeCommand>,
 ) -> Result<()> {
     eprintln!("Connecting to Cast receiver at {host}:{port}...");
     let device = CastDevice::connect_without_host_verification(host.to_string(), port)
@@ -2488,6 +2558,7 @@ fn negotiate_cast_streaming_inner(
         .receiver
         .get_status()
         .context("could not inspect the Cast receiver before mirroring")?;
+    let receiver_muted = status.volume.muted.unwrap_or(false);
     for existing in status
         .applications
         .into_iter()
@@ -2576,7 +2647,10 @@ fn negotiate_cast_streaming_inner(
         .map_err(|_| anyhow!("caller stopped waiting for Cast Streaming negotiation"))?;
     shared_control.ready.store(true, Ordering::SeqCst);
 
-    monitor_cast_streaming_control(&device)
+    device
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .context("could not make Cast Streaming controls interruptible")?;
+    monitor_cast_streaming_control(&device, &volume_commands, receiver_muted)
 }
 
 fn stop_cast_streaming_session(host: IpAddr, port: u16, session_id: &str) -> Result<()> {
@@ -2662,7 +2736,12 @@ fn parse_answer(message: CastMessage, expected_sequence: u32) -> Result<Option<A
     })?))
 }
 
-fn receive_cast_streaming_message(device: &CastDevice<'_>) -> Result<ChannelMessage> {
+fn receive_cast_streaming_message(
+    device: &CastDevice<'_>,
+) -> std::result::Result<ChannelMessage, CastError> {
+    if let Some(message) = device.receive_buffered()? {
+        return Ok(message);
+    }
     let message = device.receive_raw()?;
     if device.connection.can_handle(&message) {
         return Ok(ChannelMessage::Connection(
@@ -2675,27 +2754,54 @@ fn receive_cast_streaming_message(device: &CastDevice<'_>) -> Result<ChannelMess
     Ok(ChannelMessage::Raw(message))
 }
 
-fn monitor_cast_streaming_control(device: &CastDevice<'_>) -> Result<()> {
+fn monitor_cast_streaming_control(
+    device: &CastDevice<'_>,
+    volume_commands: &mpsc::Receiver<ReceiverVolumeCommand>,
+    mut muted: bool,
+) -> Result<()> {
     log::debug!("monitoring Cast Streaming control channel");
     loop {
-        match receive_cast_streaming_message(device)
-            .context("could not receive the next Cast Streaming control message")?
-        {
-            ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => {
+        while let Ok(command) = volume_commands.try_recv() {
+            let result = match command {
+                ReceiverVolumeCommand::SetLevel(level) => {
+                    device.receiver.set_volume(level.clamp(0.0, 1.0))
+                }
+                ReceiverVolumeCommand::ToggleMute => device.receiver.set_volume(!muted),
+            };
+            match result {
+                Ok(volume) => muted = volume.muted.unwrap_or(muted),
+                Err(error) => log::warn!("receiver rejected desktop volume control: {error}"),
+            }
+        }
+        match receive_cast_streaming_message(device) {
+            Ok(ChannelMessage::Heartbeat(HeartbeatResponse::Ping)) => {
                 device
                     .heartbeat
                     .pong()
                     .context("could not answer Cast heartbeat")?;
             }
-            ChannelMessage::Connection(ConnectionResponse::Close) => {
+            Ok(ChannelMessage::Connection(ConnectionResponse::Close)) => {
                 bail!("Cast Streaming receiver closed the application connection");
             }
-            ChannelMessage::Raw(message) => {
+            Ok(ChannelMessage::Raw(message)) => {
                 log::debug!("Cast Streaming receiver message: {message:?}");
             }
-            message => log::trace!("Cast Streaming control message: {message:?}"),
+            Ok(message) => log::trace!("Cast Streaming control message: {message:?}"),
+            Err(error) if cast_receive_timed_out(&error) => {}
+            Err(error) => {
+                return Err(error)
+                    .context("could not receive the next Cast Streaming control message");
+            }
         }
     }
+}
+
+fn cast_receive_timed_out(error: &CastError) -> bool {
+    matches!(
+        error,
+        CastError::Io(error)
+            if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    )
 }
 
 #[derive(Debug)]

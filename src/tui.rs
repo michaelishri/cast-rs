@@ -35,6 +35,10 @@ use crate::{
     discovery::{self, CastService, DeviceCapability, DiscoveryEvent, DiscoverySession},
     media::CompatibilityMode,
     playback::{PlaybackEvent, PlaybackHandle, PlaybackOptions, PreparationStage},
+    player_controls::{
+        LARGE_SEEK_BACKWARD_SECONDS, LARGE_SEEK_FORWARD_SECONDS, SEEK_BACKWARD_SECONDS,
+        SEEK_FORWARD_SECONDS, VOLUME_STEP,
+    },
     video::TranscodeDelivery,
 };
 
@@ -43,6 +47,12 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 18;
 const LOG_CAPACITY: usize = 500;
+const MAX_PLAYBACK_EVENTS_PER_TICK: usize = 16;
+const MAX_TERMINAL_EVENTS_PER_TICK: usize = 64;
+const PRESS_DEBOUNCE: Duration = Duration::from_millis(30);
+const NAVIGATION_REPEAT_INTERVAL: Duration = Duration::from_millis(50);
+const VOLUME_REPEAT_INTERVAL: Duration = Duration::from_millis(125);
+const SEEK_REPEAT_INTERVAL: Duration = Duration::from_millis(250);
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3g2", "3gp", "asf", "avi", "f4v", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg",
     "mpg", "mts", "ogm", "ogv", "ts", "vob", "webm", "wmv",
@@ -62,32 +72,63 @@ pub struct TuiOptions {
 enum Focus {
     Files,
     Playlist,
-    Player,
-    Receiver,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PlayerKeyAction {
     Seek(f32),
-    Volume(f32),
+}
+
+#[derive(Debug, Default)]
+struct KeyDebouncer {
+    last_accepted: Option<(KeyCode, KeyModifiers, Instant)>,
+}
+
+impl KeyDebouncer {
+    fn accept(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        let repeat_interval = key_repeat_interval(key.code);
+        if key.kind == KeyEventKind::Repeat && repeat_interval.is_none() {
+            return false;
+        }
+        let interval = repeat_interval.unwrap_or(PRESS_DEBOUNCE);
+        if self
+            .last_accepted
+            .as_ref()
+            .is_some_and(|(code, modifiers, accepted)| {
+                *code == key.code
+                    && *modifiers == key.modifiers
+                    && now.saturating_duration_since(*accepted) < interval
+            })
+        {
+            return false;
+        }
+        self.last_accepted = Some((key.code, key.modifiers, now));
+        true
+    }
+
+    fn release(&mut self, key: &KeyEvent) {
+        if self
+            .last_accepted
+            .as_ref()
+            .is_some_and(|(code, modifiers, _)| *code == key.code && *modifiers == key.modifiers)
+        {
+            self.last_accepted = None;
+        }
+    }
 }
 
 impl Focus {
     fn next(self) -> Self {
         match self {
             Self::Files => Self::Playlist,
-            Self::Playlist => Self::Player,
-            Self::Player => Self::Receiver,
-            Self::Receiver => Self::Files,
+            Self::Playlist => Self::Files,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Files => Self::Receiver,
+            Self::Files => Self::Playlist,
             Self::Playlist => Self::Files,
-            Self::Player => Self::Playlist,
-            Self::Receiver => Self::Player,
         }
     }
 }
@@ -319,7 +360,6 @@ struct Regions {
     receiver: Rect,
     progress: Rect,
     volume: Rect,
-    mute: Rect,
     transport: Rect,
 }
 
@@ -350,6 +390,7 @@ struct App {
     log_scroll: usize,
     regions: Regions,
     last_click: Option<LastClick>,
+    key_debouncer: KeyDebouncer,
     shift_held: bool,
     shift_hint_until: Option<Instant>,
     quit: bool,
@@ -392,6 +433,7 @@ impl App {
             log_scroll: 0,
             regions: Regions::default(),
             last_click: None,
+            key_debouncer: KeyDebouncer::default(),
             shift_held: false,
             shift_hint_until: None,
             quit: false,
@@ -444,7 +486,7 @@ impl App {
     fn poll_playback(&mut self) {
         let mut terminal_event = None;
         if let Some(playback) = &self.playback {
-            while let Ok(event) = playback.try_recv() {
+            for event in playback.drain_events(MAX_PLAYBACK_EVENTS_PER_TICK) {
                 match event {
                     PlaybackEvent::Preparing { stage, percent } => {
                         self.preparation = Some((stage, percent));
@@ -526,7 +568,6 @@ impl App {
         };
         let Some(receiver) = self.receiver().map(|receiver| receiver.address) else {
             self.receiver_picker = true;
-            self.focus = Focus::Receiver;
             self.status = "Choose a receiver before playing".to_owned();
             return;
         };
@@ -582,9 +623,17 @@ impl App {
     }
 
     fn adjust_volume(&mut self, delta: f32) {
+        let level = (self.volume.level.unwrap_or(0.5) + delta).clamp(0.0, 1.0);
+        self.set_volume(level);
+    }
+
+    fn set_volume(&mut self, level: f32) {
+        let level = level.clamp(0.0, 1.0);
         if let Some(playback) = &self.playback {
-            let level = self.volume.level.unwrap_or(0.5) + delta;
-            let _ = playback.set_volume(level.clamp(0.0, 1.0));
+            self.volume.level = Some(level);
+            if let Err(error) = playback.set_volume(level) {
+                self.status = format!("Receiver volume control failed: {error:#}");
+            }
         }
     }
 
@@ -642,6 +691,10 @@ impl App {
             return;
         }
         if key.kind == KeyEventKind::Release {
+            self.key_debouncer.release(&key);
+            return;
+        }
+        if !self.key_debouncer.accept(&key, Instant::now()) {
             return;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -652,6 +705,10 @@ impl App {
         }
         if self.help || self.logs_open || self.receiver_picker {
             self.handle_overlay_key(key);
+            return;
+        }
+        if let Some(PlayerKeyAction::Seek(seconds)) = player_key_action(key.code, key.modifiers) {
+            self.seek_by(seconds);
             return;
         }
         match (key.code, key.modifiers) {
@@ -666,6 +723,7 @@ impl App {
             (KeyCode::Tab, _) => self.focus = self.focus.next(),
             (KeyCode::Char('?'), _) => self.help = true,
             (KeyCode::Char('l'), _) => self.logs_open = true,
+            (KeyCode::Char('c' | 'C'), _) => self.receiver_picker = true,
             (KeyCode::Char(' '), _) => self.toggle_playback(),
             (KeyCode::Esc, _) => {
                 self.stop_playback();
@@ -682,8 +740,9 @@ impl App {
                     let _ = playback.set_muted(!self.volume.muted.unwrap_or(false));
                 }
             }
-            (KeyCode::Char('+') | KeyCode::Char('='), _) => self.adjust_volume(0.05),
-            (KeyCode::Char('-'), _) => self.adjust_volume(-0.05),
+            (KeyCode::Char(character), _) if volume_key_delta(character).is_some() => {
+                self.adjust_volume(volume_key_delta(character).unwrap_or_default())
+            }
             _ => self.handle_focused_key(key),
         }
     }
@@ -745,16 +804,6 @@ impl App {
                     }
                 }
                 (KeyCode::Delete | KeyCode::Backspace, _) => self.remove_selected(),
-                _ => {}
-            },
-            Focus::Player => match player_key_action(key.code, key.modifiers) {
-                Some(PlayerKeyAction::Seek(seconds)) => self.seek_by(seconds),
-                Some(PlayerKeyAction::Volume(delta)) => self.adjust_volume(delta),
-                None => {}
-            },
-            Focus::Receiver => match key.code {
-                KeyCode::Enter => self.receiver_picker = true,
-                KeyCode::Char('r') => self.rescan(),
                 _ => {}
             },
         }
@@ -874,41 +923,30 @@ impl App {
         }
         if self.regions.transport.contains(point) {
             let offset = point.x.saturating_sub(self.regions.transport.x);
-            let action = usize::from(offset) * 6 / usize::from(self.regions.transport.width.max(1));
+            let action = usize::from(offset) * 3 / usize::from(self.regions.transport.width.max(1));
             let large_seek = self.show_shift_controls();
             match action {
-                0 => self.previous(),
-                1 => self.seek_by(if large_seek { -60.0 } else { -10.0 }),
-                2 => self.toggle_playback(),
-                3 => self.seek_by(if large_seek { 60.0 } else { 10.0 }),
-                4 => {
-                    if self.playlist.advance().is_some() {
-                        self.start_current();
-                    }
-                }
-                _ => {
-                    self.stop_playback();
-                    self.status = "Stopped".to_owned();
-                }
-            }
-            return;
-        }
-        if self.regions.mute.contains(point) {
-            if let Some(playback) = &self.playback {
-                let _ = playback.set_muted(!self.volume.muted.unwrap_or(false));
+                0 => self.seek_by(if large_seek {
+                    LARGE_SEEK_BACKWARD_SECONDS
+                } else {
+                    SEEK_BACKWARD_SECONDS
+                }),
+                1 => self.toggle_playback(),
+                _ => self.seek_by(if large_seek {
+                    LARGE_SEEK_FORWARD_SECONDS
+                } else {
+                    SEEK_FORWARD_SECONDS
+                }),
             }
             return;
         }
         if self.regions.volume.contains(point) {
             let ratio = f32::from(point.x.saturating_sub(self.regions.volume.x))
                 / f32::from(self.regions.volume.width.max(1));
-            if let Some(playback) = &self.playback {
-                let _ = playback.set_volume(ratio);
-            }
+            self.set_volume(ratio);
             return;
         }
         if self.regions.receiver.contains(point) {
-            self.focus = Focus::Receiver;
             self.receiver_picker = true;
             return;
         }
@@ -933,7 +971,6 @@ impl App {
                 }
             }
         } else if self.regions.player.contains(point) {
-            self.focus = Focus::Player;
             self.toggle_playback();
         }
     }
@@ -1097,16 +1134,30 @@ pub fn run(options: TuiOptions, log_receiver: Receiver<String>) -> Result<()> {
     while !app.quit {
         app.tick(&log_receiver);
         terminal.terminal.draw(|frame| render(frame, &mut app))?;
-        if event::poll(TICK).context("could not poll terminal events")? {
-            match event::read().context("could not read terminal event")? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
-            }
-        }
+        process_terminal_events(&mut app)?;
     }
     app.stop_playback();
     terminal.restore()
+}
+
+fn process_terminal_events(app: &mut App) -> Result<()> {
+    if !event::poll(TICK).context("could not poll terminal events")? {
+        return Ok(());
+    }
+    for index in 0..MAX_TERMINAL_EVENTS_PER_TICK {
+        match event::read().context("could not read terminal event")? {
+            Event::Key(key) => app.handle_key(key),
+            Event::Mouse(mouse) => app.handle_mouse(mouse),
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        }
+        if app.quit
+            || index + 1 == MAX_TERMINAL_EVENTS_PER_TICK
+            || !event::poll(Duration::ZERO).context("could not poll pending terminal events")?
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -1127,7 +1178,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(9)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
         .split(area);
     let upper = Layout::default()
         .direction(Direction::Horizontal)
@@ -1139,6 +1194,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_files(frame, app, upper[0]);
     render_playlist(frame, app, upper[1]);
     render_player(frame, app, vertical[1]);
+    render_footer(frame, vertical[2]);
 
     if app.help {
         render_help(frame, area);
@@ -1207,17 +1263,15 @@ fn render_playlist(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let inner = focus_block(" Player ", app.focus == Focus::Player).inner(area);
-    frame.render_widget(focus_block(" Player ", app.focus == Focus::Player), area);
+    let block = Block::default().borders(Borders::ALL).title(" Player ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
         ])
         .split(inner);
     let title = app.playlist.current_entry().map_or_else(
@@ -1231,9 +1285,28 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .into_owned()
         },
     );
+    let heading = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(rows[0]);
     frame.render_widget(
         Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
-        rows[0],
+        heading[0],
+    );
+    let status = app.preparation.map_or_else(
+        || app.status.clone(),
+        |(stage, percent)| {
+            percent.map_or_else(
+                || preparation_label(stage).to_owned(),
+                |value| format!("{} {:.0}%", preparation_label(stage), value),
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(status)
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::Yellow)),
+        heading[1],
     );
 
     let position = app.position_at(Instant::now());
@@ -1255,35 +1328,19 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
 
     let controls = if app.show_shift_controls() {
-        "[ previous   ⇧← -60s   Space play/pause   +60s ⇧→   ] next   Esc stop"
+        "⇧← -60s   Space play/pause   +60s ⇧→"
     } else {
-        "[ previous   ← -10s   Space play/pause   +10s →   ] next   Esc stop"
+        "← -10s   Space play/pause   +30s →"
     };
-    app.regions.transport = rows[2];
-    frame.render_widget(
-        Paragraph::new(controls).alignment(Alignment::Center),
-        rows[2],
-    );
-
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(7),
-            Constraint::Length(18),
-            Constraint::Min(10),
-            Constraint::Length(30),
+            Constraint::Length(16),
+            Constraint::Min(28),
+            Constraint::Length(20),
         ])
-        .split(rows[3]);
-    app.regions.mute = bottom[0];
-    frame.render_widget(
-        Paragraph::new(if app.volume.muted.unwrap_or(false) {
-            "🔇 mute"
-        } else {
-            "🔊 mute"
-        }),
-        bottom[0],
-    );
-    app.regions.volume = bottom[1];
+        .split(rows[2]);
+    app.regions.volume = bottom[0];
     frame.render_widget(
         Gauge::default()
             .ratio(f64::from(app.volume.level.unwrap_or(0.0).clamp(0.0, 1.0)))
@@ -1291,42 +1348,31 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 "Volume {:.0}%",
                 app.volume.level.unwrap_or(0.0) * 100.0
             )),
+        bottom[0],
+    );
+    app.regions.transport = bottom[1];
+    frame.render_widget(
+        Paragraph::new(controls).alignment(Alignment::Center),
         bottom[1],
     );
-    frame.render_widget(Paragraph::new(app.status.as_str()), bottom[2]);
-    app.regions.receiver = bottom[3];
+    app.regions.receiver = bottom[2];
     let receiver = app
         .receiver()
         .map_or("Choose receiver", |receiver| receiver.name.as_str());
     frame.render_widget(
         Paragraph::new(format!("▣ {receiver}"))
             .alignment(Alignment::Right)
-            .style(if app.focus == Focus::Receiver {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            }),
-        bottom[3],
+            .style(Style::default().fg(Color::Yellow)),
+        bottom[2],
     );
+}
 
-    if let Some((stage, percent)) = app.preparation {
-        let text = percent.map_or_else(
-            || preparation_label(stage).to_owned(),
-            |value| format!("{} {:.0}%", preparation_label(stage), value),
-        );
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
-            rows[4],
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new("? help   l logs   Tab focus   q quit")
-                .style(Style::default().fg(Color::DarkGray)),
-            rows[4],
-        );
-    }
+fn render_footer(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new("? help   c receiver   m mute   Tab focus   q quit")
+            .style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -1334,13 +1380,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(concat!(
-            "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs\n",
-            "  Space play/pause  Esc stop  [/] previous/next  M mute  +/- volume\n\n",
+            "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs  c receiver\n",
+            "  Space play/pause  Esc stop  [/] previous/next  M mute  -/+ receiver volume\n",
+            "  ← seek -10s  → seek +30s  Shift-←/→ seek -/+60s\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
             "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
-            "Player\n  ←/→ seek -/+10s  Shift-←/→ seek -/+60s  ↓/↑ volume -/+5%\n\n",
-            "Receiver\n  Enter choose receiver  r rescan\n\n",
+            "Player\n  Transport controls remain active while either section is focused\n\n",
+            "Receiver\n  c choose receiver  r rescan from the receiver dialog\n\n",
             "Mouse\n  Click to focus/select, double-click to activate, wheel to scroll,\n",
             "  click progress/volume gauges to set them. Escape closes overlays."
         ))
@@ -1477,15 +1524,35 @@ fn supported_video(path: &Path) -> bool {
 fn player_key_action(code: KeyCode, modifiers: KeyModifiers) -> Option<PlayerKeyAction> {
     match code {
         KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(PlayerKeyAction::Seek(-60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_BACKWARD_SECONDS))
         }
         KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(PlayerKeyAction::Seek(60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_FORWARD_SECONDS))
         }
-        KeyCode::Left => Some(PlayerKeyAction::Seek(-10.0)),
-        KeyCode::Right => Some(PlayerKeyAction::Seek(10.0)),
-        KeyCode::Down => Some(PlayerKeyAction::Volume(-0.05)),
-        KeyCode::Up => Some(PlayerKeyAction::Volume(0.05)),
+        KeyCode::Left => Some(PlayerKeyAction::Seek(SEEK_BACKWARD_SECONDS)),
+        KeyCode::Right => Some(PlayerKeyAction::Seek(SEEK_FORWARD_SECONDS)),
+        _ => None,
+    }
+}
+
+fn volume_key_delta(character: char) -> Option<f32> {
+    match character {
+        '+' | '=' => Some(VOLUME_STEP),
+        '-' => Some(-VOLUME_STEP),
+        _ => None,
+    }
+}
+
+fn key_repeat_interval(code: KeyCode) -> Option<Duration> {
+    match code {
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => Some(NAVIGATION_REPEAT_INTERVAL),
+        KeyCode::Char('+' | '=' | '-') => Some(VOLUME_REPEAT_INTERVAL),
+        KeyCode::Left | KeyCode::Right => Some(SEEK_REPEAT_INTERVAL),
         _ => None,
     }
 }
@@ -1520,10 +1587,9 @@ mod tests {
     #[test]
     fn focus_cycles_in_both_directions() {
         assert_eq!(Focus::Files.next(), Focus::Playlist);
-        assert_eq!(Focus::Playlist.next(), Focus::Player);
-        assert_eq!(Focus::Player.next(), Focus::Receiver);
-        assert_eq!(Focus::Receiver.next(), Focus::Files);
-        assert_eq!(Focus::Files.previous(), Focus::Receiver);
+        assert_eq!(Focus::Playlist.next(), Focus::Files);
+        assert_eq!(Focus::Files.previous(), Focus::Playlist);
+        assert_eq!(Focus::Playlist.previous(), Focus::Files);
     }
 
     #[test]
@@ -1606,31 +1672,81 @@ mod tests {
     }
 
     #[test]
-    fn player_arrows_map_to_normal_and_shifted_seeks_and_volume_steps() {
+    fn player_arrows_map_to_normal_and_shifted_seeks_only() {
         assert_eq!(
             player_key_action(KeyCode::Left, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Seek(-10.0))
+            Some(PlayerKeyAction::Seek(SEEK_BACKWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Right, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Seek(10.0))
+            Some(PlayerKeyAction::Seek(SEEK_FORWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Left, KeyModifiers::SHIFT),
-            Some(PlayerKeyAction::Seek(-60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_BACKWARD_SECONDS))
         );
         assert_eq!(
             player_key_action(KeyCode::Right, KeyModifiers::SHIFT),
-            Some(PlayerKeyAction::Seek(60.0))
+            Some(PlayerKeyAction::Seek(LARGE_SEEK_FORWARD_SECONDS))
         );
-        assert_eq!(
-            player_key_action(KeyCode::Down, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Volume(-0.05))
+        assert_eq!(player_key_action(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(player_key_action(KeyCode::Up, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn plus_and_minus_map_to_receiver_volume_steps() {
+        assert_eq!(volume_key_delta('+'), Some(VOLUME_STEP));
+        assert_eq!(volume_key_delta('='), Some(VOLUME_STEP));
+        assert_eq!(volume_key_delta('-'), Some(-VOLUME_STEP));
+        assert_eq!(volume_key_delta('m'), None);
+    }
+
+    #[test]
+    fn held_keys_are_throttled_by_action_and_one_shot_repeats_are_ignored() {
+        let start = Instant::now();
+        let mut debouncer = KeyDebouncer::default();
+        let volume_press = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT);
+        let volume_repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('+'),
+            KeyModifiers::SHIFT,
+            KeyEventKind::Repeat,
         );
-        assert_eq!(
-            player_key_action(KeyCode::Up, KeyModifiers::NONE),
-            Some(PlayerKeyAction::Volume(0.05))
+        assert!(debouncer.accept(&volume_press, start));
+        assert!(!debouncer.accept(&volume_press, start + Duration::from_millis(10)));
+        assert!(!debouncer.accept(&volume_repeat, start + Duration::from_millis(50)));
+        assert!(debouncer.accept(&volume_repeat, start + VOLUME_REPEAT_INTERVAL));
+
+        let seek_repeat =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(debouncer.accept(&seek_repeat, start));
+        assert!(!debouncer.accept(&seek_repeat, start + Duration::from_millis(200)));
+
+        let toggle_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(!debouncer.accept(&toggle_repeat, start));
+
+        let mut navigation = KeyDebouncer::default();
+        let down_repeat =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(navigation.accept(&down_repeat, start));
+        assert!(!navigation.accept(&down_repeat, start + Duration::from_millis(25)));
+        assert!(navigation.accept(&down_repeat, start + NAVIGATION_REPEAT_INTERVAL));
+    }
+
+    #[test]
+    fn key_release_allows_an_immediate_second_press() {
+        let now = Instant::now();
+        let mut debouncer = KeyDebouncer::default();
+        let press = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
         );
+        assert!(debouncer.accept(&press, now));
+        assert!(!debouncer.accept(&press, now));
+        debouncer.release(&release);
+        assert!(debouncer.accept(&press, now));
     }
 
     #[test]
@@ -1671,6 +1787,50 @@ mod tests {
     }
 
     #[test]
+    fn compact_player_separates_status_progress_and_footer() {
+        let directory = tempdir().unwrap();
+        let options = TuiOptions {
+            directory: directory.path().to_owned(),
+            host: Some("192.0.2.1".parse().unwrap()),
+            cast_port: 8009,
+            http_port: 0,
+            compatibility_mode: CompatibilityMode::Auto,
+            transcode_delivery: TranscodeDelivery::Incremental,
+        };
+        let mut app = App::new(options).unwrap();
+        app.status = "Connecting to 192.0.2.1".to_owned();
+        let width = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let status_row = lines
+            .iter()
+            .position(|line| line.contains("Connecting to 192.0.2.1"))
+            .unwrap();
+        let progress_row = lines
+            .iter()
+            .position(|line| line.contains("00:00 / --:--"))
+            .unwrap();
+        let footer_row = lines
+            .iter()
+            .position(|line| line.contains("? help"))
+            .unwrap();
+
+        assert_eq!(app.regions.player.height, 5);
+        assert_ne!(status_row, progress_row);
+        assert_eq!(footer_row, usize::from(app.regions.player.bottom()));
+        assert_eq!(app.regions.volume.y, app.regions.transport.y);
+        assert_eq!(app.regions.transport.y, app.regions.receiver.y);
+    }
+
+    #[test]
     fn key_mapping_cycles_focus_and_opens_overlays() {
         let directory = tempdir().unwrap();
         let options = TuiOptions {
@@ -1692,6 +1852,14 @@ mod tests {
         assert!(!app.help);
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert!(app.logs_open);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        for focus in [Focus::Files, Focus::Playlist] {
+            app.focus = focus;
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+            assert!(app.receiver_picker);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!app.receiver_picker);
+        }
     }
 
     #[test]
@@ -1727,7 +1895,6 @@ mod tests {
             transcode_delivery: TranscodeDelivery::Incremental,
         };
         let mut app = App::new(options).unwrap();
-        app.focus = Focus::Player;
         let initial = app.status.clone();
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.status, initial);
@@ -1757,6 +1924,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(normal.contains("-10s"));
+        assert!(normal.contains("+30s"));
         assert!(!normal.contains("-60s"));
 
         app.shift_held = true;

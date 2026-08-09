@@ -12,6 +12,7 @@ mod media_server;
 mod mirror;
 mod network;
 mod playback;
+mod player_controls;
 #[cfg(target_os = "macos")]
 mod synthetic;
 mod tui;

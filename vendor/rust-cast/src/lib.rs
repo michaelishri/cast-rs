@@ -254,6 +254,11 @@ impl<'a> CastDevice<'a> {
         })
     }
 
+    /// Sets the receive timeout used by blocking reads on this Cast connection.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.connection_interrupt.stream.set_read_timeout(timeout)
+    }
+
     /// Waits for any message returned by cast device (e.g. Chromecast) and returns its parsed
     /// version.
     ///

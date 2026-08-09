@@ -22,10 +22,15 @@ use crate::{
     cast::{
         BufferedMediaDescription, BufferedMediaSession, MediaControl, MediaFailure,
         MediaFailureKind, MediaSessionEvent, PlaybackEnd, PlaybackState, PlaybackStatus,
+        ReceiverVolume,
     },
     media::{self, CompatibilityMode, PreparationPlan},
     media_server::MediaFileServer,
     network::{local_ip_for, private_route},
+    player_controls::{
+        LARGE_SEEK_BACKWARD_SECONDS, LARGE_SEEK_FORWARD_SECONDS, SEEK_BACKWARD_SECONDS,
+        SEEK_FORWARD_SECONDS, VOLUME_STEP,
+    },
     vod_hls::IncrementalHlsPreparation,
 };
 
@@ -466,6 +471,16 @@ fn monitor_playback(
                         PlayerAction::SeekBy(_) => {
                             display.set_feedback("Seek is not available yet", now);
                         }
+                        PlayerAction::AdjustVolume(delta) => {
+                            let level = display.adjust_volume(delta);
+                            session.set_volume(level)?;
+                            display.set_feedback(format!("Volume {:.0}%", level * 100.0), now);
+                        }
+                        PlayerAction::ToggleMute => {
+                            let muted = display.toggle_muted();
+                            session.set_muted(muted)?;
+                            display.set_feedback(if muted { "Muted" } else { "Unmuted" }, now);
+                        }
                         PlayerAction::Stop => {
                             stop_requested = true;
                             break;
@@ -518,7 +533,7 @@ fn monitor_playback(
                     print_plain_status(status, &mut plain_state, &mut plain_started);
                 }
             }
-            Ok(MediaSessionEvent::ReceiverVolume(_)) => {}
+            Ok(MediaSessionEvent::ReceiverVolume(volume)) => display.update_volume(volume),
             Ok(MediaSessionEvent::ControlError { control, detail }) => {
                 let message = format!("{}: {detail}", control_label(control));
                 if terminal.is_some() {
@@ -573,6 +588,8 @@ fn monitor_playback(
 enum PlayerAction {
     TogglePlayback,
     SeekBy(f32),
+    AdjustVolume(f32),
+    ToggleMute,
     Stop,
 }
 
@@ -588,12 +605,19 @@ fn key_action(key: KeyEvent) -> Option<PlayerAction> {
     }
 
     match key.code {
-        KeyCode::Esc if pressed => Some(PlayerAction::Stop),
+        KeyCode::Esc | KeyCode::Char('q') if pressed => Some(PlayerAction::Stop),
         KeyCode::Char(' ') if pressed => Some(PlayerAction::TogglePlayback),
-        KeyCode::Left if repeatable => Some(PlayerAction::SeekBy(-10.0)),
-        KeyCode::Right if repeatable => Some(PlayerAction::SeekBy(10.0)),
-        KeyCode::Down if repeatable => Some(PlayerAction::SeekBy(-60.0)),
-        KeyCode::Up if repeatable => Some(PlayerAction::SeekBy(60.0)),
+        KeyCode::Left if repeatable && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(PlayerAction::SeekBy(LARGE_SEEK_BACKWARD_SECONDS))
+        }
+        KeyCode::Right if repeatable && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(PlayerAction::SeekBy(LARGE_SEEK_FORWARD_SECONDS))
+        }
+        KeyCode::Left if repeatable => Some(PlayerAction::SeekBy(SEEK_BACKWARD_SECONDS)),
+        KeyCode::Right if repeatable => Some(PlayerAction::SeekBy(SEEK_FORWARD_SECONDS)),
+        KeyCode::Char('m' | 'M') if pressed => Some(PlayerAction::ToggleMute),
+        KeyCode::Char('+' | '=') if repeatable => Some(PlayerAction::AdjustVolume(VOLUME_STEP)),
+        KeyCode::Char('-') if repeatable => Some(PlayerAction::AdjustVolume(-VOLUME_STEP)),
         _ => None,
     }
 }
@@ -728,6 +752,7 @@ impl Drop for TerminalPlayer {
 struct PlaybackDisplay {
     status: Option<PlaybackStatus>,
     status_at: Instant,
+    volume: ReceiverVolume,
     feedback: Option<(String, Instant)>,
 }
 
@@ -736,6 +761,7 @@ impl PlaybackDisplay {
         Self {
             status: None,
             status_at: now,
+            volume: ReceiverVolume::default(),
             feedback: None,
         }
     }
@@ -783,6 +809,22 @@ impl PlaybackDisplay {
         self.status_at = now;
     }
 
+    fn update_volume(&mut self, volume: ReceiverVolume) {
+        self.volume = volume;
+    }
+
+    fn adjust_volume(&mut self, delta: f32) -> f32 {
+        let level = (self.volume.level.unwrap_or(0.5) + delta).clamp(0.0, 1.0);
+        self.volume.level = Some(level);
+        level
+    }
+
+    fn toggle_muted(&mut self) -> bool {
+        let muted = !self.volume.muted.unwrap_or(false);
+        self.volume.muted = Some(muted);
+        muted
+    }
+
     fn set_feedback(&mut self, message: impl Into<String>, now: Instant) {
         self.feedback = Some((message.into(), now));
     }
@@ -796,7 +838,8 @@ impl PlaybackDisplay {
         } else {
             "pause"
         };
-        let mut controls = format!("←/→ ±10s  ↓/↑ ±60s  Space {toggle}  Esc stop");
+        let mut controls =
+            format!("← -10s  +30s →  ⇧←/→ ±60s  Space {toggle}  M mute  -/+ vol  Esc stop  q quit");
         if let Some((message, received_at)) = &self.feedback
             && now.saturating_duration_since(*received_at) <= CONTROL_FEEDBACK_DURATION
         {
@@ -1036,19 +1079,39 @@ mod tests {
     fn maps_player_keys_and_repeat_behavior() {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            Some(PlayerAction::SeekBy(-10.0))
+            Some(PlayerAction::SeekBy(SEEK_BACKWARD_SECONDS))
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-            Some(PlayerAction::SeekBy(10.0))
+            Some(PlayerAction::SeekBy(SEEK_FORWARD_SECONDS))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(PlayerAction::SeekBy(LARGE_SEEK_BACKWARD_SECONDS))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)),
+            Some(PlayerAction::SeekBy(LARGE_SEEK_FORWARD_SECONDS))
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            Some(PlayerAction::SeekBy(-60.0))
+            None
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            Some(PlayerAction::SeekBy(60.0))
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(PlayerAction::ToggleMute)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT)),
+            Some(PlayerAction::AdjustVolume(VOLUME_STEP))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE)),
+            Some(PlayerAction::AdjustVolume(-VOLUME_STEP))
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
@@ -1056,6 +1119,10 @@ mod tests {
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(PlayerAction::Stop)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(PlayerAction::Stop)
         );
         assert_eq!(
@@ -1069,7 +1136,7 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Repeat,
             )),
-            Some(PlayerAction::SeekBy(10.0))
+            Some(PlayerAction::SeekBy(SEEK_FORWARD_SECONDS))
         );
         assert_eq!(
             key_action(KeyEvent::new_with_kind(
@@ -1168,7 +1235,30 @@ mod tests {
         );
         assert!(display.can_toggle());
         assert!(display.can_seek());
-        assert!(display.lines(now, 80).1.contains("Space play"));
+        let controls = display.lines(now, 80).1;
+        assert!(controls.contains("Space play"));
+        assert!(controls.contains("M mute"));
+        assert!(controls.contains("q quit"));
+    }
+
+    #[test]
+    fn updates_receiver_volume_and_mute_optimistically() {
+        let now = Instant::now();
+        let mut display = PlaybackDisplay::new(now);
+        display.update_volume(ReceiverVolume {
+            level: Some(0.4),
+            muted: Some(false),
+        });
+
+        assert!((display.adjust_volume(VOLUME_STEP) - 0.45).abs() < f32::EPSILON);
+        assert!(display.toggle_muted());
+        assert!(
+            display
+                .volume
+                .level
+                .is_some_and(|level| (level - 0.45).abs() < f32::EPSILON)
+        );
+        assert_eq!(display.volume.muted, Some(true));
     }
 
     #[test]

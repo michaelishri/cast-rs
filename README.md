@@ -87,10 +87,13 @@ cast video --host 192.168.1.50 ~/Movies/example.mp4
 
 Keep Cast running while the video plays: the receiver fetches the file directly from the Mac, so both devices must stay on the same reachable network. In an interactive terminal, Cast shows progress and supports these controls:
 
-- Left/Right: seek backward/forward 10 seconds
-- Down/Up: seek backward/forward 60 seconds
+- Left/Right: seek backward 10 seconds/forward 30 seconds
+- Shift-Left/Shift-Right: seek backward/forward 60 seconds
 - Space: pause or resume
-- Escape or `Ctrl-C`: stop playback and return the receiver to its home screen
+- `M`: mute or unmute the receiver
+- `-`/`+`: lower or raise receiver volume by 5%
+- Escape: stop playback and return the receiver to its home screen
+- `q` or `Ctrl-C`: quit the player
 
 Seeking while paused leaves playback paused. Interactive controls are disabled with `-v` or `-vv`, and when input or output is redirected, so diagnostic and scripted output remains line-oriented.
 
@@ -123,14 +126,14 @@ cast tui ~/Movies
 
 Cast discovers receivers without blocking the interface. To preselect a known receiver and skip the initial scan, use `cast tui --host 192.168.1.50`. The TUI accepts the same local-server and compatibility choices as `video`: `--cast-port`, `--http-port`, `--transcode auto|never|always`, and `--transcode-delivery incremental|complete`. It requires interactive terminal input and output and shows a safe reduced screen below 60×18.
 
-The upper half is split between the file explorer and the session playlist. The full-width player below them shows preparation or playback progress, transport controls, volume/mute, status, and the active receiver. Tab cycles File Explorer → Playlist → Player → Receiver; Shift-Tab reverses the cycle. Press `?` for the in-app help and `l` for the scrollable warning/diagnostic log. `-v` and `-vv` increase the detail captured there without writing over the alternate screen.
+The upper half is split between the file explorer and the session playlist. The full-width player below them shows preparation or playback progress, transport controls, volume/mute, status, and the active receiver. Tab and Shift-Tab cycle focus between File Explorer and Playlist. Press `?` for the in-app help and `l` for the scrollable warning/diagnostic log. `-v` and `-vv` increase the detail captured there without writing over the alternate screen.
 
 Keyboard controls:
 
 - Global: `q`/`Ctrl-C` quits, Space plays or pauses, Escape stops, `[`/`]` selects previous/next, `M` mutes, and `+`/`-` changes volume by 5%.
 - File explorer: arrows, Page Up/Down, Home/End select; Enter opens a directory or enqueues a file; Backspace opens the parent; `p` plays now; `f` toggles all regular files. Hidden entries remain hidden.
 - Playlist: arrows, Page Up/Down, Home/End select; Enter plays; Delete or Backspace removes; Alt-Up/Down reorders.
-- Player: Left/Right seeks backward/forward 10 seconds, Shift-Left/Shift-Right seeks backward/forward 60 seconds, and Down/Up changes volume by 5%. The larger seek controls appear in the player only while Shift is held.
+- Player: Left seeks backward 10 seconds, Right seeks forward 30 seconds, and Shift-Left/Shift-Right seeks backward/forward 60 seconds. The larger seek controls appear in the player only while Shift is held.
 - Receiver: Enter opens the picker and `r` rescans. Escape closes any overlay.
 
 The mouse can focus panes, select rows, double-click to activate, scroll the pane under the pointer, choose a receiver, and set playback position or volume by clicking their gauges. The playlist is session-only: duplicates are allowed, there is no repeat or shuffle, natural completion advances linearly, and stopping retains the current item. Media-specific failures skip to the next item; receiver/network failures pause the queue. Switching receivers reuses the prepared source, resumes near the current position, preserves paused/playing intent, and reads the new receiver's own volume.
