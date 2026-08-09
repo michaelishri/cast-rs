@@ -428,6 +428,11 @@ fn configured_h264_provider() -> H264Provider {
 
 #[cfg(target_os = "linux")]
 fn linux_encoder_name() -> Result<&'static str> {
+    select_linux_encoder(configured_h264_provider())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn select_linux_encoder(provider: H264Provider) -> Result<&'static str> {
     let available = |name: &'static str| {
         encoder::find_by_name(name).is_some()
             && match name {
@@ -443,7 +448,7 @@ fn linux_encoder_name() -> Result<&'static str> {
                 _ => false,
             }
     };
-    resolve_linux_provider(configured_h264_provider(), available)
+    resolve_linux_provider(provider, available)
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -475,7 +480,7 @@ fn resolve_linux_provider(
 }
 
 #[cfg(target_os = "linux")]
-struct VaapiFrames {
+pub(crate) struct VaapiFrames {
     device: *mut ffmpeg::ffi::AVBufferRef,
     frames: *mut ffmpeg::ffi::AVBufferRef,
 }
@@ -485,7 +490,11 @@ unsafe impl Send for VaapiFrames {}
 
 #[cfg(target_os = "linux")]
 impl VaapiFrames {
-    fn attach(encoder: &mut encoder::video::Video, width: u32, height: u32) -> Result<Self> {
+    pub(crate) fn attach(
+        encoder: &mut encoder::video::Video,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         let mut device = std::ptr::null_mut();
         let status = unsafe {
             ffmpeg::ffi::av_hwdevice_ctx_create(
@@ -540,7 +549,7 @@ impl VaapiFrames {
         Ok(Self { device, frames })
     }
 
-    fn upload(&self, source: &frame::Video) -> Result<frame::Video> {
+    pub(crate) fn upload(&self, source: &frame::Video) -> Result<frame::Video> {
         let mut target = frame::Video::empty();
         let status =
             unsafe { ffmpeg::ffi::av_hwframe_get_buffer(self.frames, target.as_mut_ptr(), 0) };
@@ -560,6 +569,7 @@ impl VaapiFrames {
             );
         }
         target.set_pts(source.pts());
+        target.set_kind(source.kind());
         Ok(target)
     }
 }
@@ -689,14 +699,7 @@ impl VideoTranscoder {
             .then(|| VaapiFrames::attach(&mut encoder, output_width, output_height))
             .transpose()?;
         let mut options = Dictionary::new();
-        options.set(
-            "profile",
-            if selected_encoder.name() == "libopenh264" {
-                "baseline"
-            } else {
-                "main"
-            },
-        );
+        options.set("profile", "main");
         #[cfg(target_os = "macos")]
         if hardware {
             options.set("allow_sw", "1");

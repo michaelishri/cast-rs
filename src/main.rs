@@ -5,6 +5,8 @@ mod capture;
 mod cast;
 mod desktop;
 mod discovery;
+#[cfg(target_os = "linux")]
+mod linux_encoder;
 #[cfg(target_os = "macos")]
 mod live;
 mod media;
