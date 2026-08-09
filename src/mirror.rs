@@ -759,11 +759,14 @@ impl Drop for SharedLinuxMirrorAudio {
 }
 
 fn run_extended_desktop(
-    mut options: MirrorOptions,
+    options: MirrorOptions,
     mode: RunMode,
     presentation: ProfilePresentation,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<Option<ProfileGroupResult>> {
+    #[cfg(target_os = "linux")]
+    let mut options = options;
+
     let width = even(options.width);
     let height = even(options.height);
     let mut displays = Vec::with_capacity(options.cast_hosts.len());

@@ -1,10 +1,10 @@
 # Cast
 
-Cast plays local video files and sends a macOS display to Google Cast devices such as Chromecast and Google Nest Hub. It is a command-line app for macOS 13 or newer.
+Cast plays local video files and sends a macOS or Wayland desktop to Google Cast devices such as Chromecast and Google Nest Hub. It supports macOS 13 or newer and GNOME/KDE Wayland desktops on glibc 2.35 or newer.
 
 ## Before you start
 
-- Put the Mac and Google Cast device on the same trusted local network. Guest networks and client isolation commonly prevent discovery or streaming.
+- Put the computer and Google Cast device on the same trusted local network. Guest networks and client isolation commonly prevent discovery or streaming.
 - Desktop system audio is opt-in with `cast desktop --audio`; microphone audio is never captured. Audio already present in a compatible local video file is played normally.
 
 ## Install
@@ -17,6 +17,21 @@ cast --version
 ```
 
 Homebrew selects the correct bottle for supported Apple Silicon and Intel Macs and keeps Cast up to date with `brew upgrade`.
+
+On Linux, download `cast-linux-x86_64.tar.gz` or `cast-linux-aarch64.tar.gz` from GitHub Releases, verify its adjacent `.sha256` file, and extract it. The archive contains Cast and its redistributable media libraries; it deliberately leaves glibc, GPU drivers, PipeWire, WirePlumber, the XDG desktop portal, and Cisco OpenH264 to the system.
+
+Ubuntu 22.04 is the binary compatibility baseline. Install the desktop services used by your GNOME or KDE session (package names vary by distribution); `wpctl` from WirePlumber is needed only to suppress and restore local playback during low-latency audio mirroring. Then install or check the separately distributed software encoder:
+
+```sh
+sha256sum -c cast-linux-x86_64.tar.gz.sha256
+tar -xzf cast-linux-x86_64.tar.gz
+cd cast-linux-x86_64
+./cast setup
+./cast setup --check
+./cast --version
+```
+
+`cast setup` asks before downloading, verifies a pinned checksum, and installs Cisco's OpenH264 2.3 module in the current user's XDG data directory. The module is not bundled in Cast's archive. Use `--yes` for an explicitly approved non-interactive install; `--check` never changes files.
 
 ### Install a release archive manually
 
@@ -45,7 +60,7 @@ Releases are not yet Developer-ID signed or notarized. After verifying the check
 xattr -dr com.apple.quarantine .
 ```
 
-The examples below assume a Homebrew installation. Use `./cast` instead of `cast` when running from an extracted archive.
+The examples below assume `cast` is on `PATH`. Use `./cast` when running from an extracted archive.
 
 ## First cast
 
@@ -65,7 +80,7 @@ The examples below assume a Homebrew installation. Use `./cast` instead of `cast
    cast desktop --host 192.168.1.50
    ```
 
-3. On first use, allow Screen Recording for the terminal app in **System Settings → Privacy & Security → Screen Recording**, then run the command again.
+3. On macOS, allow Screen Recording for the terminal app in **System Settings → Privacy & Security → Screen Recording**, then run the command again. On Linux, the desktop portal opens a privacy-preserving monitor/window chooser. Cast stores only the portal's opaque restore token and retries the chooser if that token expires.
 
 4. Press `Ctrl-C` to stop casting.
 
@@ -77,7 +92,20 @@ To include system and application audio, add `--audio`:
 cast desktop --host 192.168.1.50 --audio
 ```
 
-Desktop audio is AAC-LC stereo at 48 kHz. Cast excludes its own process audio to avoid feedback and does not capture the microphone. If the AAC encoder is unavailable, or a receiver rejects audio during startup, Cast warns and continues with video only; an audio failure after capture has started stops the session.
+Desktop audio is AAC-LC stereo at 48 kHz. Cast does not capture the microphone. On Linux it captures the default PipeWire sink monitor, then low-latency mirror mode mutes physical playback without muting that monitor. Local volume/mute changes are sent to every receiver, and the original output state is restored after normal exit, Ctrl-C, failure, or panic. HLS captures audio without changing local output. If capture or AAC startup is unavailable, Cast warns and continues video-only; an audio failure after capture starts ends the session cleanly.
+
+### Linux capture and encoder selection
+
+Check portal capabilities and the remembered-source state before casting:
+
+```sh
+cast displays
+cast displays --select-source
+```
+
+`--select-source` forces the chooser; otherwise Cast asks the portal to restore the previous choice and falls back to a new prompt when needed. `--extend` requests one portal virtual source per receiver and is available only when the portal advertises virtual-source support.
+
+Linux chooses H.264 in this order: NVIDIA NVENC, VA-API, then OpenH264. Override it with `--encoder nvenc`, `--encoder vaapi`, or `--encoder openh264` on `video`, `capture`, `profile`, and `desktop`. An explicit unavailable encoder fails with an actionable diagnostic instead of silently selecting another. The portal delivers the desktop and cursor through PipeWire; GPU encoding still requires a working vendor driver and device permissions.
 
 ## Cast a local video
 
@@ -152,15 +180,22 @@ Use `--extend` when each receiver should display an independent desktop. Cast cr
 cast desktop --host 192.168.1.50 --extend
 ```
 
-Move windows onto the new display while Cast is running. With `--audio`, each receiver gets the system/application audio selected by its corresponding display capture filter. `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. It cannot be combined with `--display`.
+Move windows onto the new display while Cast is running. With `--audio`, every receiver gets the same encoded system mix. On macOS, `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. On Linux, it requests portal virtual sources and fails before receiver startup when the compositor does not advertise that capability. It cannot be combined with `--display`.
 
 ## Everyday commands
 
-Choose a display and stop after 30 seconds:
+Choose a macOS display and stop after 30 seconds:
 
 ```sh
 cast displays
 cast desktop --host 192.168.1.50 --display 1 --seconds 30
+```
+
+On Linux, use the portal chooser rather than numeric display IDs:
+
+```sh
+cast displays --select-source
+cast desktop --host 192.168.1.50 --select-source --seconds 30
 ```
 
 Tune desktop casting for your network:
@@ -203,6 +238,14 @@ This takes 60 seconds across six short trials and prints a recommended command. 
 **No devices found** — Confirm both devices are on the same LAN, disable guest/client isolation, and try the receiver's IP address directly if known.
 
 **macOS asks for permission or the display is blank** — Grant Screen Recording permission to the terminal app, then quit and reopen it if macOS does not apply the change immediately.
+
+**Linux portal is missing or the chooser does not open** — Use a GNOME or KDE Wayland session and install the matching `xdg-desktop-portal` backend plus PipeWire. X11 capture is unsupported. Run `cast -v displays` to see the missing service or capability.
+
+**Linux has no usable H.264 encoder** — Run `cast setup --check`, then `cast setup` for the OpenH264 fallback. NVENC needs the proprietary NVIDIA driver; VA-API needs a working render device and driver. V4L2 M2M encoders are unsupported.
+
+**Linux audio plays locally or volume forwarding is unavailable** — Ensure WirePlumber and `wpctl` are installed. Cast continues streaming audio if local-output redirection cannot start, and reports that limitation. HLS intentionally leaves local playback unchanged.
+
+**A remembered Linux source no longer exists** — Run with `--select-source`. Cast normally detects an expired portal restore token, forgets it, and opens the chooser automatically.
 
 **Playback stutters** — Try `--target-delay-ms 400`, then reduce the bitrate to `3000000`. Re-run `profile` after changing the network, receiver, resolution, or frame rate.
 

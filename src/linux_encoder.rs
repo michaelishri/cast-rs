@@ -280,7 +280,10 @@ fn open_encoder(
         .then(|| VaapiFrames::attach(&mut encoder, width, height))
         .transpose()?;
     let mut options = Dictionary::new();
-    options.set("profile", "main");
+    // Cast receivers are offered Baseline profile in both RTSP and HLS. Keep the
+    // encoded SPS consistent with that offer; in particular, OpenH264 rejects
+    // FFmpeg's numeric constrained-baseline profile but accepts baseline.
+    options.set("profile", "baseline");
     options.set("repeat_headers", "1");
     if name == "h264_nvenc" {
         options.set("preset", "p1");

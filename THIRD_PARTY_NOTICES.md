@@ -13,6 +13,10 @@ license texts, and build instructions are available from:
 Cast itself remains licensed under the terms declared in `Cargo.toml`. This notice does not change
 the licenses applicable to the separately distributed FFmpeg libraries.
 
+Linux FFmpeg builds enable the native AAC encoder and HLS/MP4 muxers plus H.264 adapters for
+OpenH264, NVIDIA NVENC, and VA-API. Release archives contain FFmpeg and Cast's loader library, but
+not GPU drivers, VA-API driver implementations, or codec implementations supplied by vendors.
+
 ## OpenH264 integration
 
 Linux builds include OpenH264 2.3.0 API headers from commit
@@ -28,3 +32,18 @@ OpenH264 2.3.x module.
 
 Linux builds also use the MIT-licensed FFmpeg nv-codec-headers 12.1.14.0 package from commit
 `1889e62e2d35ff7aa9baca2bceb14f053785e6f1`; no NVIDIA driver or codec implementation is included.
+
+## Linux desktop integration
+
+Cast uses the MIT-licensed `ashpd` Rust crate to call the freedesktop ScreenCast portal and the
+MIT-licensed `pipewire-rs`/`libspa` crates to consume portal video and the default sink monitor.
+Those crates bind to system XDG portal, PipeWire, SPA, and WirePlumber services; the services and
+their shared libraries are not redistributed in Cast archives.
+
+VA-API support is compiled against the MIT-licensed libva interface. The system's libva shared
+libraries, DRM stack, and vendor VA driver remain external dependencies. NVENC support is compiled
+from the MIT-licensed nv-codec-headers noted above and likewise leaves the NVIDIA driver external.
+
+`native/openh264_loader.cpp` is Cast project code under this repository's MIT license. OpenH264
+headers are used to compile that delayed loader, but Cisco's binary module is never included in a
+Cast release archive.

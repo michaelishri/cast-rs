@@ -22,8 +22,9 @@ if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
 fi
 
 cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
+cargo build --locked --release
 
 git tag --annotate "$tag" --message "Release $tag"
 git push origin "$tag"

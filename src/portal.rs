@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -68,12 +68,12 @@ impl PortalCapabilities {
     }
 
     fn cursor_mode(self) -> Result<CursorMode> {
-        if self.cursor_metadata {
-            Ok(CursorMode::Metadata)
-        } else if self.cursor_embedded {
+        if self.cursor_embedded {
             Ok(CursorMode::Embedded)
         } else {
-            bail!("this desktop portal offers no supported cursor capture mode")
+            bail!(
+                "this desktop portal does not offer embedded cursor capture (metadata-only cursors require a newer PipeWire runtime)"
+            )
         }
     }
 }
@@ -444,8 +444,7 @@ pub(crate) trait FrameSink: Send + Sync + 'static {
 struct PipeWireUserData {
     format: spa::param::video::VideoInfoRaw,
     sink: Arc<dyn FrameSink>,
-    first_pts: Option<i64>,
-    last_cursor: Option<CursorImage>,
+    capture_started: Instant,
     failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -552,8 +551,7 @@ fn run_pipewire(
         .add_local_listener_with_user_data(PipeWireUserData {
             format: Default::default(),
             sink,
-            first_pts: None,
-            last_cursor: None,
+            capture_started: Instant::now(),
             failure: Arc::clone(&failure),
         })
         .state_changed(move |_, user_data, _, state| {
@@ -691,17 +689,8 @@ fn copy_pipewire_frame(
         return Ok(());
     }
     let format = raw_pixel_format(user_data.format.format())?;
-    if let Some(cursor) = buffer.find_meta::<spa::buffer::meta::MetaCursor>() {
-        update_cursor(cursor, &mut user_data.last_cursor);
-    }
-    let pts = buffer
-        .find_meta::<spa::buffer::meta::MetaHeader>()
-        .map(spa::buffer::meta::MetaHeader::pts)
-        .filter(|pts| *pts >= 0)
-        .unwrap_or(0);
-    let origin = *user_data.first_pts.get_or_insert(pts);
-    let timestamp = u64::try_from(pts.saturating_sub(origin))
-        .unwrap_or(0)
+    let timestamp = u64::try_from(user_data.capture_started.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
         .saturating_mul(90_000)
         / 1_000_000_000;
     let data = buffer
@@ -732,7 +721,7 @@ fn copy_pipewire_frame(
         height,
         format,
         timestamp,
-        cursor: user_data.last_cursor.clone(),
+        cursor: None,
     });
     Ok(())
 }
@@ -744,37 +733,6 @@ fn raw_pixel_format(format: spa::param::video::VideoFormat) -> Result<RawPixelFo
         value if value == spa::param::video::VideoFormat::RGBA => Ok(RawPixelFormat::Rgba),
         value if value == spa::param::video::VideoFormat::RGBx => Ok(RawPixelFormat::Rgbx),
         other => bail!("unsupported PipeWire video format {other:?}"),
-    }
-}
-
-fn cursor_image(cursor: &spa::buffer::meta::MetaCursor) -> Option<CursorImage> {
-    if !cursor.is_valid() {
-        return None;
-    }
-    let bitmap = cursor.bitmap()?;
-    let size = bitmap.size();
-    let format = raw_pixel_format(bitmap.format()).ok()?;
-    Some(CursorImage {
-        position: (cursor.position().x, cursor.position().y),
-        hotspot: (cursor.hotspot().x, cursor.hotspot().y),
-        width: size.width,
-        height: size.height,
-        stride: bitmap.stride().unsigned_abs() as usize,
-        format,
-        pixels: bitmap.bitmap_data()?.to_vec(),
-    })
-}
-
-fn update_cursor(cursor: &spa::buffer::meta::MetaCursor, current: &mut Option<CursorImage>) {
-    if !cursor.is_valid() {
-        *current = None;
-        return;
-    }
-    if let Some(image) = cursor_image(cursor) {
-        *current = Some(image);
-    } else if let Some(image) = current {
-        image.position = (cursor.position().x, cursor.position().y);
-        image.hotspot = (cursor.hotspot().x, cursor.hotspot().y);
     }
 }
 
@@ -864,7 +822,7 @@ mod tests {
             window: false,
             virtual_source: false,
             cursor_metadata: true,
-            cursor_embedded: false,
+            cursor_embedded: true,
         };
         assert_eq!(
             capabilities.source_types(PortalSourceKind::Normal).unwrap(),
@@ -875,7 +833,19 @@ mod tests {
                 .source_types(PortalSourceKind::Virtual)
                 .is_err()
         );
-        assert_eq!(capabilities.cursor_mode().unwrap(), CursorMode::Metadata);
+        assert_eq!(capabilities.cursor_mode().unwrap(), CursorMode::Embedded);
+
+        let metadata_only = PortalCapabilities {
+            cursor_embedded: false,
+            ..capabilities
+        };
+        assert!(
+            metadata_only
+                .cursor_mode()
+                .unwrap_err()
+                .to_string()
+                .contains("embedded cursor capture")
+        );
     }
 
     #[test]

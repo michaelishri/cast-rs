@@ -71,7 +71,7 @@ patch release; do not move or replace a published tag.
 
   ```sh
   cargo fmt -- --check
-  cargo clippy --all-targets --all-features -- -D warnings
+  cargo clippy --locked --all-targets --all-features -- -D warnings
   cargo test --locked
   cargo build --locked --release
   ./target/release/cast --version
@@ -136,8 +136,8 @@ patch release; do not move or replace a published tag.
   test "$(git cat-file -t "v${VERSION}")" = tag
   ```
 
-- [ ] Watch `.github/workflows/release.yml` finish successfully. It builds both Apple Silicon and
-      Intel archives and then creates the GitHub release.
+- [ ] Watch `.github/workflows/release.yml` finish successfully. It builds Apple Silicon, Intel,
+      Linux x86_64, and Linux aarch64 archives and then creates the GitHub release.
 
   ```sh
   gh run list --repo "$UPSTREAM" --workflow release.yml --branch "v${VERSION}" --limit 3
@@ -146,8 +146,9 @@ patch release; do not move or replace a published tag.
   gh run watch "$RELEASE_RUN" --repo "$UPSTREAM" --exit-status --interval 10
   ```
 
-- [ ] Verify the non-draft, non-prerelease GitHub release has all four expected files:
-      `arm64` and `x86_64` archives plus one checksum file for each.
+- [ ] Verify the non-draft, non-prerelease GitHub release has the four expected archives:
+      macOS `arm64`/`x86_64` and Linux `aarch64`/`x86_64`, with one checksum per archive and an
+      `ldd` audit for each Linux archive.
 
   ```sh
   gh release view "v${VERSION}" --repo "$UPSTREAM" \
@@ -157,6 +158,7 @@ patch release; do not move or replace a published tag.
   RELEASE_DIR=$(mktemp -d)
   gh release download "v${VERSION}" --repo "$UPSTREAM" --dir "$RELEASE_DIR"
   (cd "$RELEASE_DIR" && shasum -a 256 -c ./*.sha256)
+  ! grep -H 'not found' "$RELEASE_DIR"/*.ldd.txt
   ```
 
 - [ ] Smoke-test an archive on a matching Mac when one is available.
@@ -166,6 +168,10 @@ patch release; do not move or replace a published tag.
   tar -xzf "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}.tar.gz" -C "$RELEASE_DIR"
   "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}/cast" --version
   ```
+
+- [ ] Complete [the Linux release matrix](LINUX_VALIDATION.md) on the tagged archives. The release
+      workflow performs the native Ubuntu 22.04 x86_64/aarch64 archive smoke tests; record the
+      GNOME/KDE and real-device results in the release issue before calling Linux support complete.
 
 ## 4. Update the Homebrew formula
 
