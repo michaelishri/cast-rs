@@ -635,7 +635,9 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
-    use clap::{CommandFactory, Parser, error::ErrorKind};
+    #[cfg(not(target_os = "macos"))]
+    use clap::CommandFactory;
+    use clap::{Parser, error::ErrorKind};
     #[cfg(target_os = "macos")]
     use std::net::IpAddr;
 
