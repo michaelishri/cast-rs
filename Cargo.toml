@@ -22,7 +22,7 @@ log = "0.4"
 mdns-sd = "0.20"
 muxide = "0.2.5"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-rust_cast = { path = "vendor/rust-cast" }
+rust_cast = { git = "https://github.com/michaelishri/rust-cast.git", rev = "d877d0f9dabbca094d1b5ea5efc68a91c5ae75b0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"

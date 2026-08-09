@@ -1,5 +1,6 @@
 /target
 /.build
+/vendor
 *.h264
 *.avcc
 *.m3u8

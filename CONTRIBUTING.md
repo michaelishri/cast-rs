@@ -48,7 +48,7 @@ cargo build --locked --release
 
 ## Architecture notes
 
-Cast discovers receivers with mDNS and controls them through the vendored `rust-cast` client. Local video is served only from the receiver-facing LAN interface at a fresh random URL; the server supports HTTP ranges so receivers can seek and read MP4 metadata efficiently.
+Cast discovers receivers with mDNS and controls them through a pinned revision of the [`rust-cast` fork](https://github.com/michaelishri/rust-cast/tree/cast-rs). Local video is served only from the receiver-facing LAN interface at a fresh random URL; the server supports HTTP ranges so receivers can seek and read MP4 metadata efficiently.
 
 The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. The `desktop` path uses ScreenCaptureKit, VideoToolbox, and (when `--audio` is set) an AudioToolbox AAC-LC encoder. The low-latency path performs the Cast Streaming offer/answer exchange and sends H.264 and AAC as separately encrypted Cast RTP streams. HLS remains a compatibility fallback, with fMP4 video and an alternate packed-AAC rendition.
 
