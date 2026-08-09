@@ -1,16 +1,18 @@
 use std::{
     collections::{HashSet, VecDeque},
-    ffi::c_void,
     io::{self, ErrorKind, IsTerminal, Write},
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, sync::OnceLock};
 
 use aes::{
     Aes128,
@@ -26,24 +28,53 @@ use rust_cast::{
     errors::Error as CastError,
     message_manager::{CastMessage, CastMessagePayload},
 };
+#[cfg(target_os = "macos")]
 use screencapturekit::IOSurface;
+#[cfg(target_os = "macos")]
 use screencapturekit::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "macos")]
 use videotoolbox::ProfileLevel;
+#[cfg(target_os = "macos")]
 use videotoolbox::prelude::*;
 
+#[cfg(target_os = "macos")]
 use crate::audio::{self, AudioFrameHandler, AudioWorker, LocalOutputRedirect};
+#[cfg(target_os = "linux")]
+use crate::desktop::VideoEncoderControl;
 use crate::desktop::{
     AdaptiveRateControl, AdaptiveRateObserver, EncodedAudioFrame, EncodedAudioSink,
     EncodedVideoFrame as EncodedFrame, EncodedVideoSink, H264Level, LatestFrameBackend,
-    LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker, MediaClock, RateWindowHealth,
+    LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker, RateWindowHealth,
     ReceiverControlSink, ReceiverVolumeCommand, SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME,
-    SyntheticPhase, VideoFrameTimings as FrameTimings, fan_out_audio, fan_out_receiver_control,
-    fan_out_video, phase_for_frame,
+    SyntheticPhase, VideoFrameTimings as FrameTimings, fan_out_video, phase_for_frame,
 };
+#[cfg(target_os = "macos")]
+use crate::desktop::{MediaClock, fan_out_audio, fan_out_receiver_control};
+#[cfg(target_os = "macos")]
 use crate::synthetic::SyntheticFrameGenerator;
+#[cfg(target_os = "macos")]
 use crate::virtual_display::VirtualDisplaySession;
+#[cfg(target_os = "linux")]
+use crate::{
+    linux_desktop::composite_cursor,
+    linux_encoder::{LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame},
+    media::H264Provider,
+    portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
+};
+
+#[cfg(target_os = "linux")]
+mod audio {
+    pub(crate) const CHANNELS: u32 = 2;
+    pub(crate) const BITRATE: u32 = 192_000;
+    pub(crate) const RTP_PAYLOAD_TYPE: u8 = 97;
+}
+
+#[cfg(target_os = "macos")]
+type ExtendedDisplaySession = VirtualDisplaySession;
+#[cfg(target_os = "linux")]
+type ExtendedDisplaySession = PortalSelection;
 
 const CAST_STREAMING_APP_ID: &str = "0F5096E8";
 const CAST_STREAMING_NAMESPACE: &str = "urn:x-cast:com.google.cast.webrtc";
@@ -55,7 +86,9 @@ const DELTA_PACKETS_PER_BURST: usize = 16;
 const KEYFRAME_PACKETS_PER_BURST: usize = 24;
 const MAX_FRAME_PACING_WINDOW: Duration = Duration::from_millis(5);
 const RATE_CONTROL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
 static VIRTUAL_DISPLAY_TEARDOWN: Mutex<()> = Mutex::new(());
+#[cfg(target_os = "macos")]
 const SYNTHETIC_SURFACE_POOL_SIZE: usize = 3;
 const PROFILE_HISTORY_SECONDS: usize = 60;
 const PROFILE_GRAPH_COLUMNS: usize = 44;
@@ -83,6 +116,10 @@ pub struct MirrorOptions {
     pub adaptive_bitrate: bool,
     pub prioritize_encoding_speed: bool,
     pub audio: bool,
+    #[cfg(target_os = "linux")]
+    pub select_source: bool,
+    #[cfg(target_os = "linux")]
+    pub provider: H264Provider,
 }
 
 fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
@@ -548,6 +585,33 @@ fn host_command_arguments(hosts: &[IpAddr]) -> String {
     hosts.iter().map(|host| format!(" --host {host}")).collect()
 }
 
+#[cfg(target_os = "macos")]
+fn start_extended_display(
+    width: u32,
+    height: u32,
+    fps: u32,
+    ordinal: u32,
+) -> Result<ExtendedDisplaySession> {
+    VirtualDisplaySession::start(width, height, fps, ordinal)
+}
+
+#[cfg(target_os = "linux")]
+fn start_extended_display(
+    _width: u32,
+    _height: u32,
+    _fps: u32,
+    _ordinal: u32,
+) -> Result<ExtendedDisplaySession> {
+    crate::portal::select(PortalSourceKind::Virtual, true)
+}
+
+fn ensure_extended_display_alive(session: &mut ExtendedDisplaySession) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return session.ensure_alive();
+    #[cfg(target_os = "linux")]
+    session.check()
+}
+
 fn run_extended_desktop(
     options: MirrorOptions,
     mode: RunMode,
@@ -560,10 +624,16 @@ fn run_extended_desktop(
     for (index, host) in options.cast_hosts.iter().copied().enumerate() {
         let ordinal = u32::try_from(index + 1)
             .context("the number of extended displays exceeded the supported ordinal range")?;
-        let session = VirtualDisplaySession::start(width, height, options.fps, ordinal)?;
+        let session = start_extended_display(width, height, options.fps, ordinal)?;
+        #[cfg(target_os = "macos")]
         println!(
             "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
             session.display_id()
+        );
+        #[cfg(target_os = "linux")]
+        println!(
+            "Mapped receiver {host} to portal virtual source {ordinal} (PipeWire node {}).",
+            session.node_id()
         );
         displays.push((host, session));
     }
@@ -580,7 +650,10 @@ fn run_extended_desktop(
             let mut target_options = options.clone();
             target_options.cast_hosts = vec![host];
             target_options.extend = false;
-            target_options.display_id = Some(session.display_id());
+            #[cfg(target_os = "macos")]
+            {
+                target_options.display_id = Some(session.display_id());
+            }
             let stop = Arc::clone(interrupted);
             workers.push((
                 host,
@@ -651,7 +724,7 @@ fn run_desktop(
     mode: RunMode,
     presentation: ProfilePresentation,
     interrupted: &AtomicBool,
-    precreated_display: Option<VirtualDisplaySession>,
+    precreated_display: Option<ExtendedDisplaySession>,
 ) -> Result<Option<ProfileGroupResult>> {
     validate_cast_hosts(&options.cast_hosts)?;
     if options.bitrate <= 0 {
@@ -675,6 +748,7 @@ fn run_desktop(
     if options.extend && options.synthetic {
         bail!("--extend cannot be combined with --synthetic");
     }
+    #[cfg(target_os = "macos")]
     let prepared_audio = if options.audio {
         match audio::prepare() {
             Ok(encoder) => Some(encoder),
@@ -687,6 +761,11 @@ fn run_desktop(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    if options.audio {
+        eprintln!("System audio is not enabled in this build yet; continuing with video only.");
+        options.audio = false;
+    }
 
     let width = even(options.width);
     let height = even(options.height);
@@ -701,9 +780,10 @@ fn run_desktop(
     );
     let mut virtual_display = match (options.extend, precreated_display) {
         (true, Some(_)) => bail!("temporary display ownership was specified twice"),
-        (true, None) => Some(VirtualDisplaySession::start(width, height, options.fps, 1)?),
+        (true, None) => Some(start_extended_display(width, height, options.fps, 1)?),
         (false, display) => display,
     };
+    #[cfg(target_os = "macos")]
     if let Some(session) = virtual_display.as_ref() {
         options.display_id = Some(session.display_id());
     }
@@ -829,8 +909,10 @@ fn run_desktop(
         outputs.push(output);
     }
 
+    #[cfg(target_os = "macos")]
     let keyframe_interval = i32::try_from(options.fps)
         .context("frame rate exceeded VideoToolbox's keyframe interval range")?;
+    #[cfg(target_os = "macos")]
     let encoder = CompressionSession::builder(width as i32, height as i32, Codec::H264)
         .with_real_time(true)
         .with_allow_frame_reordering(false)
@@ -840,9 +922,12 @@ fn run_desktop(
         .with_profile_level(video_toolbox_profile_level(h264_level))
         .build()
         .context("could not create the VideoToolbox H.264 mirroring encoder")?;
+    #[cfg(target_os = "macos")]
     configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
 
+    #[cfg(target_os = "macos")]
     let clock = Arc::new(MediaClock::default());
+    #[cfg(target_os = "macos")]
     let pipeline = MirrorPipeline {
         encoder,
         outputs,
@@ -855,6 +940,21 @@ fn run_desktop(
         encoder_bitrate: options.bitrate,
         stats: Arc::clone(&capture_stats),
     };
+    #[cfg(target_os = "linux")]
+    let pipeline = MirrorPipeline {
+        encoder: None,
+        encoder_control: None,
+        outputs,
+        frame_index: 0,
+        fps: options.fps,
+        width,
+        height,
+        provider: options.provider,
+        rate_control,
+        encoder_bitrate: options.bitrate as u32,
+        stats: Arc::clone(&capture_stats),
+    };
+    #[cfg(target_os = "macos")]
     let (audio_submitter, audio_worker) = if !audio_outputs.is_empty() {
         let (submitter, worker) = AudioWorker::start_prepared(
             prepared_audio.expect("audio was prepared before it was offered"),
@@ -867,6 +967,8 @@ fn run_desktop(
     } else {
         (None, None)
     };
+    #[cfg(target_os = "linux")]
+    let (audio_submitter, audio_worker): (Option<()>, Option<()>) = (None, None);
     let max_frame_age = resolve_max_frame_age(options.max_frame_age, options.fps);
     let frame_observer: Arc<dyn LatestFrameObserver> = capture_stats.clone();
     let (submitter, encoder_worker) = EncoderWorker::start(
@@ -884,11 +986,13 @@ fn run_desktop(
     } else {
         log::debug!("latest-frame-wins queue enabled without a raw-frame deadline");
     }
+    #[cfg(target_os = "macos")]
     let volume_controls = targets
         .iter()
         .filter(|target| target.transport.audio.is_some())
         .map(|target| Arc::clone(&target.transport.control))
         .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
     let local_output_redirect = if audio_submitter.is_some() {
         match LocalOutputRedirect::start(move |control| {
             fan_out_receiver_control(&volume_controls, control.into());
@@ -924,92 +1028,125 @@ fn run_desktop(
             encoder_worker,
         )
     } else {
-        let content = SCShareableContent::get().context(
+        #[cfg(target_os = "macos")]
+        {
+            let content = SCShareableContent::get().context(
             "could not enumerate displays; grant Screen Recording permission in System Settings",
         )?;
-        let displays = content.displays();
-        let display = match options.display_id {
-            Some(id) => displays
-                .iter()
-                .find(|display| display.display_id() == id)
-                .ok_or_else(|| anyhow!("display {id} was not found"))?,
-            None => displays
-                .first()
-                .ok_or_else(|| anyhow!("no displays found"))?,
-        };
-        let source_width = display.width();
-        let source_height = display.height();
-        log::debug!(
-            "scaling source display {source_width}x{source_height} into H.264 mirroring output {width}x{height}"
-        );
-
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build();
-        let frame_interval = CMTime::new(1, options.fps as i32);
-        let config = SCStreamConfiguration::new()
-            .with_width(width)
-            .with_height(height)
-            .with_scales_to_fit(true)
-            .with_preserves_aspect_ratio(true)
-            .with_pixel_format(PixelFormat::YCbCr_420v)
-            .with_shows_cursor(true)
-            .with_queue_depth(3)
-            .with_minimum_frame_interval(&frame_interval);
-        let config = if audio_submitter.is_some() {
-            config
-                .with_captures_audio(true)
-                .with_sample_rate(audio::SAMPLE_RATE as i32)
-                .with_channel_count(audio::CHANNELS as i32)
-                .with_excludes_current_process_audio(true)
-        } else {
-            config
-        };
-        let mut stream = SCStream::new(&filter, &config);
-        stream.add_output_handler(
-            MirrorFrameHandler {
-                submitter,
-                failure: Arc::clone(&failure),
-                last_surface: Mutex::new(None),
-                repeated_samples: AtomicU64::new(0),
-                skipped_samples: AtomicU64::new(0),
-            },
-            SCStreamOutputType::Screen,
-        );
-        if let Some(audio_submitter) = audio_submitter {
-            stream.add_output_handler(
-                AudioFrameHandler::new(audio_submitter),
-                SCStreamOutputType::Audio,
+            let displays = content.displays();
+            let display = match options.display_id {
+                Some(id) => displays
+                    .iter()
+                    .find(|display| display.display_id() == id)
+                    .ok_or_else(|| anyhow!("display {id} was not found"))?,
+                None => displays
+                    .first()
+                    .ok_or_else(|| anyhow!("no displays found"))?,
+            };
+            let source_width = display.width();
+            let source_height = display.height();
+            log::debug!(
+                "scaling source display {source_width}x{source_height} into H.264 mirroring output {width}x{height}"
             );
-        }
 
-        match mode {
-            RunMode::Cast => println!(
-                "Mirroring display {} at {}x{} into {}x{}, {} fps, target delay {} ms...",
-                display.display_id(),
-                source_width,
-                source_height,
-                width,
-                height,
-                options.fps,
-                options.target_delay.as_millis()
-            ),
-            RunMode::Profile => println!(
-                "Profiling display {} at {}x{} into {}x{}, {} fps, probe delay {} ms...",
-                display.display_id(),
-                source_width,
-                source_height,
-                width,
-                height,
-                options.fps,
-                options.target_delay.as_millis()
-            ),
+            let filter = SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_windows(&[])
+                .build();
+            let frame_interval = CMTime::new(1, options.fps as i32);
+            let config = SCStreamConfiguration::new()
+                .with_width(width)
+                .with_height(height)
+                .with_scales_to_fit(true)
+                .with_preserves_aspect_ratio(true)
+                .with_pixel_format(PixelFormat::YCbCr_420v)
+                .with_shows_cursor(true)
+                .with_queue_depth(3)
+                .with_minimum_frame_interval(&frame_interval);
+            let config = if audio_submitter.is_some() {
+                config
+                    .with_captures_audio(true)
+                    .with_sample_rate(audio::SAMPLE_RATE as i32)
+                    .with_channel_count(audio::CHANNELS as i32)
+                    .with_excludes_current_process_audio(true)
+            } else {
+                config
+            };
+            let mut stream = SCStream::new(&filter, &config);
+            stream.add_output_handler(
+                MirrorFrameHandler {
+                    submitter,
+                    failure: Arc::clone(&failure),
+                    last_surface: Mutex::new(None),
+                    repeated_samples: AtomicU64::new(0),
+                    skipped_samples: AtomicU64::new(0),
+                },
+                SCStreamOutputType::Screen,
+            );
+            if let Some(audio_submitter) = audio_submitter {
+                stream.add_output_handler(
+                    AudioFrameHandler::new(audio_submitter),
+                    SCStreamOutputType::Audio,
+                );
+            }
+
+            match mode {
+                RunMode::Cast => println!(
+                    "Mirroring display {} at {}x{} into {}x{}, {} fps, target delay {} ms...",
+                    display.display_id(),
+                    source_width,
+                    source_height,
+                    width,
+                    height,
+                    options.fps,
+                    options.target_delay.as_millis()
+                ),
+                RunMode::Profile => println!(
+                    "Profiling display {} at {}x{} into {}x{}, {} fps, probe delay {} ms...",
+                    display.display_id(),
+                    source_width,
+                    source_height,
+                    width,
+                    height,
+                    options.fps,
+                    options.target_delay.as_millis()
+                ),
+            }
+            stream
+                .start_capture()
+                .context("could not start screen capture")?;
+            RunningInput::Screen(stream, encoder_worker, audio_worker)
         }
-        stream
-            .start_capture()
-            .context("could not start screen capture")?;
-        RunningInput::Screen(stream, encoder_worker, audio_worker)
+        #[cfg(target_os = "linux")]
+        {
+            let selection = match virtual_display.take() {
+                Some(selection) => selection,
+                None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
+            };
+            let source_description = format!(
+                "{:?} portal source (PipeWire node {}, compositor size {:?})",
+                selection.source_type(),
+                selection.node_id(),
+                selection.size()
+            );
+            let sink: Arc<dyn FrameSink> = Arc::new(MirrorPortalSink { submitter });
+            let capture = PipeWireCapture::start(selection, sink)?;
+            match mode {
+                RunMode::Cast => println!(
+                    "Mirroring {source_description} into {width}x{height}, {} fps, target delay {} ms...",
+                    options.fps,
+                    options.target_delay.as_millis()
+                ),
+                RunMode::Profile => println!(
+                    "Profiling {source_description} into {width}x{height}, {} fps, probe delay {} ms...",
+                    options.fps,
+                    options.target_delay.as_millis()
+                ),
+            }
+            let _ = audio_submitter;
+            let _ = audio_worker;
+            RunningInput::Screen(capture, encoder_worker)
+        }
     };
     if mode == RunMode::Cast {
         println!(
@@ -1047,11 +1184,12 @@ fn run_desktop(
             if let Some(error) = take_failure(&failure)? {
                 bail!("mirroring pipeline failed: {error}");
             }
+            input.check()?;
             for target in &targets {
                 target.ensure_alive()?;
             }
             if let Some(session) = virtual_display.as_mut() {
-                session.ensure_alive()?;
+                ensure_extended_display_alive(session)?;
             }
             if let (Some(graph), Some(stats)) = (graph.as_mut(), graph_stats.as_deref()) {
                 graph.draw_if_due(stats, started.elapsed())?;
@@ -1070,7 +1208,10 @@ fn run_desktop(
     }
 
     let input_result = input.stop_and_release();
+    #[cfg(target_os = "macos")]
     let output_result = local_output_redirect.map_or(Ok(()), LocalOutputRedirect::stop);
+    #[cfg(target_os = "linux")]
+    let output_result: Result<()> = Ok(());
     // Stopping an SCStream does not release the stream or its content filter.
     // Drop the capture graph before removing a virtual source display so
     // ScreenCaptureKit cannot keep that display registered with WindowServer.
@@ -1148,6 +1289,7 @@ fn run_desktop(
             }
         }
     })();
+    #[cfg(target_os = "macos")]
     let display_result = if let Some(session) = virtual_display.as_mut() {
         let _teardown = VIRTUAL_DISPLAY_TEARDOWN
             .lock()
@@ -1156,6 +1298,8 @@ fn run_desktop(
     } else {
         Ok(())
     };
+    #[cfg(target_os = "linux")]
+    let display_result: Result<()> = Ok(());
 
     run_result?;
     input_result?;
@@ -2088,6 +2232,7 @@ fn rate_window_is_congested(
     )
 }
 
+#[cfg(target_os = "macos")]
 fn video_toolbox_profile_level(level: H264Level) -> ProfileLevel {
     match level.name {
         "3.1" => ProfileLevel::H264Baseline3_1,
@@ -2102,6 +2247,7 @@ fn video_toolbox_profile_level(level: H264Level) -> ProfileLevel {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn configure_low_latency_encoder(
     encoder: &CompressionSession,
     prioritize_speed: bool,
@@ -2141,6 +2287,7 @@ fn configure_low_latency_encoder(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn set_encoder_i32(
     encoder: &CompressionSession,
     key: videotoolbox::ffi::CFStringRef,
@@ -2162,6 +2309,7 @@ fn set_encoder_i32(
     result
 }
 
+#[cfg(target_os = "macos")]
 fn set_encoder_bool(
     encoder: &CompressionSession,
     key: videotoolbox::ffi::CFStringRef,
@@ -3727,13 +3875,25 @@ impl Drop for FeedbackThread {
 }
 
 enum RunningInput {
+    #[cfg(target_os = "macos")]
     Screen(SCStream, EncoderWorker, Option<AudioWorker>),
+    #[cfg(target_os = "linux")]
+    Screen(PipeWireCapture, EncoderWorker),
     Synthetic(SyntheticFrameSource, EncoderWorker),
 }
 
 impl RunningInput {
+    fn check(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Screen(capture, _) = self {
+            capture.check()?;
+        }
+        Ok(())
+    }
+
     fn stop_and_release(mut self) -> Result<()> {
         match &mut self {
+            #[cfg(target_os = "macos")]
             Self::Screen(stream, encoder, audio) => {
                 let capture_result = stream
                     .stop_capture()
@@ -3743,6 +3903,13 @@ impl RunningInput {
                 capture_result?;
                 encoder_result?;
                 audio_result.map(|_| ())
+            }
+            #[cfg(target_os = "linux")]
+            Self::Screen(capture, encoder) => {
+                let capture_result = capture.stop();
+                let encoder_result = encoder.stop();
+                capture_result?;
+                encoder_result
             }
             Self::Synthetic(source, encoder) => {
                 let source_result = source.stop();
@@ -3754,6 +3921,7 @@ impl RunningInput {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct PendingFrame {
     surface: IOSurface,
     presentation_time: CMTime,
@@ -3763,12 +3931,20 @@ struct PendingFrame {
     synthetic_recycle: Option<(mpsc::Sender<usize>, usize)>,
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for PendingFrame {
     fn drop(&mut self) {
         if let Some((sender, index)) = self.synthetic_recycle.take() {
             let _ = sender.send(index);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+struct PendingFrame {
+    captured: CapturedFrame,
+    pipeline_started_at: Instant,
+    synthetic_phase: Option<SyntheticPhase>,
 }
 
 type FrameSubmitter = LatestFrameSubmitter<PendingFrame>;
@@ -3779,6 +3955,7 @@ struct SyntheticFrameSource {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(target_os = "macos")]
 impl SyntheticFrameSource {
     fn start(
         submitter: FrameSubmitter,
@@ -3914,6 +4091,131 @@ impl SyntheticFrameSource {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl SyntheticFrameSource {
+    fn start(
+        submitter: FrameSubmitter,
+        width: u32,
+        height: u32,
+        fps: u32,
+        failure: Arc<Mutex<Option<String>>>,
+        stats: Arc<MirrorStats>,
+    ) -> Result<Self> {
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop_signal);
+        let thread = thread::Builder::new()
+            .name("cast-synthetic-frames".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let mut frame_index = 0_u64;
+                let mut last_phase = None;
+                while !thread_stop.load(Ordering::SeqCst) {
+                    let scheduled_at = started + frame_offset(frame_index, fps);
+                    if let Some(wait) = scheduled_at.checked_duration_since(Instant::now()) {
+                        thread::sleep(wait);
+                    }
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let render_started = Instant::now();
+                    let (phase, phase_frame) = phase_for_frame(frame_index, fps);
+                    let pixels = render_linux_synthetic(width, height, phase, phase_frame);
+                    if let Ok(mut samples) = stats.synthetic_render_micros.lock() {
+                        samples.push(elapsed_micros(render_started));
+                    } else {
+                        store_source_failure(
+                            &failure,
+                            "synthetic render timing lock was poisoned".to_owned(),
+                        );
+                        break;
+                    }
+                    if last_phase != Some(phase) {
+                        log::debug!(
+                            "synthetic workload entered {} phase at frame {frame_index}",
+                            phase.label()
+                        );
+                        last_phase = Some(phase);
+                    }
+                    let frame = PendingFrame {
+                        captured: CapturedFrame {
+                            data: pixels,
+                            stride: width as usize * 4,
+                            width,
+                            height,
+                            format: RawPixelFormat::Bgra,
+                            timestamp: frame_index.saturating_mul(RTP_VIDEO_TIMEBASE)
+                                / u64::from(fps.max(1)),
+                            cursor: None,
+                        },
+                        pipeline_started_at: Instant::now(),
+                        synthetic_phase: Some(phase),
+                    };
+                    if let Err(error) = submitter.submit(frame) {
+                        store_source_failure(
+                            &failure,
+                            format!("synthetic frame queue failed: {error:#}"),
+                        );
+                        break;
+                    }
+                    stats
+                        .synthetic_generated_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                    let next_frame = frame_index.saturating_add(1);
+                    let frame_due_now = frame_at_elapsed(started.elapsed(), fps);
+                    if frame_due_now > next_frame {
+                        stats
+                            .synthetic_skipped_frames
+                            .fetch_add(frame_due_now - next_frame, Ordering::Relaxed);
+                        frame_index = frame_due_now;
+                    } else {
+                        frame_index = next_frame;
+                    }
+                }
+            })
+            .context("could not start synthetic frame source")?;
+        Ok(Self {
+            stop_signal,
+            thread: Some(thread),
+        })
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.stop_signal.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("synthetic frame source panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn render_linux_synthetic(width: u32, height: u32, phase: SyntheticPhase, frame: u64) -> Vec<u8> {
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let motion = match phase {
+                SyntheticPhase::Static => 0,
+                SyntheticPhase::PartialMotion => {
+                    u8::from(
+                        x >= (frame as u32 * 8) % width.max(1)
+                            && x < ((frame as u32 * 8) % width.max(1)).saturating_add(width / 4),
+                    ) * 160
+                }
+                SyntheticPhase::FullMotion => ((x + y + frame as u32 * 4) & 0xff) as u8,
+                SyntheticPhase::SceneCuts => ((frame / 30) & 1) as u8 * 220,
+            };
+            let offset = (y as usize * width as usize + x as usize) * 4;
+            pixels[offset] = motion;
+            pixels[offset + 1] = ((x.saturating_mul(255) / width.max(1)) as u8) ^ motion;
+            pixels[offset + 2] = ((y.saturating_mul(255) / height.max(1)) as u8) ^ motion;
+            pixels[offset + 3] = 255;
+        }
+    }
+    pixels
+}
+
 impl Drop for SyntheticFrameSource {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -3945,6 +4247,26 @@ fn store_source_failure(failure: &Mutex<Option<String>>, message: String) {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct MirrorPortalSink {
+    submitter: FrameSubmitter,
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for MirrorPortalSink {
+    fn submit(&self, captured: CapturedFrame) {
+        let frame = PendingFrame {
+            captured,
+            pipeline_started_at: Instant::now(),
+            synthetic_phase: None,
+        };
+        if let Err(error) = self.submitter.submit(frame) {
+            log::debug!("PipeWire frame arrived after mirroring stopped: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct MirrorFrameHandler {
     submitter: FrameSubmitter,
     failure: Arc<Mutex<Option<String>>>,
@@ -3953,6 +4275,7 @@ struct MirrorFrameHandler {
     skipped_samples: AtomicU64,
 }
 
+#[cfg(target_os = "macos")]
 impl SCStreamOutputTrait for MirrorFrameHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, output_type: SCStreamOutputType) {
         if output_type != SCStreamOutputType::Screen {
@@ -4020,6 +4343,7 @@ impl SCStreamOutputTrait for MirrorFrameHandler {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl MirrorFrameHandler {
     fn record_repeated_sample(
         &self,
@@ -4160,6 +4484,7 @@ impl Drop for SenderWorker {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct MirrorPipeline {
     encoder: CompressionSession,
     outputs: Vec<SenderSubmitter>,
@@ -4173,6 +4498,7 @@ struct MirrorPipeline {
     stats: Arc<MirrorStats>,
 }
 
+#[cfg(target_os = "macos")]
 impl MirrorPipeline {
     fn has_reference_frame(&self) -> bool {
         self.parameter_sets.is_some()
@@ -4286,6 +4612,7 @@ impl MirrorPipeline {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl LatestFrameBackend for MirrorPipeline {
     type Frame = PendingFrame;
 
@@ -4313,6 +4640,124 @@ impl LatestFrameBackend for MirrorPipeline {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct MirrorPipeline {
+    encoder: Option<LinuxVideoEncoder>,
+    encoder_control: Option<Arc<LinuxEncoderControl>>,
+    outputs: Vec<SenderSubmitter>,
+    frame_index: u64,
+    fps: u32,
+    width: u32,
+    height: u32,
+    provider: H264Provider,
+    rate_control: Arc<AdaptiveRateControl>,
+    encoder_bitrate: u32,
+    stats: Arc<MirrorStats>,
+}
+
+// The FFmpeg scaler is !Send, but the pipeline is moved to its worker before
+// the encoder is constructed and remains exclusively owned by that worker.
+#[cfg(target_os = "linux")]
+unsafe impl Send for MirrorPipeline {}
+
+#[cfg(target_os = "linux")]
+impl MirrorPipeline {
+    fn ensure_encoder(&mut self, format: RawPixelFormat) -> Result<()> {
+        if self.encoder.is_some() {
+            return Ok(());
+        }
+        let encoder = LinuxVideoEncoder::new(
+            self.provider,
+            self.width,
+            self.height,
+            self.fps,
+            self.encoder_bitrate,
+            format,
+        )?;
+        self.encoder_control = Some(encoder.control());
+        self.encoder = Some(encoder);
+        Ok(())
+    }
+
+    fn apply_requested_bitrate(&mut self) {
+        let target = self.rate_control.target_bitrate().min(u64::from(u32::MAX)) as u32;
+        if target == self.encoder_bitrate {
+            return;
+        }
+        if let Some(control) = &self.encoder_control
+            && let Err(error) = control.set_bitrate(target)
+        {
+            self.stats
+                .adaptive_bitrate_apply_failures
+                .fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "Linux H.264 provider rejected adaptive bitrate {:.2} Mbit/s: {error:#}",
+                f64::from(target) / 1_000_000.0
+            );
+            return;
+        }
+        self.encoder_bitrate = target;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LatestFrameBackend for MirrorPipeline {
+    type Frame = PendingFrame;
+
+    fn has_reference_frame(&self) -> bool {
+        self.frame_index > 0
+    }
+
+    fn queue_started_at(&self, frame: &Self::Frame) -> Option<Instant> {
+        Some(frame.pipeline_started_at)
+    }
+
+    fn failure_context(&self) -> &'static str {
+        "Linux mirroring encode worker failed"
+    }
+
+    fn process_frame(&mut self, mut frame: Self::Frame, queue_wait_micros: u64) -> Result<()> {
+        if let Some(cursor) = frame.captured.cursor.take() {
+            composite_cursor(&mut frame.captured, &cursor);
+        }
+        self.ensure_encoder(frame.captured.format)?;
+        self.apply_requested_bitrate();
+        let encode_started = Instant::now();
+        let packets = self
+            .encoder
+            .as_mut()
+            .expect("Linux encoder was initialized")
+            .encode(RawVideoFrame {
+                data: &frame.captured.data,
+                stride: frame.captured.stride,
+                width: frame.captured.width,
+                height: frame.captured.height,
+                format: frame.captured.format,
+                timestamp: frame.captured.timestamp,
+            })?;
+        let encode_micros = elapsed_micros(encode_started);
+        for packet in packets {
+            let encoded = EncodedFrame {
+                rtp_timestamp: packet.timestamp as u32,
+                keyframe: packet.keyframe,
+                data: Arc::new(packet.data),
+                timings: FrameTimings {
+                    pipeline_started_at: frame.pipeline_started_at,
+                    capture_age_micros: None,
+                    queue_wait_micros,
+                    encode_micros,
+                    prepare_micros: 0,
+                    sender_lock_wait_micros: 0,
+                },
+                synthetic_phase: frame.synthetic_phase,
+            };
+            fan_out_video(&self.outputs, encoded)?;
+            self.frame_index = self.frame_index.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
 fn encrypt_frame(data: &[u8], frame_id: u32, key: &[u8; 16], iv_mask: &[u8; 16]) -> Vec<u8> {
     let mut nonce = *iv_mask;
     for (target, byte) in nonce[8..12].iter_mut().zip(frame_id.to_be_bytes()) {
@@ -4324,6 +4769,7 @@ fn encrypt_frame(data: &[u8], frame_id: u32, key: &[u8; 16], iv_mask: &[u8; 16])
     output
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn avcc_to_annex_b(data: &[u8], parameter_sets: Option<(&Vec<u8>, &Vec<u8>)>) -> Result<Vec<u8>> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
     let parameter_bytes =
@@ -4353,6 +4799,7 @@ fn avcc_to_annex_b(data: &[u8], parameter_sets: Option<(&Vec<u8>, &Vec<u8>)>) ->
     Ok(output)
 }
 
+#[cfg(target_os = "macos")]
 fn avcc_contains_nal_type(data: &[u8], wanted: u8) -> Result<bool> {
     let mut offset = 0;
     while offset < data.len() {
@@ -4372,6 +4819,7 @@ fn avcc_contains_nal_type(data: &[u8], wanted: u8) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(target_os = "macos")]
 fn h264_parameter_sets(sample: *mut c_void) -> Result<(Vec<u8>, Vec<u8>)> {
     if sample.is_null() {
         bail!("encoded mirroring keyframe had no CoreMedia sample buffer");
@@ -4462,6 +4910,7 @@ const fn even(value: u32) -> u32 {
     value - value % 2
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MachTimebaseInfo {
@@ -4469,6 +4918,7 @@ struct MachTimebaseInfo {
     denom: u32,
 }
 
+#[cfg(target_os = "macos")]
 fn capture_age_micros(display_time: u64) -> Option<u64> {
     let now = unsafe { mach_absolute_time() };
     let elapsed_ticks = now.checked_sub(display_time)?;
@@ -4484,12 +4934,14 @@ fn capture_age_micros(display_time: u64) -> Option<u64> {
     u64::try_from(nanoseconds / 1_000).ok()
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
-#[cfg_attr(target_os = "macos", link(name = "CoreMedia", kind = "framework"))]
+#[cfg(target_os = "macos")]
+#[link(name = "CoreMedia", kind = "framework")]
 unsafe extern "C" {
     fn CMSampleBufferGetFormatDescription(sample_buffer: *mut c_void) -> *mut c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -4504,6 +4956,8 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::audio;
     use super::{
         AdaptiveRateControl, CastRtpSender, CastStreamingControlState, CastStreamingOfferMessage,
         EncodedFrame, FrameTimings, H264Level, LatencyDistribution, LatencyRecommendations,
@@ -4516,6 +4970,7 @@ mod tests {
         rate_window_is_congested, recommend_latency, round_target_delay, select_tuning_winner,
         source_command_argument, validate_cast_hosts,
     };
+    #[cfg(target_os = "macos")]
     use crate::audio;
     use serde_json::json;
     use std::{

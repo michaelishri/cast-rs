@@ -87,6 +87,8 @@ struct OpenEncoder {
     encoder: encoder::video::Encoder,
     scaler: scaling::Context,
     input_format: ffmpeg::format::Pixel,
+    source_width: u32,
+    source_height: u32,
     output_format: ffmpeg::format::Pixel,
     vaapi: Option<VaapiFrames>,
 }
@@ -115,7 +117,16 @@ impl LinuxVideoEncoder {
             bail!("encoder dimensions, frame rate, and bitrate must be greater than zero");
         }
         let control = Arc::new(LinuxEncoderControl::new(bitrate));
-        let open = open_encoder(provider, width, height, fps, bitrate, input_format.ffmpeg())?;
+        let open = open_encoder(
+            provider,
+            width,
+            height,
+            width,
+            height,
+            fps,
+            bitrate,
+            input_format.ffmpeg(),
+        )?;
         Ok(Self {
             provider,
             width,
@@ -132,15 +143,23 @@ impl LinuxVideoEncoder {
         Arc::clone(&self.control)
     }
 
+    pub(crate) const fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub(crate) const fn input_format(&self) -> RawPixelFormat {
+        match self.open.input_format {
+            ffmpeg::format::Pixel::BGRA => RawPixelFormat::Bgra,
+            ffmpeg::format::Pixel::BGRZ => RawPixelFormat::Bgrx,
+            ffmpeg::format::Pixel::RGBA => RawPixelFormat::Rgba,
+            ffmpeg::format::Pixel::RGBZ => RawPixelFormat::Rgbx,
+            _ => unreachable!(),
+        }
+    }
+
     pub(crate) fn encode(&mut self, source: RawVideoFrame<'_>) -> Result<Vec<EncodedPacket>> {
-        if source.width != self.width || source.height != self.height {
-            bail!(
-                "captured frame changed from {}x{} to {}x{}; rebuild the encoder",
-                self.width,
-                self.height,
-                source.width,
-                source.height
-            );
+        if source.width == 0 || source.height == 0 {
+            bail!("captured frame dimensions must be greater than zero");
         }
         let minimum_stride = usize::try_from(source.width)?.saturating_mul(4);
         let required = source
@@ -153,12 +172,18 @@ impl LinuxVideoEncoder {
 
         let generation = self.control.generation.load(Ordering::SeqCst);
         let input_format = source.format.ffmpeg();
-        if generation != self.applied_generation || input_format != self.open.input_format {
+        if generation != self.applied_generation
+            || input_format != self.open.input_format
+            || source.width != self.open.source_width
+            || source.height != self.open.source_height
+        {
             let bitrate = self.control.bitrate.load(Ordering::SeqCst);
             self.open = open_encoder(
                 self.provider,
                 self.width,
                 self.height,
+                source.width,
+                source.height,
                 self.fps,
                 bitrate,
                 input_format,
@@ -208,10 +233,13 @@ impl LinuxVideoEncoder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_encoder(
     provider: H264Provider,
     width: u32,
     height: u32,
+    source_width: u32,
+    source_height: u32,
     fps: u32,
     bitrate: u32,
     input_format: ffmpeg::format::Pixel,
@@ -267,8 +295,8 @@ fn open_encoder(
         .with_context(|| format!("could not open Linux H.264 provider {name}"))?;
     let scaler = scaling::Context::get(
         input_format,
-        width,
-        height,
+        source_width,
+        source_height,
         output_format,
         width,
         height,
@@ -279,6 +307,8 @@ fn open_encoder(
         encoder,
         scaler,
         input_format,
+        source_width,
+        source_height,
         output_format,
         vaapi,
     })
@@ -367,5 +397,19 @@ mod tests {
             .unwrap();
         assert!(restarted.iter().any(|packet| packet.keyframe));
         assert!(restarted.iter().all(|packet| packet.timestamp >= 3_000));
+
+        let resized_pixels = vec![0_u8; 80 * 48 * 4];
+        let resized = encoder
+            .encode(RawVideoFrame {
+                data: &resized_pixels,
+                stride: 80 * 4,
+                width: 80,
+                height: 48,
+                format: RawPixelFormat::Bgra,
+                timestamp: 6_000,
+            })
+            .unwrap();
+        assert!(resized.iter().any(|packet| packet.keyframe));
+        assert!(resized.iter().all(|packet| packet.timestamp >= 6_000));
     }
 }
