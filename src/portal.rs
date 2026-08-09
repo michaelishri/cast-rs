@@ -433,8 +433,35 @@ pub(crate) struct CursorImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) stride: usize,
-    pub(crate) format: RawPixelFormat,
+    pub(crate) format: CursorPixelFormat,
     pub(crate) pixels: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorPixelFormat {
+    Rgbx,
+    Bgrx,
+    Xrgb,
+    Xbgr,
+    Rgba,
+    Bgra,
+    Argb,
+    Abgr,
+}
+
+impl CursorPixelFormat {
+    pub(crate) fn rgba(self, pixel: &[u8]) -> (u8, u8, u8, u8) {
+        match self {
+            Self::Rgbx => (pixel[0], pixel[1], pixel[2], 255),
+            Self::Bgrx => (pixel[2], pixel[1], pixel[0], 255),
+            Self::Xrgb => (pixel[1], pixel[2], pixel[3], 255),
+            Self::Xbgr => (pixel[3], pixel[2], pixel[1], 255),
+            Self::Rgba => (pixel[0], pixel[1], pixel[2], pixel[3]),
+            Self::Bgra => (pixel[2], pixel[1], pixel[0], pixel[3]),
+            Self::Argb => (pixel[1], pixel[2], pixel[3], pixel[0]),
+            Self::Abgr => (pixel[3], pixel[2], pixel[1], pixel[0]),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -848,7 +875,7 @@ fn update_cursor_metadata(
         width,
         height,
         stride,
-        format: raw_pixel_format(spa::param::video::VideoFormat::from_raw(bitmap.format))?,
+        format: cursor_pixel_format(spa::param::video::VideoFormat::from_raw(bitmap.format))?,
         pixels,
     });
     Ok(())
@@ -935,6 +962,20 @@ fn raw_pixel_format(format: spa::param::video::VideoFormat) -> Result<RawPixelFo
         value if value == spa::param::video::VideoFormat::RGBA => Ok(RawPixelFormat::Rgba),
         value if value == spa::param::video::VideoFormat::RGBx => Ok(RawPixelFormat::Rgbx),
         other => bail!("unsupported PipeWire video format {other:?}"),
+    }
+}
+
+fn cursor_pixel_format(format: spa::param::video::VideoFormat) -> Result<CursorPixelFormat> {
+    match format {
+        value if value == spa::param::video::VideoFormat::RGBx => Ok(CursorPixelFormat::Rgbx),
+        value if value == spa::param::video::VideoFormat::BGRx => Ok(CursorPixelFormat::Bgrx),
+        value if value == spa::param::video::VideoFormat::xRGB => Ok(CursorPixelFormat::Xrgb),
+        value if value == spa::param::video::VideoFormat::xBGR => Ok(CursorPixelFormat::Xbgr),
+        value if value == spa::param::video::VideoFormat::RGBA => Ok(CursorPixelFormat::Rgba),
+        value if value == spa::param::video::VideoFormat::BGRA => Ok(CursorPixelFormat::Bgra),
+        value if value == spa::param::video::VideoFormat::ARGB => Ok(CursorPixelFormat::Argb),
+        value if value == spa::param::video::VideoFormat::ABGR => Ok(CursorPixelFormat::Abgr),
+        other => bail!("unsupported PipeWire cursor format {other:?}"),
     }
 }
 
@@ -1132,7 +1173,7 @@ mod tests {
         assert_eq!(image.position, (4, 5));
         assert_eq!(image.hotspot, (1, 1));
         assert_eq!((image.width, image.height, image.stride), (2, 2, 8));
-        assert_eq!(image.format, RawPixelFormat::Bgra);
+        assert_eq!(image.format, CursorPixelFormat::Bgra);
         assert_eq!(image.pixels, fixture.pixels);
 
         let moved = spa::sys::spa_meta_cursor {
@@ -1195,5 +1236,57 @@ mod tests {
             RawPixelFormat::Rgbx
         );
         assert!(raw_pixel_format(spa::param::video::VideoFormat::NV12).is_err());
+    }
+
+    #[test]
+    fn packed_cursor_formats_are_mapped_explicitly() {
+        let cases = [
+            (
+                spa::param::video::VideoFormat::RGBx,
+                CursorPixelFormat::Rgbx,
+                (1, 2, 3, 255),
+            ),
+            (
+                spa::param::video::VideoFormat::BGRx,
+                CursorPixelFormat::Bgrx,
+                (3, 2, 1, 255),
+            ),
+            (
+                spa::param::video::VideoFormat::xRGB,
+                CursorPixelFormat::Xrgb,
+                (2, 3, 4, 255),
+            ),
+            (
+                spa::param::video::VideoFormat::xBGR,
+                CursorPixelFormat::Xbgr,
+                (4, 3, 2, 255),
+            ),
+            (
+                spa::param::video::VideoFormat::RGBA,
+                CursorPixelFormat::Rgba,
+                (1, 2, 3, 4),
+            ),
+            (
+                spa::param::video::VideoFormat::BGRA,
+                CursorPixelFormat::Bgra,
+                (3, 2, 1, 4),
+            ),
+            (
+                spa::param::video::VideoFormat::ARGB,
+                CursorPixelFormat::Argb,
+                (2, 3, 4, 1),
+            ),
+            (
+                spa::param::video::VideoFormat::ABGR,
+                CursorPixelFormat::Abgr,
+                (4, 3, 2, 1),
+            ),
+        ];
+        for (spa, expected, rgba) in cases {
+            let mapped = cursor_pixel_format(spa).unwrap();
+            assert_eq!(mapped, expected);
+            assert_eq!(mapped.rgba(&[1, 2, 3, 4]), rgba);
+        }
+        assert!(cursor_pixel_format(spa::param::video::VideoFormat::NV12).is_err());
     }
 }

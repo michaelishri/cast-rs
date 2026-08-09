@@ -205,7 +205,7 @@ impl LatestFrameBackend for DiagnosticEncoder {
 }
 
 pub(crate) fn composite_cursor(frame: &mut CapturedFrame, cursor: &CursorImage) {
-    if cursor.format != frame.format || cursor.stride < cursor.width as usize * 4 {
+    if cursor.stride < cursor.width as usize * 4 {
         return;
     }
     let left = cursor.position.0 - cursor.hotspot.0;
@@ -223,17 +223,17 @@ pub(crate) fn composite_cursor(frame: &mut CapturedFrame, cursor: &CursorImage) 
             let source = cursor_y as usize * cursor.stride + cursor_x as usize * 4;
             let target = target_y as usize * frame.stride + target_x as usize * 4;
             if source + 4 <= cursor.pixels.len() && target + 4 <= frame.data.len() {
-                let alpha = if matches!(
-                    cursor.format,
+                let (red, green, blue, alpha) =
+                    cursor.format.rgba(&cursor.pixels[source..source + 4]);
+                let foreground = match frame.format {
                     crate::linux_encoder::RawPixelFormat::Bgra
-                        | crate::linux_encoder::RawPixelFormat::Rgba
-                ) {
-                    u16::from(cursor.pixels[source + 3])
-                } else {
-                    255
+                    | crate::linux_encoder::RawPixelFormat::Bgrx => [blue, green, red],
+                    crate::linux_encoder::RawPixelFormat::Rgba
+                    | crate::linux_encoder::RawPixelFormat::Rgbx => [red, green, blue],
                 };
-                for channel in 0..3 {
-                    let foreground = u16::from(cursor.pixels[source + channel]);
+                let alpha = u16::from(alpha);
+                for (channel, foreground) in foreground.into_iter().enumerate() {
+                    let foreground = u16::from(foreground);
                     let background = u16::from(frame.data[target + channel]);
                     frame.data[target + channel] =
                         ((foreground * alpha + background * (255 - alpha)) / 255) as u8;
@@ -250,7 +250,7 @@ const fn even(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux_encoder::RawPixelFormat;
+    use crate::{linux_encoder::RawPixelFormat, portal::CursorPixelFormat};
 
     #[test]
     fn cursor_metadata_is_composited_and_clipped() {
@@ -259,7 +259,7 @@ mod tests {
             stride: 16,
             width: 4,
             height: 4,
-            format: RawPixelFormat::Bgra,
+            format: RawPixelFormat::Bgrx,
             timestamp: 0,
             cursor: None,
         };
@@ -269,11 +269,35 @@ mod tests {
             width: 2,
             height: 2,
             stride: 8,
-            format: RawPixelFormat::Bgra,
+            format: CursorPixelFormat::Bgra,
             pixels: vec![1, 1, 1, 255, 1, 1, 1, 255, 1, 1, 1, 255, 1, 1, 1, 255],
         };
         composite_cursor(&mut frame, &cursor);
         assert_eq!(&frame.data[..4], &[1, 1, 1, 0]);
         assert!(frame.data[4..].iter().all(|value| *value == 0));
+    }
+
+    #[test]
+    fn cursor_color_layout_and_alpha_are_converted_to_the_frame_layout() {
+        let mut frame = CapturedFrame {
+            data: vec![10, 20, 30, 0],
+            stride: 4,
+            width: 1,
+            height: 1,
+            format: RawPixelFormat::Rgbx,
+            timestamp: 0,
+            cursor: None,
+        };
+        let cursor = CursorImage {
+            position: (0, 0),
+            hotspot: (0, 0),
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: CursorPixelFormat::Argb,
+            pixels: vec![128, 110, 120, 130],
+        };
+        composite_cursor(&mut frame, &cursor);
+        assert_eq!(frame.data, [60, 70, 80, 0]);
     }
 }
