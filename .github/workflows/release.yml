@@ -130,40 +130,7 @@ jobs:
 
       - name: Package release archive, checksum, and dependency audit
         shell: bash
-        run: |
-          archive="cast-linux-${{ matrix.archive_arch }}"
-          archive_root="$archive"
-          mkdir -p "package/$archive_root/lib" dist
-          cp target/release/cast "package/$archive_root/"
-          cp -a .build/ffmpeg-dist/lib/libavcodec.so* "package/$archive_root/lib/"
-          cp -a .build/ffmpeg-dist/lib/libavformat.so* "package/$archive_root/lib/"
-          cp -a .build/ffmpeg-dist/lib/libavutil.so* "package/$archive_root/lib/"
-          cp -a .build/ffmpeg-dist/lib/libswresample.so* "package/$archive_root/lib/"
-          cp -a .build/ffmpeg-dist/lib/libswscale.so* "package/$archive_root/lib/"
-          cp -a .build/ffmpeg-dist/lib/libcast_openh264_loader.so* "package/$archive_root/lib/"
-          cp README.md LICENSE THIRD_PARTY_NOTICES.md "package/$archive_root/"
-          cp .build/ffmpeg-8.0.1/COPYING.LGPLv2.1 "package/$archive_root/FFMPEG-LICENSE-LGPL-2.1.txt"
-          patchelf --set-rpath '$ORIGIN/lib' "package/$archive_root/cast"
-          find "package/$archive_root/lib" -type f -name '*.so*' -print0 | while IFS= read -r -d '' library; do
-            patchelf --set-rpath '$ORIGIN' "$library"
-          done
-          readelf -d "package/$archive_root/cast" | grep -F '[$ORIGIN/lib]'
-          LD_LIBRARY_PATH= ldd "package/$archive_root/cast" | tee "dist/$archive.ldd.txt"
-          ! grep -F 'not found' "dist/$archive.ldd.txt"
-          grep -F "package/$archive_root/lib/libavcodec.so" "dist/$archive.ldd.txt"
-          tar -C package -czf "dist/$archive.tar.gz" "$archive_root"
-          (
-            cd dist
-            sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
-          )
-
-      - name: Smoke-test packaged archive
-        shell: bash
-        run: |
-          smoke_root="$(mktemp -d)"
-          tar -xzf "dist/cast-linux-${{ matrix.archive_arch }}.tar.gz" -C "$smoke_root"
-          env -u LD_LIBRARY_PATH "$smoke_root/cast-linux-${{ matrix.archive_arch }}/cast" --version
-          env -u LD_LIBRARY_PATH "$smoke_root/cast-linux-${{ matrix.archive_arch }}/cast" --help >/dev/null
+        run: ./scripts/package-linux-release.sh "${{ matrix.archive_arch }}"
 
       - name: Upload Linux release assets
         uses: actions/upload-artifact@v7

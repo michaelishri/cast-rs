@@ -1,6 +1,6 @@
 # Linux release validation
 
-Run this matrix for a release candidate built by `.github/workflows/release.yml`. Automated archive checks are required on both native Ubuntu 22.04 x86_64 and aarch64 runners. Desktop rows require real GNOME and KDE Wayland sessions plus a Cast video receiver; do not substitute X11.
+Run this matrix for a release candidate built by `.github/workflows/release.yml`. The ordinary CI workflow uses the same `scripts/package-linux-release.sh` path before release and retains the x86_64/aarch64 archives, checksums, and `ldd` reports as `validation-linux-*` artifacts. Linux source checks compile against both the Ubuntu 22.04 header floor and Ubuntu 24.04 current-header baseline. Desktop rows require real GNOME and KDE Wayland sessions plus a Cast video receiver; do not substitute X11.
 
 ## Automated release gate
 
@@ -13,6 +13,8 @@ Run this matrix for a release candidate built by `.github/workflows/release.yml`
 - [ ] Both `ldd` audit artifacts contain no `not found` entries and resolve FFmpeg from the archive.
 - [ ] Both `.sha256` files verify.
 - [ ] Neither archive contains an OpenH264 module, GPU driver, portal, PipeWire, WirePlumber, or glibc.
+
+Record the successful CI run URL and both artifact names in the release issue. Do not check these rows from an x86_64-only local run; the native aarch64 job is part of the gate.
 
 ## Real-desktop matrix
 
