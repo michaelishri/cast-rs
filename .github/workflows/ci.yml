@@ -9,6 +9,46 @@ permissions:
   contents: read
 
 jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential nasm pkg-config
+
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
   check:
     name: macOS checks
     runs-on: macos-26
