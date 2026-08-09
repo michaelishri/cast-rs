@@ -50,8 +50,9 @@ use crate::desktop::{
     ReceiverControlSink, ReceiverVolumeCommand, SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME,
     SyntheticPhase, VideoFrameTimings as FrameTimings, fan_out_video, phase_for_frame,
 };
-#[cfg(target_os = "macos")]
 use crate::desktop::{MediaClock, fan_out_audio, fan_out_receiver_control};
+#[cfg(target_os = "linux")]
+use crate::linux_audio::{self as audio, AudioWorker, LocalOutputRedirect, PipeWireAudioCapture};
 #[cfg(target_os = "macos")]
 use crate::synthetic::SyntheticFrameGenerator;
 #[cfg(target_os = "macos")]
@@ -63,13 +64,6 @@ use crate::{
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
 };
-
-#[cfg(target_os = "linux")]
-mod audio {
-    pub(crate) const CHANNELS: u32 = 2;
-    pub(crate) const BITRATE: u32 = 192_000;
-    pub(crate) const RTP_PAYLOAD_TYPE: u8 = 97;
-}
 
 #[cfg(target_os = "macos")]
 type ExtendedDisplaySession = VirtualDisplaySession;
@@ -153,6 +147,8 @@ pub fn cast_desktop(options: MirrorOptions) -> Result<()> {
             ProfilePresentation::Detailed,
             interrupted.as_ref(),
             None,
+            #[cfg(target_os = "linux")]
+            None,
         )
         .map(|_| ())
     }
@@ -180,6 +176,8 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
             RunMode::Profile,
             ProfilePresentation::Detailed,
             interrupted.as_ref(),
+            None,
+            #[cfg(target_os = "linux")]
             None,
         )
         .map(|_| ())
@@ -450,6 +448,8 @@ fn run_auto_tune_trial(
         ProfilePresentation::AutoTuneTrial,
         interrupted,
         None,
+        #[cfg(target_os = "linux")]
+        None,
     )?
     .expect("profile mode returns profile measurements")
     .aggregate;
@@ -612,8 +612,154 @@ fn ensure_extended_display_alive(session: &mut ExtendedDisplaySession) -> Result
     session.check()
 }
 
+#[cfg(target_os = "linux")]
+type SharedAudioOutputs = Arc<Mutex<Vec<(u64, Vec<SenderSubmitter>)>>>;
+
+#[cfg(target_os = "linux")]
+type SharedAudioControls = Arc<Mutex<Vec<(u64, Vec<Arc<CastStreamingControlState>>)>>>;
+
+#[cfg(target_os = "linux")]
+struct SharedLinuxMirrorAudio {
+    next_registration: AtomicU64,
+    outputs: SharedAudioOutputs,
+    controls: SharedAudioControls,
+    failure: Arc<Mutex<Option<String>>>,
+    resources: Mutex<SharedLinuxAudioResources>,
+}
+
+#[cfg(target_os = "linux")]
+struct SharedLinuxAudioResources {
+    capture: Option<PipeWireAudioCapture>,
+    worker: Option<AudioWorker>,
+    redirect: Option<LocalOutputRedirect>,
+}
+
+#[cfg(target_os = "linux")]
+impl SharedLinuxMirrorAudio {
+    fn start() -> Result<Self> {
+        let encoder = audio::prepare()?;
+        let outputs = Arc::new(Mutex::new(Vec::<(u64, Vec<SenderSubmitter>)>::new()));
+        let worker_outputs = Arc::clone(&outputs);
+        let failure = Arc::new(Mutex::new(None));
+        let (submitter, worker) = AudioWorker::start_prepared(
+            encoder,
+            Arc::new(MediaClock::default()),
+            Arc::clone(&failure),
+            move |frame| {
+                let outputs = worker_outputs
+                    .lock()
+                    .map_err(|_| anyhow!("shared audio output lock was poisoned"))?;
+                for (_, subscriber) in outputs.iter() {
+                    fan_out_audio(subscriber, frame.clone())?;
+                }
+                Ok(())
+            },
+        )?;
+        let capture = match PipeWireAudioCapture::start(submitter, Arc::clone(&failure)) {
+            Ok(capture) => capture,
+            Err(error) => {
+                worker.stop()?;
+                return Err(error);
+            }
+        };
+        let controls = Arc::new(Mutex::new(
+            Vec::<(u64, Vec<Arc<CastStreamingControlState>>)>::new(),
+        ));
+        let redirect_controls = Arc::clone(&controls);
+        let redirect = match LocalOutputRedirect::start(move |control| {
+            if let Ok(controls) = redirect_controls.lock() {
+                for (_, subscriber) in controls.iter() {
+                    fan_out_receiver_control(subscriber, control.into());
+                }
+            }
+        }) {
+            Ok(redirect) => Some(redirect),
+            Err(error) => {
+                eprintln!(
+                    "Could not suppress local desktop audio or route volume controls to the receiver: {error:#}"
+                );
+                None
+            }
+        };
+        Ok(Self {
+            next_registration: AtomicU64::new(1),
+            outputs,
+            controls,
+            failure,
+            resources: Mutex::new(SharedLinuxAudioResources {
+                capture: Some(capture),
+                worker: Some(worker),
+                redirect,
+            }),
+        })
+    }
+
+    fn register(
+        &self,
+        outputs: Vec<SenderSubmitter>,
+        controls: Vec<Arc<CastStreamingControlState>>,
+    ) -> Result<u64> {
+        let id = self.next_registration.fetch_add(1, Ordering::Relaxed);
+        self.outputs
+            .lock()
+            .map_err(|_| anyhow!("shared audio output lock was poisoned"))?
+            .push((id, outputs));
+        self.controls
+            .lock()
+            .map_err(|_| anyhow!("shared volume-control lock was poisoned"))?
+            .push((id, controls));
+        Ok(id)
+    }
+
+    fn unregister(&self, id: u64) {
+        if let Ok(mut outputs) = self.outputs.lock() {
+            outputs.retain(|(candidate, _)| *candidate != id);
+        }
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.retain(|(candidate, _)| *candidate != id);
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(error) = take_failure(&self.failure)? {
+            bail!("shared Linux desktop audio failed: {error}");
+        }
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<()> {
+        let (capture, worker, redirect) = {
+            let mut resources = self
+                .resources
+                .lock()
+                .map_err(|_| anyhow!("shared audio resource lock was poisoned"))?;
+            (
+                resources.capture.take(),
+                resources.worker.take(),
+                resources.redirect.take(),
+            )
+        };
+        let capture_result = capture.map(PipeWireAudioCapture::stop).transpose();
+        let worker_result = worker.map(AudioWorker::stop).transpose();
+        let redirect_result = redirect.map(LocalOutputRedirect::stop).transpose();
+        capture_result?;
+        worker_result?;
+        redirect_result?;
+        self.check()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SharedLinuxMirrorAudio {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            log::warn!("could not stop shared Linux desktop audio: {error:#}");
+        }
+    }
+}
+
 fn run_extended_desktop(
-    options: MirrorOptions,
+    mut options: MirrorOptions,
     mode: RunMode,
     presentation: ProfilePresentation,
     interrupted: &Arc<AtomicBool>,
@@ -638,6 +784,20 @@ fn run_extended_desktop(
         displays.push((host, session));
     }
 
+    #[cfg(target_os = "linux")]
+    let shared_audio = if options.audio {
+        match SharedLinuxMirrorAudio::start() {
+            Ok(audio) => Some(Arc::new(audio)),
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                options.audio = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let worker_presentation =
         if mode == RunMode::Profile && presentation == ProfilePresentation::Detailed {
             ProfilePresentation::GroupedTarget
@@ -655,6 +815,8 @@ fn run_extended_desktop(
                 target_options.display_id = Some(session.display_id());
             }
             let stop = Arc::clone(interrupted);
+            #[cfg(target_os = "linux")]
+            let shared_audio = shared_audio.as_ref().map(Arc::clone);
             workers.push((
                 host,
                 scope.spawn(move || {
@@ -665,6 +827,8 @@ fn run_extended_desktop(
                             worker_presentation,
                             stop.as_ref(),
                             Some(session),
+                            #[cfg(target_os = "linux")]
+                            shared_audio,
                         )
                     }))
                     .map_err(|_| anyhow!("desktop cast worker for {host} panicked"))
@@ -687,6 +851,11 @@ fn run_extended_desktop(
             })
             .collect::<Vec<_>>()
     });
+
+    #[cfg(target_os = "linux")]
+    if let Some(audio) = shared_audio {
+        audio.stop()?;
+    }
 
     let mut failures = Vec::new();
     let mut receivers = Vec::new();
@@ -725,6 +894,7 @@ fn run_desktop(
     presentation: ProfilePresentation,
     interrupted: &AtomicBool,
     precreated_display: Option<ExtendedDisplaySession>,
+    #[cfg(target_os = "linux")] shared_audio: Option<Arc<SharedLinuxMirrorAudio>>,
 ) -> Result<Option<ProfileGroupResult>> {
     validate_cast_hosts(&options.cast_hosts)?;
     if options.bitrate <= 0 {
@@ -748,8 +918,16 @@ fn run_desktop(
     if options.extend && options.synthetic {
         bail!("--extend cannot be combined with --synthetic");
     }
-    #[cfg(target_os = "macos")]
-    let prepared_audio = if options.audio {
+    let prepared_audio = if options.audio && {
+        #[cfg(target_os = "linux")]
+        {
+            shared_audio.is_none()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+    } {
         match audio::prepare() {
             Ok(encoder) => Some(encoder),
             Err(error) => {
@@ -761,12 +939,6 @@ fn run_desktop(
     } else {
         None
     };
-    #[cfg(target_os = "linux")]
-    if options.audio {
-        eprintln!("System audio is not enabled in this build yet; continuing with video only.");
-        options.audio = false;
-    }
-
     let width = even(options.width);
     let height = even(options.height);
     let h264_level = H264Level::for_stream(width, height, options.fps, options.bitrate as u64)?;
@@ -925,7 +1097,6 @@ fn run_desktop(
     #[cfg(target_os = "macos")]
     configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
 
-    #[cfg(target_os = "macos")]
     let clock = Arc::new(MediaClock::default());
     #[cfg(target_os = "macos")]
     let pipeline = MirrorPipeline {
@@ -954,8 +1125,29 @@ fn run_desktop(
         encoder_bitrate: options.bitrate as u32,
         stats: Arc::clone(&capture_stats),
     };
-    #[cfg(target_os = "macos")]
-    let (audio_submitter, audio_worker) = if !audio_outputs.is_empty() {
+    #[cfg(target_os = "linux")]
+    let shared_audio_registration = shared_audio
+        .as_ref()
+        .filter(|_| !audio_outputs.is_empty())
+        .map(|audio| {
+            let controls = targets
+                .iter()
+                .filter(|target| target.transport.audio.is_some())
+                .map(|target| Arc::clone(&target.transport.control))
+                .collect();
+            audio.register(audio_outputs.clone(), controls)
+        })
+        .transpose()?;
+    let (audio_submitter, audio_worker) = if !audio_outputs.is_empty() && {
+        #[cfg(target_os = "linux")]
+        {
+            shared_audio.is_none()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+    } {
         let (submitter, worker) = AudioWorker::start_prepared(
             prepared_audio.expect("audio was prepared before it was offered"),
             Arc::clone(&clock),
@@ -968,7 +1160,19 @@ fn run_desktop(
         (None, None)
     };
     #[cfg(target_os = "linux")]
-    let (audio_submitter, audio_worker): (Option<()>, Option<()>) = (None, None);
+    let (audio_submitter, audio_worker, pipewire_audio) =
+        if let (Some(submitter), Some(worker)) = (audio_submitter, audio_worker) {
+            match PipeWireAudioCapture::start(submitter.clone(), Arc::clone(&failure)) {
+                Ok(capture) => (Some(submitter), Some(worker), Some(capture)),
+                Err(error) => {
+                    eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                    worker.stop()?;
+                    (None, None, None)
+                }
+            }
+        } else {
+            (None, None, None)
+        };
     let max_frame_age = resolve_max_frame_age(options.max_frame_age, options.fps);
     let frame_observer: Arc<dyn LatestFrameObserver> = capture_stats.clone();
     let (submitter, encoder_worker) = EncoderWorker::start(
@@ -986,13 +1190,11 @@ fn run_desktop(
     } else {
         log::debug!("latest-frame-wins queue enabled without a raw-frame deadline");
     }
-    #[cfg(target_os = "macos")]
     let volume_controls = targets
         .iter()
         .filter(|target| target.transport.audio.is_some())
         .map(|target| Arc::clone(&target.transport.control))
         .collect::<Vec<_>>();
-    #[cfg(target_os = "macos")]
     let local_output_redirect = if audio_submitter.is_some() {
         match LocalOutputRedirect::start(move |control| {
             fan_out_receiver_control(&volume_controls, control.into());
@@ -1143,9 +1345,7 @@ fn run_desktop(
                     options.target_delay.as_millis()
                 ),
             }
-            let _ = audio_submitter;
-            let _ = audio_worker;
-            RunningInput::Screen(capture, encoder_worker)
+            RunningInput::Screen(capture, encoder_worker, pipewire_audio, audio_worker)
         }
     };
     if mode == RunMode::Cast {
@@ -1184,6 +1384,10 @@ fn run_desktop(
             if let Some(error) = take_failure(&failure)? {
                 bail!("mirroring pipeline failed: {error}");
             }
+            #[cfg(target_os = "linux")]
+            if let Some(audio) = &shared_audio {
+                audio.check()?;
+            }
             input.check()?;
             for target in &targets {
                 target.ensure_alive()?;
@@ -1208,10 +1412,11 @@ fn run_desktop(
     }
 
     let input_result = input.stop_and_release();
-    #[cfg(target_os = "macos")]
-    let output_result = local_output_redirect.map_or(Ok(()), LocalOutputRedirect::stop);
     #[cfg(target_os = "linux")]
-    let output_result: Result<()> = Ok(());
+    if let (Some(audio), Some(registration)) = (&shared_audio, shared_audio_registration) {
+        audio.unregister(registration);
+    }
+    let output_result = local_output_redirect.map_or(Ok(()), LocalOutputRedirect::stop);
     // Stopping an SCStream does not release the stream or its content filter.
     // Drop the capture graph before removing a virtual source display so
     // ScreenCaptureKit cannot keep that display registered with WindowServer.
@@ -3878,14 +4083,19 @@ enum RunningInput {
     #[cfg(target_os = "macos")]
     Screen(SCStream, EncoderWorker, Option<AudioWorker>),
     #[cfg(target_os = "linux")]
-    Screen(PipeWireCapture, EncoderWorker),
+    Screen(
+        PipeWireCapture,
+        EncoderWorker,
+        Option<PipeWireAudioCapture>,
+        Option<AudioWorker>,
+    ),
     Synthetic(SyntheticFrameSource, EncoderWorker),
 }
 
 impl RunningInput {
     fn check(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if let Self::Screen(capture, _) = self {
+        if let Self::Screen(capture, ..) = self {
             capture.check()?;
         }
         Ok(())
@@ -3905,11 +4115,18 @@ impl RunningInput {
                 audio_result.map(|_| ())
             }
             #[cfg(target_os = "linux")]
-            Self::Screen(capture, encoder) => {
+            Self::Screen(capture, encoder, audio_capture, audio_worker) => {
                 let capture_result = capture.stop();
                 let encoder_result = encoder.stop();
+                let audio_capture_result = audio_capture
+                    .take()
+                    .map(PipeWireAudioCapture::stop)
+                    .transpose();
+                let audio_worker_result = audio_worker.take().map(AudioWorker::stop).transpose();
                 capture_result?;
-                encoder_result
+                encoder_result?;
+                audio_capture_result?;
+                audio_worker_result.map(|_| ())
             }
             Self::Synthetic(source, encoder) => {
                 let source_result = source.stop();

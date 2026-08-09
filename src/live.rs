@@ -29,13 +29,16 @@ use videotoolbox::prelude::*;
 
 #[cfg(target_os = "macos")]
 use crate::audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker};
+use crate::desktop::MediaClock;
+#[cfg(target_os = "linux")]
+use crate::linux_audio::{self as audio, AudioSubmitter, AudioWorker, PipeWireAudioCapture};
+#[cfg(target_os = "macos")]
+use crate::virtual_display::VirtualDisplaySession;
 use crate::{
     cast,
     desktop::{EncodedAudioFrame, EncodedAudioSink},
     network::{http_url, local_ip_for, private_route},
 };
-#[cfg(target_os = "macos")]
-use crate::{desktop::MediaClock, virtual_display::VirtualDisplaySession};
 #[cfg(target_os = "linux")]
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
@@ -44,13 +47,6 @@ use crate::{
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
 };
-
-#[cfg(target_os = "linux")]
-mod audio {
-    pub(crate) const BITRATE: u32 = 192_000;
-    pub(crate) const ACCESS_UNIT_SAMPLES: usize = 1_024;
-    pub(crate) const SAMPLE_RATE: u32 = 48_000;
-}
 
 #[cfg(target_os = "macos")]
 type ExtendedDisplaySession = VirtualDisplaySession;
@@ -85,8 +81,6 @@ pub struct LiveOptions {
 pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     #[cfg(target_os = "linux")]
     let mut options = options;
-    #[cfg(target_os = "macos")]
-    let options = options;
     if options.bitrate <= 0 {
         bail!("bitrate must be greater than zero");
     }
@@ -96,10 +90,18 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
     #[cfg(target_os = "linux")]
-    if options.audio {
-        eprintln!("System audio is not enabled in this build yet; continuing with video only.");
-        options.audio = false;
-    }
+    let prepared_audio = if options.audio {
+        match audio::prepare() {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                options.audio = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let width = even(options.width);
     let height = even(options.height);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -199,6 +201,44 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         target.url = http_url(address, &format!("/{}/master.m3u8", target.route));
     }
 
+    #[cfg(target_os = "linux")]
+    let (audio_submitter, audio_worker, pipewire_audio) = if let Some(encoder) = prepared_audio {
+        let mut seen_stores = HashSet::new();
+        let audio_stores = targets
+            .iter()
+            .filter(|target| seen_stores.insert(Arc::as_ptr(&target.store) as usize))
+            .map(|target| Arc::clone(&target.store))
+            .collect::<Vec<_>>();
+        let clock = Arc::new(MediaClock::default());
+        match AudioWorker::start_prepared(encoder, clock, Arc::clone(&failure), move |frame| {
+            for store in &audio_stores {
+                store.submit_audio(frame.clone())?;
+            }
+            Ok(())
+        }) {
+            Ok((submitter, worker)) => {
+                match PipeWireAudioCapture::start(submitter.clone(), Arc::clone(&failure)) {
+                    Ok(capture) => (Some(submitter), Some(worker), Some(capture)),
+                    Err(error) => {
+                        eprintln!(
+                            "System audio is unavailable; continuing with video only: {error:#}"
+                        );
+                        worker.stop()?;
+                        disable_target_audio(&targets)?;
+                        (None, None, None)
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                disable_target_audio(&targets)?;
+                (None, None, None)
+            }
+        }
+    } else {
+        (None, None, None)
+    };
+
     let mut captures = Vec::new();
     if options.extend {
         for (target, (_, session)) in targets.iter().zip(virtual_displays.drain(..)) {
@@ -207,6 +247,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
                 &options,
                 Arc::clone(&target.store),
                 Arc::clone(&failure),
+                #[cfg(target_os = "linux")]
+                audio_submitter.clone(),
             )?);
         }
     } else {
@@ -215,6 +257,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             &options,
             Arc::clone(shared_store.as_ref().expect("shared HLS store exists")),
             Arc::clone(&failure),
+            #[cfg(target_os = "linux")]
+            audio_submitter.clone(),
         )?);
     }
 
@@ -289,6 +333,10 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             capture_result = Err(error);
         }
     }
+    #[cfg(target_os = "linux")]
+    let audio_capture_result = pipewire_audio.map(PipeWireAudioCapture::stop).transpose();
+    #[cfg(target_os = "linux")]
+    let audio_worker_result = audio_worker.map(AudioWorker::stop).transpose();
     log::debug!("released desktop capture resources before display teardown");
     let mut receiver_result = Ok(());
     for (_, session) in &mut receiver_sessions {
@@ -311,7 +359,20 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
 
     run_result?;
     capture_result?;
+    #[cfg(target_os = "linux")]
+    audio_capture_result?;
+    #[cfg(target_os = "linux")]
+    audio_worker_result?;
     receiver_result
+}
+
+#[cfg(target_os = "linux")]
+fn disable_target_audio(targets: &[HlsTarget]) -> Result<()> {
+    for target in targets {
+        target.store.disable_audio()?;
+        target.audio.store(false, Ordering::SeqCst);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -893,6 +954,7 @@ impl LiveCapture {
         options: &LiveOptions,
         store: Arc<HlsStore>,
         failure: Arc<Mutex<Option<String>>>,
+        audio_submitter: Option<AudioSubmitter>,
     ) -> Result<Self> {
         let selection = match extended_display {
             Some(selection) => selection,
@@ -910,6 +972,7 @@ impl LiveCapture {
             height: even(options.height),
             bitrate: options.bitrate as u32,
             provider: options.provider,
+            audio_submitter,
         };
         let observer: Arc<dyn LatestFrameObserver> = Arc::new(LiveQueueObserver);
         let (submitter, worker) = LatestFrameWorker::start(
@@ -1005,6 +1068,7 @@ struct LinuxLivePipeline {
     height: u32,
     bitrate: u32,
     provider: H264Provider,
+    audio_submitter: Option<AudioSubmitter>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1047,6 +1111,9 @@ impl LinuxLivePipeline {
             if let Some(segment) = muxer.flush_segment() {
                 let start = self.segment_start_timestamp.unwrap_or(timestamp);
                 let duration = timestamp.saturating_sub(start) as f64 / TIMESCALE as f64;
+                if let Some(audio) = &self.audio_submitter {
+                    audio.advance_to(video_to_audio_timestamp(timestamp));
+                }
                 self.store
                     .push_segment(segment, duration.max(0.001), start, timestamp)?;
             }
@@ -1246,7 +1313,6 @@ impl HlsStore {
             .unwrap_or(false)
     }
 
-    #[cfg(target_os = "macos")]
     fn disable_audio(&self) -> Result<()> {
         let mut state = self
             .state
@@ -1891,12 +1957,13 @@ mod tests {
         desktop::LatestFrameBackend, linux_encoder::RawPixelFormat, media::H264Provider,
         portal::CapturedFrame,
     };
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
     use std::{
         collections::HashMap,
         collections::VecDeque,
         net::IpAddr,
         sync::{Arc, atomic::AtomicBool},
-        time::Duration,
     };
 
     #[test]
@@ -1947,6 +2014,7 @@ mod tests {
             height: 64,
             bitrate: 1_000_000,
             provider: H264Provider::Openh264,
+            audio_submitter: None,
         };
         for index in 0..65_u64 {
             let mut data = vec![0_u8; 64 * 64 * 4];

@@ -950,16 +950,20 @@ mod tests {
             Ok(self.state.lock().unwrap().snapshot)
         }
 
-        fn set_volume(&mut self, _device_id: u32, volume: f32) -> Result<()> {
+        fn set_volume(&mut self, device_id: u32, volume: f32) -> Result<()> {
             let mut state = self.state.lock().unwrap();
-            state.snapshot.volume = Some(volume);
+            if state.snapshot.device_id == device_id {
+                state.snapshot.volume = Some(volume);
+            }
             state.volume_updates.push(volume);
             Ok(())
         }
 
-        fn set_muted(&mut self, _device_id: u32, muted: bool) -> Result<()> {
+        fn set_muted(&mut self, device_id: u32, muted: bool) -> Result<()> {
             let mut state = self.state.lock().unwrap();
-            state.snapshot.muted = Some(muted);
+            if state.snapshot.device_id == device_id {
+                state.snapshot.muted = Some(muted);
+            }
             state.mute_updates.push(muted);
             Ok(())
         }
@@ -1000,6 +1004,42 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.snapshot, original);
         assert_eq!(state.volume_updates.last(), Some(&0.4));
+        assert_eq!(state.mute_updates.last(), Some(&false));
+    }
+
+    #[test]
+    fn output_redirect_restores_old_and_new_devices_across_a_switch() {
+        let original = OutputSnapshot {
+            device_id: 7,
+            volume: Some(0.4),
+            muted: Some(false),
+        };
+        let state = Arc::new(Mutex::new(FakeOutputState {
+            snapshot: original,
+            volume_updates: Vec::new(),
+            mute_updates: Vec::new(),
+        }));
+        let redirect = LocalOutputRedirect::start(
+            FakeOutputBackend {
+                state: Arc::clone(&state),
+            },
+            Duration::from_millis(1),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.snapshot = OutputSnapshot {
+                device_id: 9,
+                volume: Some(0.7),
+                muted: Some(false),
+            };
+        }
+        thread::sleep(Duration::from_millis(20));
+        redirect.stop().unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.volume_updates.contains(&0.4));
+        assert!(state.volume_updates.contains(&0.7));
         assert_eq!(state.mute_updates.last(), Some(&false));
     }
 
