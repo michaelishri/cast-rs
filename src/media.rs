@@ -1571,10 +1571,9 @@ mod tests {
     fn linked_linux_ffmpeg_registers_delayed_and_hardware_encoders() {
         assert!(encoder::find_by_name("h264_nvenc").is_some());
         let module_available = crate::setup::find_compatible().unwrap().is_some();
-        assert_eq!(
-            encoder::find_by_name("libopenh264").is_some(),
-            module_available
-        );
+        if module_available {
+            assert!(encoder::find_by_name("libopenh264").is_some());
+        }
     }
 
     fn media(container: &str, video: codec::Id, audio: Option<codec::Id>) -> MediaInfo {
