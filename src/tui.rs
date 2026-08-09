@@ -66,6 +66,12 @@ enum Focus {
     Receiver,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlayerKeyAction {
+    Seek(f32),
+    Volume(f32),
+}
+
 impl Focus {
     fn next(self) -> Self {
         match self {
@@ -718,15 +724,13 @@ impl App {
                         self.start_current();
                     }
                 }
-                (KeyCode::Delete, _) => self.remove_selected(),
+                (KeyCode::Delete | KeyCode::Backspace, _) => self.remove_selected(),
                 _ => {}
             },
-            Focus::Player => match key.code {
-                KeyCode::Left => self.seek_by(-10.0),
-                KeyCode::Right => self.seek_by(10.0),
-                KeyCode::Down => self.seek_by(-60.0),
-                KeyCode::Up => self.seek_by(60.0),
-                _ => {}
+            Focus::Player => match player_key_action(key.code) {
+                Some(PlayerKeyAction::Seek(seconds)) => self.seek_by(seconds),
+                Some(PlayerKeyAction::Volume(delta)) => self.adjust_volume(delta),
+                None => {}
             },
             Focus::Receiver => match key.code {
                 KeyCode::Enter => self.receiver_picker = true,
@@ -850,15 +854,13 @@ impl App {
         }
         if self.regions.transport.contains(point) {
             let offset = point.x.saturating_sub(self.regions.transport.x);
-            let action = usize::from(offset) * 8 / usize::from(self.regions.transport.width.max(1));
+            let action = usize::from(offset) * 6 / usize::from(self.regions.transport.width.max(1));
             match action {
                 0 => self.previous(),
-                1 => self.seek_by(-60.0),
-                2 => self.seek_by(-10.0),
-                3 => self.toggle_playback(),
-                4 => self.seek_by(10.0),
-                5 => self.seek_by(60.0),
-                6 => {
+                1 => self.seek_by(-10.0),
+                2 => self.toggle_playback(),
+                3 => self.seek_by(30.0),
+                4 => {
                     if self.playlist.advance().is_some() {
                         self.start_current();
                     }
@@ -1224,8 +1226,7 @@ fn render_player(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         rows[1],
     );
 
-    let controls =
-        "[ previous   ← -60s   -10s   Space play/pause   +10s   +60s →   ] next   s stop";
+    let controls = "[ previous   ← -10s   Space play/pause   +30s →   ] next   s stop";
     app.regions.transport = rows[2];
     frame.render_widget(
         Paragraph::new(controls).alignment(Alignment::Center),
@@ -1305,8 +1306,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "  Space play/pause  s stop  [/] previous/next  m mute  +/- volume\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
-            "Playlist\n  Enter play  Delete remove  Alt-↑/Alt-↓ reorder\n\n",
-            "Player\n  ←/→ seek ±10s  ↓/↑ seek ±60s\n\n",
+            "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
+            "Player\n  ← seek -10s  → seek +30s  ↓/↑ volume -/+5%\n\n",
             "Receiver\n  Enter choose receiver  r rescan\n\n",
             "Mouse\n  Click to focus/select, double-click to activate, wheel to scroll,\n",
             "  click progress/volume gauges to set them. Escape closes overlays."
@@ -1441,6 +1442,16 @@ fn supported_video(path: &Path) -> bool {
         })
 }
 
+fn player_key_action(code: KeyCode) -> Option<PlayerKeyAction> {
+    match code {
+        KeyCode::Left => Some(PlayerKeyAction::Seek(-10.0)),
+        KeyCode::Right => Some(PlayerKeyAction::Seek(30.0)),
+        KeyCode::Down => Some(PlayerKeyAction::Volume(-0.05)),
+        KeyCode::Up => Some(PlayerKeyAction::Volume(0.05)),
+        _ => None,
+    }
+}
+
 fn move_index(current: usize, length: usize, amount: isize) -> usize {
     if length == 0 {
         return 0;
@@ -1557,6 +1568,26 @@ mod tests {
     }
 
     #[test]
+    fn player_arrows_map_to_asymmetric_seeks_and_volume_steps() {
+        assert_eq!(
+            player_key_action(KeyCode::Left),
+            Some(PlayerKeyAction::Seek(-10.0))
+        );
+        assert_eq!(
+            player_key_action(KeyCode::Right),
+            Some(PlayerKeyAction::Seek(30.0))
+        );
+        assert_eq!(
+            player_key_action(KeyCode::Down),
+            Some(PlayerKeyAction::Volume(-0.05))
+        );
+        assert_eq!(
+            player_key_action(KeyCode::Up),
+            Some(PlayerKeyAction::Volume(0.05))
+        );
+    }
+
+    #[test]
     fn test_backend_renders_normal_minimum_resized_and_too_small_layouts() {
         let directory = tempdir().unwrap();
         fs::write(
@@ -1615,6 +1646,27 @@ mod tests {
         assert!(!app.help);
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert!(app.logs_open);
+    }
+
+    #[test]
+    fn playlist_accepts_macos_backspace_and_forward_delete() {
+        let directory = tempdir().unwrap();
+        let options = TuiOptions {
+            directory: directory.path().to_owned(),
+            host: Some("192.0.2.1".parse().unwrap()),
+            cast_port: 8009,
+            http_port: 0,
+            compatibility_mode: CompatibilityMode::Auto,
+            transcode_delivery: TranscodeDelivery::Incremental,
+        };
+        let mut app = App::new(options).unwrap();
+        app.focus = Focus::Playlist;
+        app.playlist.enqueue("one.mp4".into());
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.playlist.entries.is_empty());
+        app.playlist.enqueue("two.mp4".into());
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(app.playlist.entries.is_empty());
     }
 
     #[test]

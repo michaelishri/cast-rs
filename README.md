@@ -129,8 +129,8 @@ Keyboard controls:
 
 - Global: `q`/`Ctrl-C` quits, Space plays or pauses, `s` stops, `[`/`]` selects previous/next, `m` mutes, and `+`/`-` changes volume by 5%.
 - File explorer: arrows, Page Up/Down, Home/End select; Enter opens a directory or enqueues a file; Backspace opens the parent; `p` plays now; `f` toggles all regular files. Hidden entries remain hidden.
-- Playlist: arrows, Page Up/Down, Home/End select; Enter plays; Delete removes; Alt-Up/Down reorders.
-- Player: Left/Right seeks ±10 seconds and Down/Up seeks ±60 seconds.
+- Playlist: arrows, Page Up/Down, Home/End select; Enter plays; Delete or Backspace removes; Alt-Up/Down reorders.
+- Player: Left seeks backward 10 seconds, Right seeks forward 30 seconds, and Down/Up changes volume by 5%.
 - Receiver: Enter opens the picker and `r` rescans. Escape closes any overlay.
 
 The mouse can focus panes, select rows, double-click to activate, scroll the pane under the pointer, choose a receiver, and set playback position or volume by clicking their gauges. The playlist is session-only: duplicates are allowed, there is no repeat or shuffle, natural completion advances linearly, and stopping retains the current item. Media-specific failures skip to the next item; receiver/network failures pause the queue. Switching receivers reuses the prepared source, resumes near the current position, preserves paused/playing intent, and reads the new receiver's own volume.
