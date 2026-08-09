@@ -5,7 +5,7 @@ use std::{
     os::{fd::OwnedFd, unix::fs::PermissionsExt},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -295,7 +295,7 @@ pub(crate) fn list_sources(select_source: bool) -> Result<()> {
 }
 
 pub(crate) fn select(kind: PortalSourceKind, force_chooser: bool) -> Result<PortalSelection> {
-    let runtime = Arc::new(runtime()?);
+    let runtime = runtime()?;
     let store = TokenStore::discover()?;
     let restore_token = (!force_chooser && kind == PortalSourceKind::Normal)
         .then(|| store.load_or_forget_corrupt())
@@ -415,11 +415,26 @@ async fn open_selection(
     })
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("could not start the desktop portal runtime")
+fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
+    static PORTAL_RUNTIME: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+
+    if let Some(runtime) = PORTAL_RUNTIME.get() {
+        return Ok(Arc::clone(runtime));
+    }
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("could not start the desktop portal runtime")?,
+    );
+    if PORTAL_RUNTIME.set(Arc::clone(&runtime)).is_err() {
+        return Ok(Arc::clone(
+            PORTAL_RUNTIME
+                .get()
+                .expect("another thread initialized the desktop portal runtime"),
+        ));
+    }
+    Ok(runtime)
 }
 
 const fn availability(value: bool) -> &'static str {
@@ -990,6 +1005,13 @@ fn store_failure(failure: &Mutex<Option<String>>, message: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_operations_share_one_process_runtime() {
+        let first = runtime().unwrap();
+        let second = runtime().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn normalizes_positive_and_negative_video_strides() {
