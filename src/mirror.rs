@@ -62,7 +62,9 @@ use crate::virtual_display::VirtualDisplaySession;
 #[cfg(target_os = "linux")]
 use crate::{
     linux_desktop::composite_cursor,
-    linux_encoder::{LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame},
+    linux_encoder::{
+        EncodingPriority, LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame,
+    },
     linux_pipewire::CaptureEpoch,
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
@@ -206,6 +208,7 @@ fn preflight_linux_encoder(options: &MirrorOptions) -> Result<()> {
         even(options.height),
         options.fps,
         options.bitrate as u32,
+        EncodingPriority::from_speed_priority(options.prioritize_encoding_speed),
     )
     .context("Linux H.264 provider preflight failed")
 }
@@ -462,6 +465,8 @@ fn run_auto_tune_trial(
     let mut options = base.clone();
     options.duration = Some(duration);
     config.apply(&mut options, deadline_fps);
+    #[cfg(target_os = "linux")]
+    preflight_linux_encoder(&options)?;
     println!(
         "\nTrial {}/{}: {name} ({})",
         index + 1,
@@ -1168,6 +1173,7 @@ fn run_desktop(
         width,
         height,
         provider: options.provider,
+        priority: EncodingPriority::from_speed_priority(options.prioritize_encoding_speed),
         rate_control,
         encoder_bitrate: options.bitrate as u32,
         stats: Arc::clone(&capture_stats),
@@ -1816,8 +1822,19 @@ fn stage_distribution(
         .expect("the profile has at least one latency sample")
 }
 
+#[cfg(target_os = "macos")]
 const fn applied_label(applied: bool) -> &'static str {
     if applied { "applied" } else { "unavailable" }
+}
+
+#[cfg(target_os = "macos")]
+const fn encoder_stage_label() -> &'static str {
+    "VideoToolbox"
+}
+
+#[cfg(target_os = "linux")]
+const fn encoder_stage_label() -> &'static str {
+    "Linux H.264 encoder"
 }
 
 fn collect_profile_result(stats: &MirrorStats, sampled_for: Duration) -> Result<ProfileRunResult> {
@@ -2142,8 +2159,9 @@ fn print_profile_report(
         );
     }
     println!(
-        "  Stage p95: raw queue {:.1} ms | VideoToolbox {:.1} ms | H.264 prepare {:.1} ms | sender-lock {:.1} ms | UDP send {:.1} ms | ACK {:.1} ms",
+        "  Stage p95: raw queue {:.1} ms | {} {:.1} ms | H.264 prepare {:.1} ms | sender-lock {:.1} ms | UDP send {:.1} ms | ACK {:.1} ms",
         micros_to_millis(queue_wait.p95_micros),
+        encoder_stage_label(),
         micros_to_millis(encode.p95_micros),
         micros_to_millis(prepare.p95_micros),
         micros_to_millis(sender_lock.p95_micros),
@@ -2200,6 +2218,7 @@ fn print_profile_report(
             .adaptive_bitrate_apply_failures
             .load(Ordering::Relaxed),
     );
+    #[cfg(target_os = "macos")]
     println!(
         "  VideoToolbox controls: MaxFrameDelayCount=0 {}, speed-priority {}.",
         if stats.vt_max_frame_delay_applied.load(Ordering::Relaxed) {
@@ -2212,6 +2231,16 @@ fn print_profile_report(
         } else {
             "disabled by --quality-priority"
         },
+    );
+    #[cfg(target_os = "linux")]
+    println!(
+        "  Linux encoder controls: {:?} provider selection, {} priority.",
+        options.provider,
+        if options.prioritize_encoding_speed {
+            "speed"
+        } else {
+            "quality"
+        }
     );
     println!(
         "  Receiver-reported playout delay at the end of the profile: {} ms.",
@@ -4919,6 +4948,7 @@ struct MirrorPipeline {
     width: u32,
     height: u32,
     provider: H264Provider,
+    priority: EncodingPriority,
     rate_control: Arc<AdaptiveRateControl>,
     encoder_bitrate: u32,
     stats: Arc<MirrorStats>,
@@ -4942,6 +4972,7 @@ impl MirrorPipeline {
             self.fps,
             self.encoder_bitrate,
             format,
+            self.priority,
         )?;
         self.encoder_control = Some(encoder.control());
         self.encoder = Some(encoder);
@@ -5234,10 +5265,10 @@ mod tests {
         ProfileRunResult, RTP_H264_PAYLOAD_TYPE, RateWindowHealth, RawFrameDeadline,
         SENDER_QUEUE_FRAMES, SenderSubmitter, StoredFrame, StreamMaterial, TuningConfig,
         aggregate_profile_results, answer_display_frame_rate, auto_tune_score, avcc_to_annex_b,
-        combined_tuning_config, encrypt_frame, expand_frame_id_after, expand_frame_id_at_or_before,
-        frame_pacing, host_command_arguments, negotiated_group_frame_rate,
-        rate_window_is_congested, recommend_latency, round_target_delay, select_tuning_winner,
-        source_command_argument, validate_cast_hosts,
+        combined_tuning_config, encoder_stage_label, encrypt_frame, expand_frame_id_after,
+        expand_frame_id_at_or_before, frame_pacing, host_command_arguments,
+        negotiated_group_frame_rate, rate_window_is_congested, recommend_latency,
+        round_target_delay, select_tuning_winner, source_command_argument, validate_cast_hosts,
     };
     #[cfg(target_os = "macos")]
     use crate::audio;
@@ -5247,6 +5278,14 @@ mod tests {
         sync::{Arc, mpsc},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn profile_report_names_the_platform_encoder() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(encoder_stage_label(), "VideoToolbox");
+        #[cfg(target_os = "linux")]
+        assert_eq!(encoder_stage_label(), "Linux H.264 encoder");
+    }
 
     #[test]
     fn converts_avcc_to_annex_b_and_prepends_parameter_sets() {

@@ -44,7 +44,7 @@ use crate::{
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
     linux_desktop::composite_cursor,
-    linux_encoder::{LinuxVideoEncoder, RawVideoFrame},
+    linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     linux_pipewire::CaptureEpoch,
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
@@ -98,6 +98,7 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         even(options.height),
         options.fps,
         options.bitrate as u32,
+        EncodingPriority::Speed,
     )
     .context("Linux H.264 provider preflight failed")?;
     #[cfg(target_os = "linux")]
@@ -1174,6 +1175,7 @@ impl LatestFrameBackend for LinuxLivePipeline {
                 self.fps,
                 self.bitrate,
                 frame.format,
+                EncodingPriority::Speed,
             )?);
         }
         let packets = self

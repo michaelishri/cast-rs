@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
-    linux_encoder::{LinuxVideoEncoder, RawVideoFrame},
+    linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
     portal::{CapturedFrame, CursorImage, FrameSink, PipeWireCapture, PortalSourceKind},
 };
@@ -176,6 +176,7 @@ impl LatestFrameBackend for DiagnosticEncoder {
                 self.fps,
                 self.bitrate,
                 frame.format,
+                EncodingPriority::Speed,
             )?);
         }
         let packets = self

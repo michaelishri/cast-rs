@@ -433,6 +433,11 @@ fn linux_encoder_name() -> Result<&'static str> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn select_linux_encoder(provider: H264Provider) -> Result<&'static str> {
+    available_linux_encoders(provider).map(|encoders| encoders[0])
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn available_linux_encoders(provider: H264Provider) -> Result<Vec<&'static str>> {
     let available = |name: &'static str| {
         encoder::find_by_name(name).is_some()
             && match name {
@@ -441,32 +446,61 @@ pub(crate) fn select_linux_encoder(provider: H264Provider) -> Result<&'static st
                         && unsafe { libloading::Library::new("libnvidia-encode.so.1") }.is_ok()
                 }
                 "h264_vaapi" => {
-                    std::path::Path::new("/dev/dri/renderD128").exists()
+                    has_vaapi_render_node(std::path::Path::new("/dev/dri"))
                         && unsafe { libloading::Library::new("libva-drm.so.2") }.is_ok()
                 }
                 "libopenh264" => crate::setup::find_compatible().ok().flatten().is_some(),
                 _ => false,
             }
     };
-    resolve_linux_provider(provider, available)
+    resolve_linux_providers(provider, available)
+}
+
+#[cfg(target_os = "linux")]
+fn has_vaapi_render_node(directory: &std::path::Path) -> bool {
+    directory.read_dir().is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_dri_render_node_name)
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_dri_render_node_name(name: &str) -> bool {
+    name.strip_prefix("renderD").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(test)]
+fn resolve_linux_provider(
+    requested: H264Provider,
+    available: impl FnMut(&'static str) -> bool,
+) -> Result<&'static str> {
+    resolve_linux_providers(requested, available).map(|providers| providers[0])
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn resolve_linux_provider(
+fn resolve_linux_providers(
     requested: H264Provider,
     mut available: impl FnMut(&'static str) -> bool,
-) -> Result<&'static str> {
+) -> Result<Vec<&'static str>> {
     let candidates = match requested {
         H264Provider::Auto => ["h264_nvenc", "h264_vaapi", "libopenh264"].as_slice(),
         H264Provider::Nvenc => ["h264_nvenc"].as_slice(),
         H264Provider::Vaapi => ["h264_vaapi"].as_slice(),
         H264Provider::Openh264 => ["libopenh264"].as_slice(),
     };
-    candidates
+    let available = candidates
         .iter()
         .copied()
-        .find(|name| available(name))
-        .ok_or_else(|| match requested {
+        .filter(|name| available(name))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        Err(match requested {
             H264Provider::Auto | H264Provider::Openh264 => anyhow!(
                 "no usable Linux H.264 encoder is available; install NVENC/VA-API support or run `cast setup --yes` for OpenH264"
             ),
@@ -477,6 +511,9 @@ fn resolve_linux_provider(
                 "the requested VA-API provider is unavailable; check /dev/dri access, the VA-API driver, and linked FFmpeg support"
             ),
         })
+    } else {
+        Ok(available)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1488,6 +1525,10 @@ mod tests {
     #[test]
     fn linux_auto_provider_prefers_nvenc_then_vaapi_then_openh264() {
         assert_eq!(
+            resolve_linux_providers(H264Provider::Auto, |_| true).unwrap(),
+            ["h264_nvenc", "h264_vaapi", "libopenh264"]
+        );
+        assert_eq!(
             resolve_linux_provider(H264Provider::Auto, |_| true).unwrap(),
             "h264_nvenc"
         );
@@ -1499,6 +1540,19 @@ mod tests {
             resolve_linux_provider(H264Provider::Auto, |name| name == "libopenh264").unwrap(),
             "libopenh264"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vaapi_detection_accepts_every_numbered_render_node() {
+        assert!(is_dri_render_node_name("renderD128"));
+        assert!(is_dri_render_node_name("renderD129"));
+        assert!(!is_dri_render_node_name("renderD"));
+        assert!(!is_dri_render_node_name("card0"));
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::File::create(directory.path().join("renderD129")).unwrap();
+        assert!(has_vaapi_render_node(directory.path()));
     }
 
     #[test]
@@ -1516,7 +1570,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn linked_linux_ffmpeg_registers_delayed_and_hardware_encoders() {
         assert!(encoder::find_by_name("h264_nvenc").is_some());
-        assert!(encoder::find_by_name("libopenh264").is_some());
+        let module_available = crate::setup::find_compatible().unwrap().is_some();
+        assert_eq!(
+            encoder::find_by_name("libopenh264").is_some(),
+            module_available
+        );
     }
 
     fn media(container: &str, video: codec::Id, audio: Option<codec::Id>) -> MediaInfo {

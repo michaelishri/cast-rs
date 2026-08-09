@@ -11,8 +11,27 @@ use ffmpeg_next as ffmpeg;
 
 use crate::{
     desktop::VideoEncoderControl,
-    media::{H264Provider, VaapiFrames, select_linux_encoder},
+    media::{H264Provider, VaapiFrames, available_linux_encoders},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EncodingPriority {
+    Speed,
+    Quality,
+}
+
+impl EncodingPriority {
+    pub(crate) const fn from_speed_priority(speed: bool) -> Self {
+        if speed { Self::Speed } else { Self::Quality }
+    }
+
+    const fn scaler_flags(self) -> scaling::Flags {
+        match self {
+            Self::Speed => scaling::Flags::FAST_BILINEAR,
+            Self::Quality => scaling::Flags::BICUBIC,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawPixelFormat {
@@ -95,6 +114,7 @@ struct OpenEncoder {
 
 pub(crate) struct LinuxVideoEncoder {
     provider: H264Provider,
+    priority: EncodingPriority,
     width: u32,
     height: u32,
     fps: u32,
@@ -111,17 +131,19 @@ impl LinuxVideoEncoder {
         height: u32,
         fps: u32,
         bitrate: u32,
+        priority: EncodingPriority,
     ) -> Result<()> {
-        open_encoder(
+        open_encoder(OpenEncoderConfig {
             provider,
             width,
             height,
-            width,
-            height,
+            source_width: width,
+            source_height: height,
             fps,
             bitrate,
-            ffmpeg::format::Pixel::BGRA,
-        )?;
+            input_format: ffmpeg::format::Pixel::BGRA,
+            priority,
+        })?;
         Ok(())
     }
 
@@ -132,23 +154,26 @@ impl LinuxVideoEncoder {
         fps: u32,
         bitrate: u32,
         input_format: RawPixelFormat,
+        priority: EncodingPriority,
     ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 || bitrate == 0 {
             bail!("encoder dimensions, frame rate, and bitrate must be greater than zero");
         }
         let control = Arc::new(LinuxEncoderControl::new(bitrate));
-        let open = open_encoder(
+        let open = open_encoder(OpenEncoderConfig {
             provider,
             width,
             height,
-            width,
-            height,
+            source_width: width,
+            source_height: height,
             fps,
             bitrate,
-            input_format.ffmpeg(),
-        )?;
+            input_format: input_format.ffmpeg(),
+            priority,
+        })?;
         Ok(Self {
             provider,
+            priority,
             width,
             height,
             fps,
@@ -198,16 +223,17 @@ impl LinuxVideoEncoder {
             || source.height != self.open.source_height
         {
             let bitrate = self.control.bitrate.load(Ordering::SeqCst);
-            self.open = open_encoder(
-                self.provider,
-                self.width,
-                self.height,
-                source.width,
-                source.height,
-                self.fps,
+            self.open = open_encoder(OpenEncoderConfig {
+                provider: self.provider,
+                width: self.width,
+                height: self.height,
+                source_width: source.width,
+                source_height: source.height,
+                fps: self.fps,
                 bitrate,
                 input_format,
-            )?;
+                priority: self.priority,
+            })?;
             self.applied_generation = generation;
             self.control.force_keyframe.store(true, Ordering::SeqCst);
         }
@@ -253,8 +279,8 @@ impl LinuxVideoEncoder {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn open_encoder(
+#[derive(Clone, Copy)]
+struct OpenEncoderConfig {
     provider: H264Provider,
     width: u32,
     height: u32,
@@ -263,8 +289,51 @@ fn open_encoder(
     fps: u32,
     bitrate: u32,
     input_format: ffmpeg::format::Pixel,
-) -> Result<OpenEncoder> {
-    let name = select_linux_encoder(provider)?;
+    priority: EncodingPriority,
+}
+
+fn open_encoder(config: OpenEncoderConfig) -> Result<OpenEncoder> {
+    let candidates = available_linux_encoders(config.provider)?;
+    try_provider_candidates(config.provider, &candidates, |name| {
+        open_encoder_named(name, config)
+    })
+}
+
+fn try_provider_candidates<T>(
+    requested: H264Provider,
+    candidates: &[&'static str],
+    mut open: impl FnMut(&'static str) -> Result<T>,
+) -> Result<T> {
+    let mut failures = Vec::new();
+    for &name in candidates {
+        match open(name) {
+            Ok(value) => return Ok(value),
+            Err(error) if requested != H264Provider::Auto => {
+                return Err(error).with_context(|| {
+                    format!("requested Linux H.264 provider {name} could not be opened")
+                });
+            }
+            Err(error) => failures.push(format!("{name}: {error:#}")),
+        }
+    }
+    bail!(
+        "no detected Linux H.264 provider could be opened: {}",
+        failures.join("; ")
+    )
+}
+
+fn open_encoder_named(name: &'static str, config: OpenEncoderConfig) -> Result<OpenEncoder> {
+    let OpenEncoderConfig {
+        width,
+        height,
+        source_width,
+        source_height,
+        fps,
+        bitrate,
+        input_format,
+        priority,
+        ..
+    } = config;
     let codec = encoder::find_by_name(name)
         .ok_or_else(|| anyhow!("selected Linux encoder {name} disappeared"))?;
     let advertised_formats = codec
@@ -299,20 +368,7 @@ fn open_encoder(
     let vaapi = (name == "h264_vaapi")
         .then(|| VaapiFrames::attach(&mut encoder, width, height))
         .transpose()?;
-    let mut options = Dictionary::new();
-    // Cast receivers are offered Baseline profile in both RTSP and HLS. Keep the
-    // encoded SPS consistent with that offer; in particular, OpenH264 rejects
-    // FFmpeg's numeric constrained-baseline profile but accepts baseline.
-    options.set("profile", "baseline");
-    options.set("repeat_headers", "1");
-    if name == "h264_nvenc" {
-        options.set("preset", "p1");
-        options.set("tune", "ull");
-        options.set("zerolatency", "1");
-    }
-    if name == "libopenh264" {
-        options.set("allow_skip_frames", "1");
-    }
+    let options = encoder_options(name, priority);
     let encoder = encoder
         .open_as_with(codec, options)
         .with_context(|| format!("could not open Linux H.264 provider {name}"))?;
@@ -323,7 +379,7 @@ fn open_encoder(
         output_format,
         width,
         height,
-        scaling::Flags::FAST_BILINEAR,
+        priority.scaler_flags(),
     )
     .context("could not create the Linux desktop video converter")?;
     Ok(OpenEncoder {
@@ -335,6 +391,54 @@ fn open_encoder(
         output_format,
         vaapi,
     })
+}
+
+fn encoder_options(name: &str, priority: EncodingPriority) -> Dictionary<'static> {
+    let mut options = Dictionary::new();
+    // Cast receivers are offered Baseline profile in both RTSP and HLS. Keep the
+    // encoded SPS consistent with that offer; in particular, OpenH264 rejects
+    // FFmpeg's numeric constrained-baseline profile but accepts baseline.
+    options.set("profile", "baseline");
+    options.set("repeat_headers", "1");
+    match name {
+        "h264_nvenc" => {
+            options.set(
+                "preset",
+                if priority == EncodingPriority::Speed {
+                    "p1"
+                } else {
+                    "p5"
+                },
+            );
+            options.set("tune", "ull");
+            options.set("zerolatency", "1");
+        }
+        "h264_vaapi" => {
+            // FFmpeg/VA-API defines larger quality levels as faster. Drivers
+            // clamp this request to their advertised range.
+            options.set(
+                "quality",
+                if priority == EncodingPriority::Speed {
+                    "7"
+                } else {
+                    "1"
+                },
+            );
+        }
+        "libopenh264" => {
+            options.set("allow_skip_frames", "1");
+            options.set(
+                "rc_mode",
+                if priority == EncodingPriority::Speed {
+                    "bitrate"
+                } else {
+                    "quality"
+                },
+            );
+        }
+        _ => {}
+    }
+    options
 }
 
 fn drain_packets(encoder: &mut encoder::video::Encoder) -> Result<Vec<EncodedPacket>> {
@@ -381,6 +485,61 @@ mod tests {
     }
 
     #[test]
+    fn encoding_priority_selects_distinct_provider_options() {
+        let fast_nvenc = encoder_options("h264_nvenc", EncodingPriority::Speed);
+        let quality_nvenc = encoder_options("h264_nvenc", EncodingPriority::Quality);
+        assert_eq!(fast_nvenc.get("preset"), Some("p1"));
+        assert_eq!(quality_nvenc.get("preset"), Some("p5"));
+
+        let fast_vaapi = encoder_options("h264_vaapi", EncodingPriority::Speed);
+        let quality_vaapi = encoder_options("h264_vaapi", EncodingPriority::Quality);
+        assert_eq!(fast_vaapi.get("quality"), Some("7"));
+        assert_eq!(quality_vaapi.get("quality"), Some("1"));
+
+        let fast_openh264 = encoder_options("libopenh264", EncodingPriority::Speed);
+        let quality_openh264 = encoder_options("libopenh264", EncodingPriority::Quality);
+        assert_eq!(fast_openh264.get("rc_mode"), Some("bitrate"));
+        assert_eq!(quality_openh264.get("rc_mode"), Some("quality"));
+        assert_ne!(
+            EncodingPriority::Speed.scaler_flags(),
+            EncodingPriority::Quality.scaler_flags()
+        );
+    }
+
+    #[test]
+    fn automatic_provider_open_falls_through_in_priority_order() {
+        let mut attempted = Vec::new();
+        let selected = try_provider_candidates(
+            H264Provider::Auto,
+            &["h264_nvenc", "h264_vaapi", "libopenh264"],
+            |name| {
+                attempted.push(name);
+                if name == "libopenh264" {
+                    Ok(name)
+                } else {
+                    bail!("simulated provider open failure")
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, "libopenh264");
+        assert_eq!(attempted, ["h264_nvenc", "h264_vaapi", "libopenh264"]);
+    }
+
+    #[test]
+    fn explicit_provider_open_preserves_the_root_error_without_fallback() {
+        let mut attempted = Vec::new();
+        let error = try_provider_candidates::<()>(H264Provider::Nvenc, &["h264_nvenc"], |name| {
+            attempted.push(name);
+            bail!("driver rejected the encoder")
+        })
+        .unwrap_err();
+        assert_eq!(attempted, ["h264_nvenc"]);
+        assert!(error.to_string().contains("requested Linux H.264 provider"));
+        assert!(format!("{error:#}").contains("driver rejected the encoder"));
+    }
+
+    #[test]
     fn openh264_streaming_control_smoke_when_module_is_available() {
         if crate::setup::find_compatible().unwrap().is_none() {
             return;
@@ -393,6 +552,7 @@ mod tests {
             30,
             1_000_000,
             RawPixelFormat::Bgra,
+            EncodingPriority::Speed,
         )
         .unwrap();
         let control = encoder.control();

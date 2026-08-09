@@ -283,7 +283,7 @@ enum Command {
         max_frame_age_ms: Option<u64>,
         #[arg(long)]
         fixed_bitrate: bool,
-        /// Retained for cross-platform command compatibility; Linux providers choose their own latency preset.
+        /// Prefer encoding quality over the lowest-latency scaler and provider preset.
         #[arg(long)]
         quality_priority: bool,
     },
@@ -374,6 +374,7 @@ enum Command {
         max_frame_age_ms: Option<u64>,
         #[arg(long)]
         fixed_bitrate: bool,
+        /// Prefer encoding quality over the lowest-latency scaler and provider preset.
         #[arg(long)]
         quality_priority: bool,
         #[arg(long)]
