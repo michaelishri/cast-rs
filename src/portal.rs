@@ -207,7 +207,7 @@ impl TokenStore {
 
 pub(crate) struct PortalSelection {
     runtime: Arc<tokio::runtime::Runtime>,
-    session: Arc<Session<Screencast>>,
+    session: Option<Arc<Session<Screencast>>>,
     stream: PortalStream,
     cursor_mode: CursorMode,
     remote: Option<OwnedFd>,
@@ -248,7 +248,12 @@ impl PortalSelection {
 impl Drop for PortalSelection {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
-        if let Err(error) = self.runtime.block_on(self.session.close()) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let result = self.runtime.block_on(session.close());
+        drop_inside_runtime(&self.runtime, session);
+        if let Err(error) = result {
             log::warn!("could not close the desktop portal session: {error}");
         }
     }
@@ -407,7 +412,7 @@ async fn open_selection(
     });
     Ok(PortalSelection {
         runtime: Arc::clone(runtime),
-        session,
+        session: Some(session),
         stream,
         cursor_mode,
         remote: Some(remote),
@@ -435,6 +440,10 @@ fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
         ));
     }
     Ok(runtime)
+}
+
+fn drop_inside_runtime<T>(runtime: &tokio::runtime::Runtime, value: T) {
+    runtime.block_on(async move { drop(value) });
 }
 
 const fn availability(value: bool) -> &'static str {
@@ -1036,11 +1045,32 @@ fn store_failure(failure: &Mutex<Option<String>>, message: impl Into<String>) {
 mod tests {
     use super::*;
 
+    struct RuntimeDropProbe(Arc<AtomicBool>);
+
+    impl Drop for RuntimeDropProbe {
+        fn drop(&mut self) {
+            self.0.store(
+                tokio::runtime::Handle::try_current().is_ok(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
     #[test]
     fn portal_operations_share_one_process_runtime() {
         let first = runtime().unwrap();
         let second = runtime().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn runtime_bound_values_are_dropped_inside_the_portal_runtime() {
+        let dropped_inside_runtime = Arc::new(AtomicBool::new(false));
+        drop_inside_runtime(
+            &runtime().unwrap(),
+            RuntimeDropProbe(Arc::clone(&dropped_inside_runtime)),
+        );
+        assert!(dropped_inside_runtime.load(Ordering::SeqCst));
     }
 
     #[test]
