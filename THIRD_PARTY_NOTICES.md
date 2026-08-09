@@ -12,3 +12,19 @@ license texts, and build instructions are available from:
 
 Cast itself remains licensed under the terms declared in `Cargo.toml`. This notice does not change
 the licenses applicable to the separately distributed FFmpeg libraries.
+
+## OpenH264 integration
+
+Linux builds include OpenH264 2.3.0 API headers from commit
+`2e637867315ffeda3cd8970825ec86acc3fc4a30` and Cast's own delayed-loading shim. The OpenH264
+project source and BSD license are available from <https://github.com/cisco/openh264/tree/v2.3.0>.
+
+Cast release archives do not contain Cisco's OpenH264 implementation. On request, `cast setup`
+downloads the architecture-specific OpenH264 2.3.0 module directly from
+<https://ciscobinary.openh264.org/> after user confirmation and verifies its pinned SHA-256
+checksum. Cisco distributes those separately downloaded binaries under the terms at
+<https://www.openh264.org/BINARY_LICENSE.txt>. Users may instead provide a compatible system
+OpenH264 2.3.x module.
+
+Linux builds also use the MIT-licensed FFmpeg nv-codec-headers 12.1.14.0 package from commit
+`1889e62e2d35ff7aa9baca2bceb14f053785e6f1`; no NVIDIA driver or codec implementation is included.

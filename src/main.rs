@@ -14,6 +14,8 @@ mod mirror;
 mod network;
 mod playback;
 mod player_controls;
+#[cfg(target_os = "linux")]
+mod setup;
 #[cfg(target_os = "macos")]
 mod synthetic;
 mod tui;
@@ -54,6 +56,16 @@ enum Command {
     Devices {
         #[arg(long, default_value_t = 3)]
         timeout: u64,
+    },
+    #[cfg(target_os = "linux")]
+    /// Install or check the optional Cisco OpenH264 runtime module.
+    Setup {
+        /// Confirm the verified download without prompting.
+        #[arg(long)]
+        yes: bool,
+        /// Check local availability without downloading or changing files.
+        #[arg(long, conflicts_with = "yes")]
+        check: bool,
     },
     #[cfg(target_os = "macos")]
     /// List displays visible to macOS ScreenCaptureKit.
@@ -101,6 +113,10 @@ enum Command {
         /// Convert incompatible containers/codecs using linked media libraries.
         #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
         transcode: TranscodeMode,
+        #[cfg(target_os = "linux")]
+        /// Linux H.264 encoder used when video conversion is required.
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
         /// Deliver transcoded media as it is prepared or after a complete MP4 is ready.
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
@@ -122,6 +138,10 @@ enum Command {
         /// Convert incompatible containers/codecs using linked media libraries.
         #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
         transcode: TranscodeMode,
+        #[cfg(target_os = "linux")]
+        /// Linux H.264 encoder used when video conversion is required.
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
         /// Deliver transcoded media incrementally or after a complete MP4 is ready.
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
@@ -286,6 +306,27 @@ enum TranscodeMode {
     Always,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, ValueEnum)]
+enum H264Encoder {
+    Auto,
+    Nvenc,
+    Vaapi,
+    Openh264,
+}
+
+#[cfg(target_os = "linux")]
+impl From<H264Encoder> for media::H264Provider {
+    fn from(value: H264Encoder) -> Self {
+        match value {
+            H264Encoder::Auto => Self::Auto,
+            H264Encoder::Nvenc => Self::Nvenc,
+            H264Encoder::Vaapi => Self::Vaapi,
+            H264Encoder::Openh264 => Self::Openh264,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum TranscodeDeliveryMode {
     Complete,
@@ -313,6 +354,8 @@ fn main() -> Result<()> {
                 print_devices(&devices);
             }
         }
+        #[cfg(target_os = "linux")]
+        Command::Setup { yes, check } => setup::run(yes, check)?,
         #[cfg(target_os = "macos")]
         Command::Displays => capture::list_displays()?,
         Command::Url {
@@ -353,38 +396,19 @@ fn main() -> Result<()> {
             start_at,
             content_type,
             transcode,
+            #[cfg(target_os = "linux")]
+            encoder,
             transcode_delivery,
-        } => video::cast_video(video::VideoOptions {
-            cast_host: host,
-            cast_port,
-            http_port,
-            file,
-            start_at,
-            content_type,
-            compatibility_mode: match transcode {
-                TranscodeMode::Auto => media::CompatibilityMode::Auto,
-                TranscodeMode::Never => media::CompatibilityMode::Never,
-                TranscodeMode::Always => media::CompatibilityMode::Always,
-            },
-            transcode_delivery: match transcode_delivery {
-                TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
-                TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
-            },
-            interactive: interactive_video,
-        })?,
-        Command::Tui {
-            directory,
-            host,
-            cast_port,
-            http_port,
-            transcode,
-            transcode_delivery,
-        } => tui::run(
-            tui::TuiOptions {
-                directory,
-                host,
+        } => {
+            #[cfg(target_os = "linux")]
+            media::configure_h264_provider(encoder.into());
+            video::cast_video(video::VideoOptions {
+                cast_host: host,
                 cast_port,
                 http_port,
+                file,
+                start_at,
+                content_type,
                 compatibility_mode: match transcode {
                     TranscodeMode::Auto => media::CompatibilityMode::Auto,
                     TranscodeMode::Never => media::CompatibilityMode::Never,
@@ -394,11 +418,42 @@ fn main() -> Result<()> {
                     TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
                     TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
                 },
-            },
-            log_capture
-                .expect("TUI log capture was initialized")
-                .receiver,
-        )?,
+                interactive: interactive_video,
+            })?
+        }
+        Command::Tui {
+            directory,
+            host,
+            cast_port,
+            http_port,
+            transcode,
+            #[cfg(target_os = "linux")]
+            encoder,
+            transcode_delivery,
+        } => {
+            #[cfg(target_os = "linux")]
+            media::configure_h264_provider(encoder.into());
+            tui::run(
+                tui::TuiOptions {
+                    directory,
+                    host,
+                    cast_port,
+                    http_port,
+                    compatibility_mode: match transcode {
+                        TranscodeMode::Auto => media::CompatibilityMode::Auto,
+                        TranscodeMode::Never => media::CompatibilityMode::Never,
+                        TranscodeMode::Always => media::CompatibilityMode::Always,
+                    },
+                    transcode_delivery: match transcode_delivery {
+                        TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
+                        TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
+                    },
+                },
+                log_capture
+                    .expect("TUI log capture was initialized")
+                    .receiver,
+            )?
+        }
         #[cfg(target_os = "macos")]
         Command::Capture {
             display,
@@ -635,6 +690,8 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::H264Encoder;
     use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
     #[cfg(not(target_os = "macos"))]
     use clap::CommandFactory;
@@ -666,6 +723,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_setup_and_encoder_selection_parse_without_exposing_desktop_early() {
+        let cli = Cli::try_parse_from(["cast", "setup", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Setup {
+                check: true,
+                yes: false
+            }
+        ));
+        let error = Cli::try_parse_from(["cast", "setup", "--check", "--yes"])
+            .err()
+            .expect("conflicting setup switches were accepted");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+
+        let cli = Cli::try_parse_from([
+            "cast",
+            "video",
+            "sample.mp4",
+            "--host",
+            "192.0.2.1",
+            "--encoder",
+            "vaapi",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Video {
+                encoder: H264Encoder::Vaapi,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn desktop_accepts_extend_as_a_switch() {
         let cli =
@@ -685,6 +777,7 @@ mod tests {
                 http_port: 0,
                 transcode: TranscodeMode::Auto,
                 transcode_delivery: TranscodeDeliveryMode::Incremental,
+                ..
             } if directory == std::path::Path::new(".")
         ));
 
@@ -713,6 +806,7 @@ mod tests {
                 http_port: 8080,
                 transcode: TranscodeMode::Always,
                 transcode_delivery: TranscodeDeliveryMode::Complete,
+                ..
             } if directory == std::path::Path::new("/tmp")
         ));
     }

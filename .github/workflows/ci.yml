@@ -22,7 +22,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential nasm pkg-config
+          sudo apt-get install --yes build-essential libva-dev nasm pkg-config
 
       - name: Cache linked media libraries
         uses: actions/cache@v5

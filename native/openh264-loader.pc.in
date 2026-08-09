@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: OpenH264 loader for Cast
+Description: Delayed loader for a user- or system-installed Cisco OpenH264 module
+Version: 2.3.0
+Libs: -L${libdir} -lcast_openh264_loader
+Libs.private: -ldl -lstdc++
+Cflags: -I${includedir}
