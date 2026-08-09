@@ -1,5 +1,4 @@
 #include <CoreAudio/AudioHardware.h>
-#include <CoreAudio/AudioHardwareService.h>
 #include <stdint.h>
 
 typedef struct {
@@ -20,7 +19,7 @@ static AudioObjectPropertyAddress default_output_address(void) {
 
 static AudioObjectPropertyAddress volume_address(void) {
     return (AudioObjectPropertyAddress) {
-        kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+        kAudioDevicePropertyVolumeScalar,
         kAudioDevicePropertyScopeOutput,
         kAudioObjectPropertyElementMain,
     };
