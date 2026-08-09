@@ -24,7 +24,7 @@ Repeat applicable rows on current GNOME Wayland and KDE Plasma Wayland. Record d
 | --- | --- |
 | Encoder | `auto`, explicit NVENC, explicit VA-API, explicit OpenH264; unavailable explicit providers fail before receiver startup |
 | Source | remembered normal source, `--select-source`, portal denial, expired restore token, window and monitor, `--extend` capability success/failure |
-| Mirror | audio on/off, one receiver, receiver group, extended receiver group, adaptive and `--fixed-bitrate`, `--quality-priority` compatibility flag |
+| Mirror | audio on/off, one receiver, receiver group, extended receiver group, adaptive and `--fixed-bitrate`, speed-default and `--quality-priority` encoder/scaler paths |
 | HLS | audio on/off, one/multiple receivers, normal/extended sources |
 | Diagnostics | `displays`, `capture`, normal `profile`, synthetic profile and synthetic `--auto-tune` |
 | Audio | default sink monitor only, no microphone, receiver fan-out, local volume/mute forwarding, output-device switch |
