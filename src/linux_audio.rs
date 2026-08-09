@@ -20,8 +20,9 @@ use pw::{properties::properties, spa};
 
 use crate::desktop::{
     EncodedAudioFrame, LocalOutputBackend, LocalOutputControl,
-    LocalOutputRedirect as SharedLocalOutputRedirect, MediaClock, MediaTimestamp, OutputSnapshot,
+    LocalOutputRedirect as SharedLocalOutputRedirect, OutputSnapshot,
 };
+use crate::linux_pipewire::CaptureEpoch;
 
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNELS: u32 = 2;
@@ -91,7 +92,6 @@ pub(crate) struct AudioWorker {
 impl AudioWorker {
     pub(crate) fn start_prepared<F>(
         encoder: PreparedAudioEncoder,
-        clock: Arc<MediaClock>,
         failure: Arc<Mutex<Option<String>>>,
         mut output: F,
     ) -> Result<(AudioSubmitter, Self)>
@@ -106,7 +106,7 @@ impl AudioWorker {
         let thread = thread::Builder::new()
             .name("desktop-aac-encoder".into())
             .spawn(move || {
-                let mut pipeline = AudioPipeline::new(clock, encoder);
+                let mut pipeline = AudioPipeline::new(encoder);
                 while !worker_stop.load(Ordering::SeqCst) {
                     let command = match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(command) => command,
@@ -162,7 +162,6 @@ impl Drop for AudioWorker {
 }
 
 struct AudioPipeline {
-    clock: Arc<MediaClock>,
     encoder: AacEncoder,
     left: VecDeque<f32>,
     right: VecDeque<f32>,
@@ -171,9 +170,8 @@ struct AudioPipeline {
 }
 
 impl AudioPipeline {
-    fn new(clock: Arc<MediaClock>, encoder: AacEncoder) -> Self {
+    fn new(encoder: AacEncoder) -> Self {
         Self {
-            clock,
             encoder,
             left: VecDeque::new(),
             right: VecDeque::new(),
@@ -189,17 +187,7 @@ impl AudioPipeline {
         if !pcm.len().is_multiple_of(CHANNELS as usize) {
             bail!("PipeWire returned a truncated stereo audio buffer");
         }
-        let timestamp = self
-            .clock
-            .ticks(
-                MediaTimestamp {
-                    value: i64::try_from(captured_at).unwrap_or(i64::MAX),
-                    timescale: SAMPLE_RATE as i32,
-                    valid: true,
-                },
-                u64::from(SAMPLE_RATE),
-            )
-            .unwrap_or(self.next_sample);
+        let timestamp = captured_at;
         if timestamp > self.next_sample {
             self.push_silence(timestamp - self.next_sample, output)?;
         }
@@ -371,7 +359,8 @@ fn adts_header(payload_length: usize) -> Result<Vec<u8>> {
 struct PipeWireAudioData {
     format: spa::param::audio::AudioInfoRaw,
     submitter: AudioSubmitter,
-    sample_cursor: u64,
+    sample_cursor: Option<u64>,
+    capture_epoch: CaptureEpoch,
     failure: Arc<Mutex<Option<String>>>,
     startup: Option<mpsc::Sender<Result<(), String>>>,
 }
@@ -385,6 +374,7 @@ impl PipeWireAudioCapture {
     pub(crate) fn start(
         submitter: AudioSubmitter,
         failure: Arc<Mutex<Option<String>>>,
+        capture_epoch: CaptureEpoch,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -398,6 +388,7 @@ impl PipeWireAudioCapture {
             .spawn(move || {
                 if let Err(error) = run_pipewire_audio(
                     submitter,
+                    capture_epoch,
                     &thread_stop,
                     Arc::clone(&thread_failure),
                     startup_tx,
@@ -457,6 +448,7 @@ impl Drop for PipeWireAudioCapture {
 
 fn run_pipewire_audio(
     submitter: AudioSubmitter,
+    capture_epoch: CaptureEpoch,
     stop: &Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     startup: mpsc::Sender<Result<(), String>>,
@@ -485,7 +477,8 @@ fn run_pipewire_audio(
         .add_local_listener_with_user_data(PipeWireAudioData {
             format: Default::default(),
             submitter,
-            sample_cursor: 0,
+            sample_cursor: None,
+            capture_epoch,
             failure: Arc::clone(&failure),
             startup: Some(startup),
         })
@@ -640,9 +633,16 @@ fn copy_pipewire_audio(
         .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
         .collect::<Vec<_>>();
     let frames = u64::try_from(pcm.len() / CHANNELS as usize).unwrap_or(u64::MAX);
-    data.submitter.submit_pcm(data.sample_cursor, pcm);
-    data.sample_cursor = data.sample_cursor.saturating_add(frames);
+    let timestamp = data.sample_cursor.unwrap_or_else(|| {
+        first_audio_timestamp(data.capture_epoch.ticks(u64::from(SAMPLE_RATE)), frames)
+    });
+    data.submitter.submit_pcm(timestamp, pcm);
+    data.sample_cursor = Some(timestamp.saturating_add(frames));
     Ok(())
+}
+
+fn first_audio_timestamp(buffer_end: u64, frames: u64) -> u64 {
+    buffer_end.saturating_sub(frames)
 }
 
 struct WirePlumberOutputBackend;
@@ -776,7 +776,7 @@ mod tests {
                 return;
             }
         };
-        let mut pipeline = AudioPipeline::new(Arc::new(MediaClock::default()), encoder);
+        let mut pipeline = AudioPipeline::new(encoder);
         let mut frames = Vec::new();
         pipeline
             .push_pcm(0, &vec![0.0; ACCESS_UNIT_SAMPLES * 2], &mut |frame| {
@@ -784,6 +784,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert_eq!(pipeline.next_sample, ACCESS_UNIT_SAMPLES as u64);
         pipeline
             .push_pcm(
                 (ACCESS_UNIT_SAMPLES * 2) as u64,
@@ -794,8 +795,29 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(pipeline.next_sample, (ACCESS_UNIT_SAMPLES * 3) as u64);
+        pipeline
+            .push_pcm(
+                (ACCESS_UNIT_SAMPLES * 2 + ACCESS_UNIT_SAMPLES / 2) as u64,
+                &vec![0.0; ACCESS_UNIT_SAMPLES * 2],
+                &mut |frame| {
+                    frames.push(frame);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pipeline.next_sample,
+            (ACCESS_UNIT_SAMPLES * 3 + ACCESS_UNIT_SAMPLES / 2) as u64
+        );
         assert!(!frames.is_empty());
         assert!(pipeline.push_pcm(0, &[0.0], &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn first_audio_buffer_preserves_its_offset_from_the_shared_epoch() {
+        assert_eq!(first_audio_timestamp(24_000, 480), 23_520);
+        assert_eq!(first_audio_timestamp(240, 480), 0);
     }
 
     #[test]

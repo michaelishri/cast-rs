@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,7 +24,10 @@ use pw::{properties::properties, spa};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::{linux_encoder::RawPixelFormat, linux_pipewire::DequeuedBuffer};
+use crate::{
+    linux_encoder::RawPixelFormat,
+    linux_pipewire::{CaptureEpoch, DequeuedBuffer},
+};
 
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_FILE: &str = "screencast-source.json";
@@ -452,9 +455,17 @@ pub(crate) trait FrameSink: Send + Sync + 'static {
 struct PipeWireUserData {
     format: spa::param::video::VideoInfoRaw,
     sink: Arc<dyn FrameSink>,
-    capture_started: Instant,
+    capture_epoch: CaptureEpoch,
     cursor_metadata: bool,
     last_cursor: Option<CursorImage>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+struct PipeWireVideoConfig {
+    node_id: u32,
+    sink: Arc<dyn FrameSink>,
+    cursor_metadata: bool,
+    capture_epoch: CaptureEpoch,
     failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -466,7 +477,15 @@ pub(crate) struct PipeWireCapture {
 }
 
 impl PipeWireCapture {
-    pub(crate) fn start(mut selection: PortalSelection, sink: Arc<dyn FrameSink>) -> Result<Self> {
+    pub(crate) fn start(selection: PortalSelection, sink: Arc<dyn FrameSink>) -> Result<Self> {
+        Self::start_at(selection, sink, CaptureEpoch::new())
+    }
+
+    pub(crate) fn start_at(
+        mut selection: PortalSelection,
+        sink: Arc<dyn FrameSink>,
+        capture_epoch: CaptureEpoch,
+    ) -> Result<Self> {
         let remote = selection.take_remote()?;
         let node_id = selection.node_id();
         let cursor_metadata = selection.cursor_mode() == CursorMode::Metadata;
@@ -480,12 +499,15 @@ impl PipeWireCapture {
             .spawn(move || {
                 if let Err(error) = run_pipewire(
                     remote,
-                    node_id,
-                    sink,
-                    cursor_metadata,
+                    PipeWireVideoConfig {
+                        node_id,
+                        sink,
+                        cursor_metadata,
+                        capture_epoch,
+                        failure: Arc::clone(&thread_failure),
+                    },
                     &thread_stop,
                     &portal_closed,
-                    Arc::clone(&thread_failure),
                 ) && let Ok(mut failure) = thread_failure.lock()
                     && failure.is_none()
                 {
@@ -534,13 +556,17 @@ impl Drop for PipeWireCapture {
 
 fn run_pipewire(
     remote: OwnedFd,
-    node_id: u32,
-    sink: Arc<dyn FrameSink>,
-    cursor_metadata: bool,
+    config: PipeWireVideoConfig,
     stop: &Arc<AtomicBool>,
     portal_closed: &Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
+    let PipeWireVideoConfig {
+        node_id,
+        sink,
+        cursor_metadata,
+        capture_epoch,
+        failure,
+    } = config;
     pw::init();
     let mainloop =
         pw::main_loop::MainLoopRc::new(None).context("could not create PipeWire loop")?;
@@ -564,7 +590,7 @@ fn run_pipewire(
         .add_local_listener_with_user_data(PipeWireUserData {
             format: Default::default(),
             sink,
-            capture_started: Instant::now(),
+            capture_epoch,
             cursor_metadata,
             last_cursor: None,
             failure: Arc::clone(&failure),
@@ -710,10 +736,7 @@ fn copy_pipewire_frame(
             &mut user_data.last_cursor,
         )?;
     }
-    let timestamp = u64::try_from(user_data.capture_started.elapsed().as_nanos())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(90_000)
-        / 1_000_000_000;
+    let timestamp = user_data.capture_epoch.ticks(90_000);
     let data = buffer
         .datas_mut()
         .first_mut()

@@ -41,6 +41,8 @@ use videotoolbox::prelude::*;
 
 #[cfg(target_os = "macos")]
 use crate::audio::{self, AudioFrameHandler, AudioWorker, LocalOutputRedirect};
+#[cfg(target_os = "macos")]
+use crate::desktop::MediaClock;
 #[cfg(target_os = "linux")]
 use crate::desktop::VideoEncoderControl;
 use crate::desktop::{
@@ -50,7 +52,7 @@ use crate::desktop::{
     ReceiverControlSink, ReceiverVolumeCommand, SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME,
     SyntheticPhase, VideoFrameTimings as FrameTimings, fan_out_video, phase_for_frame,
 };
-use crate::desktop::{MediaClock, fan_out_audio, fan_out_receiver_control};
+use crate::desktop::{fan_out_audio, fan_out_receiver_control};
 #[cfg(target_os = "linux")]
 use crate::linux_audio::{self as audio, AudioWorker, LocalOutputRedirect, PipeWireAudioCapture};
 #[cfg(target_os = "macos")]
@@ -61,6 +63,7 @@ use crate::virtual_display::VirtualDisplaySession;
 use crate::{
     linux_desktop::composite_cursor,
     linux_encoder::{LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame},
+    linux_pipewire::CaptureEpoch,
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
 };
@@ -151,6 +154,8 @@ pub fn cast_desktop(options: MirrorOptions) -> Result<()> {
             None,
             #[cfg(target_os = "linux")]
             None,
+            #[cfg(target_os = "linux")]
+            None,
         )
         .map(|_| ())
     }
@@ -180,6 +185,8 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
             RunMode::Profile,
             ProfilePresentation::Detailed,
             interrupted.as_ref(),
+            None,
+            #[cfg(target_os = "linux")]
             None,
             #[cfg(target_os = "linux")]
             None,
@@ -469,6 +476,8 @@ fn run_auto_tune_trial(
         None,
         #[cfg(target_os = "linux")]
         None,
+        #[cfg(target_os = "linux")]
+        None,
     )?
     .expect("profile mode returns profile measurements")
     .aggregate;
@@ -655,16 +664,13 @@ struct SharedLinuxAudioResources {
 
 #[cfg(target_os = "linux")]
 impl SharedLinuxMirrorAudio {
-    fn start() -> Result<Self> {
+    fn start(capture_epoch: CaptureEpoch) -> Result<Self> {
         let encoder = audio::prepare()?;
         let outputs = Arc::new(Mutex::new(Vec::<(u64, Vec<SenderSubmitter>)>::new()));
         let worker_outputs = Arc::clone(&outputs);
         let failure = Arc::new(Mutex::new(None));
-        let (submitter, worker) = AudioWorker::start_prepared(
-            encoder,
-            Arc::new(MediaClock::default()),
-            Arc::clone(&failure),
-            move |frame| {
+        let (submitter, worker) =
+            AudioWorker::start_prepared(encoder, Arc::clone(&failure), move |frame| {
                 let outputs = worker_outputs
                     .lock()
                     .map_err(|_| anyhow!("shared audio output lock was poisoned"))?;
@@ -672,15 +678,15 @@ impl SharedLinuxMirrorAudio {
                     fan_out_audio(subscriber, frame.clone())?;
                 }
                 Ok(())
-            },
-        )?;
-        let capture = match PipeWireAudioCapture::start(submitter, Arc::clone(&failure)) {
-            Ok(capture) => capture,
-            Err(error) => {
-                worker.stop()?;
-                return Err(error);
-            }
-        };
+            })?;
+        let capture =
+            match PipeWireAudioCapture::start(submitter, Arc::clone(&failure), capture_epoch) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    worker.stop()?;
+                    return Err(error);
+                }
+            };
         let controls = Arc::new(Mutex::new(
             Vec::<(u64, Vec<Arc<CastStreamingControlState>>)>::new(),
         ));
@@ -807,8 +813,10 @@ fn run_extended_desktop(
     }
 
     #[cfg(target_os = "linux")]
+    let capture_epoch = CaptureEpoch::new();
+    #[cfg(target_os = "linux")]
     let shared_audio = if options.audio {
-        match SharedLinuxMirrorAudio::start() {
+        match SharedLinuxMirrorAudio::start(capture_epoch.clone()) {
             Ok(audio) => Some(Arc::new(audio)),
             Err(error) => {
                 eprintln!("System audio is unavailable; continuing with video only: {error:#}");
@@ -839,6 +847,8 @@ fn run_extended_desktop(
             let stop = Arc::clone(interrupted);
             #[cfg(target_os = "linux")]
             let shared_audio = shared_audio.as_ref().map(Arc::clone);
+            #[cfg(target_os = "linux")]
+            let worker_capture_epoch = capture_epoch.clone();
             workers.push((
                 host,
                 scope.spawn(move || {
@@ -851,6 +861,8 @@ fn run_extended_desktop(
                             Some(session),
                             #[cfg(target_os = "linux")]
                             shared_audio,
+                            #[cfg(target_os = "linux")]
+                            Some(worker_capture_epoch),
                         )
                     }))
                     .map_err(|_| anyhow!("desktop cast worker for {host} panicked"))
@@ -917,6 +929,7 @@ fn run_desktop(
     interrupted: &AtomicBool,
     precreated_display: Option<ExtendedDisplaySession>,
     #[cfg(target_os = "linux")] shared_audio: Option<Arc<SharedLinuxMirrorAudio>>,
+    #[cfg(target_os = "linux")] shared_capture_epoch: Option<CaptureEpoch>,
 ) -> Result<Option<ProfileGroupResult>> {
     validate_cast_hosts(&options.cast_hosts)?;
     if options.bitrate <= 0 {
@@ -1128,7 +1141,10 @@ fn run_desktop(
     #[cfg(target_os = "macos")]
     configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
 
+    #[cfg(target_os = "macos")]
     let clock = Arc::new(MediaClock::default());
+    #[cfg(target_os = "linux")]
+    let capture_epoch = shared_capture_epoch.unwrap_or_else(CaptureEpoch::new);
     #[cfg(target_os = "macos")]
     let pipeline = MirrorPipeline {
         encoder,
@@ -1181,6 +1197,7 @@ fn run_desktop(
     } {
         let (submitter, worker) = AudioWorker::start_prepared(
             prepared_audio.expect("audio was prepared before it was offered"),
+            #[cfg(target_os = "macos")]
             Arc::clone(&clock),
             Arc::clone(&failure),
             move |audio_frame| fan_out_audio(&audio_outputs, audio_frame),
@@ -1193,7 +1210,11 @@ fn run_desktop(
     #[cfg(target_os = "linux")]
     let (audio_submitter, audio_worker, pipewire_audio) =
         if let (Some(submitter), Some(worker)) = (audio_submitter, audio_worker) {
-            match PipeWireAudioCapture::start(submitter.clone(), Arc::clone(&failure)) {
+            match PipeWireAudioCapture::start(
+                submitter.clone(),
+                Arc::clone(&failure),
+                capture_epoch.clone(),
+            ) {
                 Ok(capture) => (Some(submitter), Some(worker), Some(capture)),
                 Err(error) => {
                     eprintln!("System audio is unavailable; continuing with video only: {error:#}");
@@ -1363,7 +1384,7 @@ fn run_desktop(
                 selection.size()
             );
             let sink: Arc<dyn FrameSink> = Arc::new(MirrorPortalSink { submitter });
-            let capture = PipeWireCapture::start(selection, sink)?;
+            let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
             match mode {
                 RunMode::Cast => println!(
                     "Mirroring {source_description} into {width}x{height}, {} fps, target delay {} ms...",

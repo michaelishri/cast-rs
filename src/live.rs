@@ -29,6 +29,7 @@ use videotoolbox::prelude::*;
 
 #[cfg(target_os = "macos")]
 use crate::audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker};
+#[cfg(target_os = "macos")]
 use crate::desktop::MediaClock;
 #[cfg(target_os = "linux")]
 use crate::linux_audio::{self as audio, AudioSubmitter, AudioWorker, PipeWireAudioCapture};
@@ -44,6 +45,7 @@ use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
     linux_desktop::composite_cursor,
     linux_encoder::{LinuxVideoEncoder, RawVideoFrame},
+    linux_pipewire::CaptureEpoch,
     media::H264Provider,
     portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
 };
@@ -211,6 +213,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    let capture_epoch = CaptureEpoch::new();
+    #[cfg(target_os = "linux")]
     let (audio_submitter, audio_worker, pipewire_audio) = if let Some(encoder) = prepared_audio {
         let mut seen_stores = HashSet::new();
         let audio_stores = targets
@@ -218,15 +222,18 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             .filter(|target| seen_stores.insert(Arc::as_ptr(&target.store) as usize))
             .map(|target| Arc::clone(&target.store))
             .collect::<Vec<_>>();
-        let clock = Arc::new(MediaClock::default());
-        match AudioWorker::start_prepared(encoder, clock, Arc::clone(&failure), move |frame| {
+        match AudioWorker::start_prepared(encoder, Arc::clone(&failure), move |frame| {
             for store in &audio_stores {
                 store.submit_audio(frame.clone())?;
             }
             Ok(())
         }) {
             Ok((submitter, worker)) => {
-                match PipeWireAudioCapture::start(submitter.clone(), Arc::clone(&failure)) {
+                match PipeWireAudioCapture::start(
+                    submitter.clone(),
+                    Arc::clone(&failure),
+                    capture_epoch.clone(),
+                ) {
                     Ok(capture) => (Some(submitter), Some(worker), Some(capture)),
                     Err(error) => {
                         eprintln!(
@@ -258,6 +265,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
                 Arc::clone(&failure),
                 #[cfg(target_os = "linux")]
                 audio_submitter.clone(),
+                #[cfg(target_os = "linux")]
+                capture_epoch.clone(),
             )?);
         }
     } else {
@@ -268,6 +277,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             Arc::clone(&failure),
             #[cfg(target_os = "linux")]
             audio_submitter.clone(),
+            #[cfg(target_os = "linux")]
+            capture_epoch.clone(),
         )?);
     }
 
@@ -964,6 +975,7 @@ impl LiveCapture {
         store: Arc<HlsStore>,
         failure: Arc<Mutex<Option<String>>>,
         audio_submitter: Option<AudioSubmitter>,
+        capture_epoch: CaptureEpoch,
     ) -> Result<Self> {
         let selection = match extended_display {
             Some(selection) => selection,
@@ -994,7 +1006,7 @@ impl LiveCapture {
             "cast-linux-hls-encoder",
         )?;
         let sink: Arc<dyn FrameSink> = Arc::new(LivePortalSink { submitter });
-        let capture = PipeWireCapture::start(selection, sink)?;
+        let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
         println!(
             "Capturing the selected portal source into {}x{}, {} fps HLS...",
             even(options.width),
