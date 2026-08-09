@@ -35,7 +35,6 @@ use crate::{
     discovery::{self, CastService, DeviceCapability, DiscoveryEvent, DiscoverySession},
     media::CompatibilityMode,
     playback::{PlaybackEvent, PlaybackHandle, PlaybackOptions, PreparationStage},
-    system_volume::{SystemVolumeEvent, SystemVolumeMonitor},
     video::TranscodeDelivery,
 };
 
@@ -336,7 +335,6 @@ struct App {
     playback: Option<PlaybackHandle>,
     playback_status: Option<(PlaybackStatus, Instant)>,
     volume: ReceiverVolume,
-    system_volume: SystemVolumeMonitor,
     preparation: Option<(PreparationStage, Option<f64>)>,
     status: String,
     help: bool,
@@ -379,7 +377,6 @@ impl App {
             playback: None,
             playback_status: None,
             volume: ReceiverVolume::default(),
-            system_volume: SystemVolumeMonitor::start()?,
             preparation: None,
             status: "Select a video and press Enter to enqueue it".to_owned(),
             help: false,
@@ -403,22 +400,6 @@ impl App {
         }
         self.poll_discovery();
         self.poll_playback();
-        self.poll_system_volume();
-    }
-
-    fn poll_system_volume(&mut self) {
-        for event in self.system_volume.drain_events(8) {
-            let Some(playback) = &self.playback else {
-                continue;
-            };
-            let result = match event {
-                SystemVolumeEvent::Volume(level) => playback.set_volume(level),
-                SystemVolumeEvent::Muted(muted) => playback.set_muted(muted),
-            };
-            if let Err(error) = result {
-                self.status = format!("Receiver volume control failed: {error:#}");
-            }
-        }
     }
 
     fn poll_discovery(&mut self) {
@@ -698,8 +679,9 @@ impl App {
                     let _ = playback.set_muted(!self.volume.muted.unwrap_or(false));
                 }
             }
-            (KeyCode::Char('+') | KeyCode::Char('='), _) => self.adjust_volume(0.05),
-            (KeyCode::Char('-'), _) => self.adjust_volume(-0.05),
+            (KeyCode::Char(character), _) if volume_key_delta(character).is_some() => {
+                self.adjust_volume(volume_key_delta(character).unwrap_or_default())
+            }
             _ => self.handle_focused_key(key),
         }
     }
@@ -1318,8 +1300,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(concat!(
             "Global\n  Tab/Shift-Tab focus  q/Ctrl-C quit  ? help  l logs  c receiver\n",
-            "  Space play/pause  Esc stop  [/] previous/next  M mute  +/- volume\n",
-            "  ←/→ seek -/+10s  Shift-←/→ seek -/+60s  macOS volume keys control receiver\n\n",
+            "  Space play/pause  Esc stop  [/] previous/next  M mute  -/+ receiver volume\n",
+            "  ←/→ seek -/+10s  Shift-←/→ seek -/+60s\n\n",
             "Files\n  ↑/↓ PgUp/PgDn Home/End select  Enter open/enqueue\n",
             "  Backspace parent  p play now  f show all files\n\n",
             "Playlist\n  Enter play  Delete/Backspace remove  Alt-↑/Alt-↓ reorder\n\n",
@@ -1472,6 +1454,14 @@ fn player_key_action(code: KeyCode, modifiers: KeyModifiers) -> Option<PlayerKey
     }
 }
 
+fn volume_key_delta(character: char) -> Option<f32> {
+    match character {
+        '+' | '=' => Some(0.05),
+        '-' => Some(-0.05),
+        _ => None,
+    }
+}
+
 fn move_index(current: usize, length: usize, amount: isize) -> usize {
     if length == 0 {
         return 0;
@@ -1606,6 +1596,14 @@ mod tests {
         );
         assert_eq!(player_key_action(KeyCode::Down, KeyModifiers::NONE), None);
         assert_eq!(player_key_action(KeyCode::Up, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn plus_and_minus_map_to_receiver_volume_steps() {
+        assert_eq!(volume_key_delta('+'), Some(0.05));
+        assert_eq!(volume_key_delta('='), Some(0.05));
+        assert_eq!(volume_key_delta('-'), Some(-0.05));
+        assert_eq!(volume_key_delta('m'), None);
     }
 
     #[test]
