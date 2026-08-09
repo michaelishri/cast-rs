@@ -313,6 +313,7 @@ dependencies = [
  "pipewire",
  "ratatui",
  "rust_cast",
+ "rustls",
  "screencapturekit",
  "serde",
  "serde_json",

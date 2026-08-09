@@ -41,7 +41,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -452,6 +452,7 @@ enum TranscodeDeliveryMode {
 }
 
 fn main() -> Result<()> {
+    install_crypto_provider()?;
     let cli = Cli::parse();
     let interactive_video = interactive_video_output(
         cli.verbose,
@@ -829,6 +830,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn install_crypto_provider() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("could not install the process-wide Rustls AWS-LC crypto provider"))
+}
+
 fn print_devices(devices: &[discovery::CastService]) {
     print!("{}", format_devices(devices));
 }
@@ -937,7 +944,10 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 mod tests {
     #[cfg(target_os = "linux")]
     use super::H264Encoder;
-    use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
+    use super::{
+        Cli, Command, TranscodeDeliveryMode, TranscodeMode, install_crypto_provider,
+        interactive_video_output,
+    };
     use clap::{Parser, error::ErrorKind};
     #[cfg(target_os = "macos")]
     use std::net::IpAddr;
@@ -949,6 +959,12 @@ mod tests {
         assert!(!interactive_video_output(2, true, true));
         assert!(!interactive_video_output(0, false, true));
         assert!(!interactive_video_output(0, true, false));
+    }
+
+    #[test]
+    fn installs_the_process_wide_tls_crypto_provider() {
+        install_crypto_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]
