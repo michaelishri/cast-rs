@@ -785,7 +785,7 @@ fn copy_pipewire_frame(
         .ok_or_else(|| anyhow!("PipeWire frame had no data plane"))?;
     let chunk = data.chunk();
     let offset = usize::try_from(chunk.offset())?;
-    let bytes = usize::try_from(chunk.size())?;
+    let chunk_bytes = usize::try_from(chunk.size())?;
     let signed_stride = chunk.stride();
     let mapped = data
         .data()
@@ -796,10 +796,21 @@ fn copy_pipewire_frame(
     } else {
         offset % mapped.len()
     };
+    let row_bytes = usize::try_from(width)?
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("PipeWire frame row size overflowed"))?;
+    let available = mapped_frame_storage(mapped.len(), offset, signed_stride, row_bytes)?;
+    log::trace!(
+        "PipeWire video buffer: mapped={} bytes, chunk={} bytes, offset={}, stride={}",
+        mapped.len(),
+        chunk_bytes,
+        offset,
+        signed_stride
+    );
     let (pixels, stride) = normalize_strided_image(
         mapped,
         offset,
-        bytes.min(mapped.len()),
+        available,
         signed_stride,
         width,
         height,
@@ -818,6 +829,25 @@ fn copy_pipewire_frame(
             .flatten(),
     });
     Ok(())
+}
+
+fn mapped_frame_storage(
+    mapped_len: usize,
+    offset: usize,
+    signed_stride: i32,
+    row_bytes: usize,
+) -> Result<usize> {
+    if offset >= mapped_len {
+        bail!("PipeWire frame offset falls outside its mapped buffer");
+    }
+    if signed_stride < 0 {
+        Ok(offset
+            .checked_add(row_bytes)
+            .ok_or_else(|| anyhow!("PipeWire frame storage range overflowed"))?
+            .min(mapped_len))
+    } else {
+        Ok(mapped_len - offset)
+    }
 }
 
 fn update_cursor_metadata(
@@ -1031,6 +1061,19 @@ mod tests {
         assert_eq!(&negative[0..4], &[3; 4]);
         assert_eq!(&negative[8..12], &[2; 4]);
         assert_eq!(&negative[16..20], &[1; 4]);
+    }
+
+    #[test]
+    fn frame_storage_uses_mapped_plane_bounds_instead_of_chunk_payload_size() {
+        let rows = [0_u8; 24];
+        let available = mapped_frame_storage(rows.len(), 0, 8, 4).unwrap();
+        assert_eq!(available, rows.len());
+        normalize_strided_image(&rows, 0, available, 8, 1, 3, "test frame").unwrap();
+
+        let available = mapped_frame_storage(rows.len(), 16, -8, 4).unwrap();
+        assert_eq!(available, 20);
+        normalize_strided_image(&rows, 16, available, -8, 1, 3, "test frame").unwrap();
+        assert!(mapped_frame_storage(rows.len(), rows.len(), 8, 4).is_err());
     }
 
     #[test]
