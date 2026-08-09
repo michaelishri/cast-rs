@@ -4,7 +4,7 @@ use std::{
     io::{self, ErrorKind, IsTerminal, Write},
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -33,13 +33,15 @@ use serde_json::Value;
 use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
-use crate::audio::{
-    self, AudioFrameHandler, AudioWorker, LocalOutputControl, LocalOutputRedirect, MediaClock,
+use crate::audio::{self, AudioFrameHandler, AudioWorker, LocalOutputRedirect};
+use crate::desktop::{
+    AdaptiveRateControl, AdaptiveRateObserver, EncodedVideoFrame as EncodedFrame, EncodedVideoSink,
+    H264Level, LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker,
+    MediaClock, RateWindowHealth, ReceiverControlSink, ReceiverVolumeCommand,
+    SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticPhase,
+    VideoFrameTimings as FrameTimings, fan_out_receiver_control, fan_out_video, phase_for_frame,
 };
-use crate::synthetic::{
-    SYNTHETIC_CYCLE_SECONDS, SYNTHETIC_WORKLOAD_NAME, SyntheticFrameGenerator, SyntheticPhase,
-    phase_for_frame,
-};
+use crate::synthetic::SyntheticFrameGenerator;
 use crate::virtual_display::VirtualDisplaySession;
 
 const CAST_STREAMING_APP_ID: &str = "0F5096E8";
@@ -52,7 +54,6 @@ const DELTA_PACKETS_PER_BURST: usize = 16;
 const KEYFRAME_PACKETS_PER_BURST: usize = 24;
 const MAX_FRAME_PACING_WINDOW: Duration = Duration::from_millis(5);
 const RATE_CONTROL_INTERVAL: Duration = Duration::from_secs(1);
-const RATE_CONTROL_HEALTHY_WINDOWS_BEFORE_INCREASE: u8 = 3;
 static VIRTUAL_DISPLAY_TEARDOWN: Mutex<()> = Mutex::new(());
 const SYNTHETIC_SURFACE_POOL_SIZE: usize = 3;
 const PROFILE_HISTORY_SECONDS: usize = 60;
@@ -835,7 +836,7 @@ fn run_desktop(
         .with_average_bit_rate(options.bitrate)
         .with_expected_frame_rate(options.fps as f64)
         .with_max_keyframe_interval(keyframe_interval)
-        .with_profile_level(h264_level.profile_level)
+        .with_profile_level(video_toolbox_profile_level(h264_level))
         .build()
         .context("could not create the VideoToolbox H.264 mirroring encoder")?;
     configure_low_latency_encoder(&encoder, options.prioritize_encoding_speed, &capture_stats);
@@ -885,11 +886,13 @@ fn run_desktop(
         (None, None)
     };
     let max_frame_age = resolve_max_frame_age(options.max_frame_age, options.fps);
+    let frame_observer: Arc<dyn LatestFrameObserver> = capture_stats.clone();
     let (submitter, encoder_worker) = EncoderWorker::start(
         pipeline,
         max_frame_age,
         Arc::clone(&failure),
-        Arc::clone(&capture_stats),
+        frame_observer,
+        "cast-mirror-encoder",
     )?;
     if let Some(max_frame_age) = max_frame_age {
         log::debug!(
@@ -906,13 +909,7 @@ fn run_desktop(
         .collect::<Vec<_>>();
     let local_output_redirect = if audio_submitter.is_some() {
         match LocalOutputRedirect::start(move |control| {
-            let command = match control {
-                LocalOutputControl::Volume(level) => ReceiverVolumeCommand::SetLevel(level),
-                LocalOutputControl::ToggleMute => ReceiverVolumeCommand::ToggleMute,
-            };
-            for target in &volume_controls {
-                target.request_volume(command);
-            }
+            fan_out_receiver_control(&volume_controls, control.into());
         }) {
             Ok(redirect) => Some(redirect),
             Err(error) => {
@@ -2109,117 +2106,17 @@ fn rate_window_is_congested(
     )
 }
 
-#[derive(Clone, Copy)]
-struct H264Level {
-    name: &'static str,
-    codec_parameter: &'static str,
-    profile_level: ProfileLevel,
-}
-
-impl H264Level {
-    fn for_stream(width: u32, height: u32, fps: u32, bitrate: u64) -> Result<Self> {
-        let macroblocks_per_frame =
-            u64::from(width.div_ceil(16)).saturating_mul(u64::from(height.div_ceil(16)));
-        let macroblocks_per_second = macroblocks_per_frame.saturating_mul(u64::from(fps));
-        let levels = [
-            (
-                3_600,
-                108_000,
-                14_000_000,
-                Self {
-                    name: "3.1",
-                    codec_parameter: "avc1.42001F",
-                    profile_level: ProfileLevel::H264Baseline3_1,
-                },
-            ),
-            (
-                5_120,
-                216_000,
-                20_000_000,
-                Self {
-                    name: "3.2",
-                    codec_parameter: "avc1.420020",
-                    profile_level: ProfileLevel::H264Baseline3_2,
-                },
-            ),
-            (
-                8_192,
-                245_760,
-                20_000_000,
-                Self {
-                    name: "4.0",
-                    codec_parameter: "avc1.420028",
-                    profile_level: ProfileLevel::H264Baseline4_0,
-                },
-            ),
-            (
-                8_192,
-                245_760,
-                50_000_000,
-                Self {
-                    name: "4.1",
-                    codec_parameter: "avc1.420029",
-                    profile_level: ProfileLevel::H264Baseline4_1,
-                },
-            ),
-            (
-                8_704,
-                522_240,
-                50_000_000,
-                Self {
-                    name: "4.2",
-                    codec_parameter: "avc1.42002A",
-                    profile_level: ProfileLevel::H264Baseline4_2,
-                },
-            ),
-            (
-                22_080,
-                589_824,
-                135_000_000,
-                Self {
-                    name: "5.0",
-                    codec_parameter: "avc1.420032",
-                    profile_level: ProfileLevel::H264Baseline5_0,
-                },
-            ),
-            (
-                36_864,
-                983_040,
-                240_000_000,
-                Self {
-                    name: "5.1",
-                    codec_parameter: "avc1.420033",
-                    profile_level: ProfileLevel::H264Baseline5_1,
-                },
-            ),
-            (
-                36_864,
-                2_073_600,
-                240_000_000,
-                Self {
-                    name: "5.2",
-                    codec_parameter: "avc1.420034",
-                    profile_level: ProfileLevel::H264Baseline5_2,
-                },
-            ),
-        ];
-        levels
-            .into_iter()
-            .find(|(max_frame, max_second, max_bitrate, _)| {
-                macroblocks_per_frame <= *max_frame
-                    && macroblocks_per_second <= *max_second
-                    && bitrate <= *max_bitrate
-            })
-            .map(|(_, _, _, level)| level)
-            .ok_or_else(|| {
-                anyhow!(
-                    "{}x{} at {} fps and {:.2} Mbit/s exceeds H.264 Baseline level 5.2",
-                    width,
-                    height,
-                    fps,
-                    bitrate as f64 / 1_000_000.0
-                )
-            })
+fn video_toolbox_profile_level(level: H264Level) -> ProfileLevel {
+    match level.name {
+        "3.1" => ProfileLevel::H264Baseline3_1,
+        "3.2" => ProfileLevel::H264Baseline3_2,
+        "4.0" => ProfileLevel::H264Baseline4_0,
+        "4.1" => ProfileLevel::H264Baseline4_1,
+        "4.2" => ProfileLevel::H264Baseline4_2,
+        "5.0" => ProfileLevel::H264Baseline5_0,
+        "5.1" => ProfileLevel::H264Baseline5_1,
+        "5.2" => ProfileLevel::H264Baseline5_2,
+        _ => unreachable!("unsupported H.264 level {}", level.name),
     }
 }
 
@@ -2365,7 +2262,7 @@ struct CastStreamingControlState {
     volume_commands: mpsc::Sender<ReceiverVolumeCommand>,
 }
 
-impl CastStreamingControlState {
+impl ReceiverControlSink for CastStreamingControlState {
     fn request_volume(&self, command: ReceiverVolumeCommand) {
         if self.volume_commands.send(command).is_err() {
             log::warn!("Cast Streaming volume control channel has closed");
@@ -2384,12 +2281,6 @@ impl Default for CastStreamingControlState {
             volume_commands,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ReceiverVolumeCommand {
-    SetLevel(f32),
-    ToggleMute,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3063,6 +2954,43 @@ struct MirrorStats {
     synthetic_phase_retransmissions: [AtomicU64; 4],
 }
 
+impl LatestFrameObserver for MirrorStats {
+    fn submitted(&self) {
+        self.raw_frames_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn replaced(&self) {
+        self.raw_frames_replaced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn expired(&self) {
+        self.raw_frames_expired.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl AdaptiveRateObserver for MirrorStats {
+    fn initialized(&self, bitrate: u64) {
+        self.current_target_bitrate
+            .store(bitrate, Ordering::Relaxed);
+        self.minimum_target_bitrate
+            .store(bitrate, Ordering::Relaxed);
+    }
+
+    fn changed(&self, bitrate: u64, increase: bool) {
+        self.current_target_bitrate
+            .store(bitrate, Ordering::Relaxed);
+        self.minimum_target_bitrate
+            .fetch_min(bitrate, Ordering::Relaxed);
+        if increase {
+            self.adaptive_bitrate_increases
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.adaptive_bitrate_decreases
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn merge_capture_stats(source: &MirrorStats, target: &MirrorStats) -> Result<()> {
     macro_rules! copy_u64 {
         ($field:ident) => {
@@ -3103,170 +3031,6 @@ fn merge_capture_stats(source: &MirrorStats, target: &MirrorStats) -> Result<()>
     Ok(())
 }
 
-struct AdaptiveRateControl {
-    enabled: bool,
-    minimum_bitrate: u64,
-    maximum_bitrate: u64,
-    target_bitrate: AtomicU64,
-    stats: Arc<MirrorStats>,
-    group: Mutex<GroupRateState>,
-}
-
-#[derive(Clone, Copy)]
-struct RateWindowHealth {
-    congested: bool,
-    acknowledged_bps: u64,
-}
-
-struct GroupRateState {
-    reports: Vec<Option<RateWindowHealth>>,
-    healthy_rounds: u8,
-}
-
-impl AdaptiveRateControl {
-    #[cfg(test)]
-    fn new(maximum_bitrate: u64, enabled: bool, stats: Arc<MirrorStats>) -> Self {
-        Self::new_group(maximum_bitrate, enabled, stats, 1)
-    }
-
-    fn new_group(
-        maximum_bitrate: u64,
-        enabled: bool,
-        stats: Arc<MirrorStats>,
-        participants: usize,
-    ) -> Self {
-        assert!(participants > 0, "rate-control group must not be empty");
-        let minimum_bitrate = (maximum_bitrate / 4).max(500_000).min(maximum_bitrate);
-        stats
-            .current_target_bitrate
-            .store(maximum_bitrate, Ordering::Relaxed);
-        stats
-            .minimum_target_bitrate
-            .store(maximum_bitrate, Ordering::Relaxed);
-        Self {
-            enabled,
-            minimum_bitrate,
-            maximum_bitrate,
-            target_bitrate: AtomicU64::new(maximum_bitrate),
-            stats,
-            group: Mutex::new(GroupRateState {
-                reports: vec![None; participants],
-                healthy_rounds: 0,
-            }),
-        }
-    }
-
-    fn target_bitrate(&self) -> u64 {
-        self.target_bitrate.load(Ordering::Relaxed)
-    }
-
-    fn decrease(&self, _acknowledged_bps: u64) {
-        if !self.enabled {
-            return;
-        }
-        let current = self.target_bitrate();
-        let next = current
-            .saturating_mul(80)
-            .saturating_div(100)
-            .max(self.minimum_bitrate);
-        self.set_target(next, false);
-    }
-
-    fn increase(&self) {
-        if !self.enabled {
-            return;
-        }
-        let current = self.target_bitrate();
-        let next = current
-            .saturating_mul(105)
-            .saturating_div(100)
-            .max(current.saturating_add(100_000))
-            .min(self.maximum_bitrate);
-        self.set_target(next, true);
-    }
-
-    fn report_window(&self, target: usize, health: RateWindowHealth) {
-        let action = {
-            let Ok(mut group) = self.group.lock() else {
-                log::warn!("adaptive bitrate group lock was poisoned");
-                return;
-            };
-            let Some(slot) = group.reports.get_mut(target) else {
-                log::warn!("adaptive bitrate received an unknown target index {target}");
-                return;
-            };
-            if let Some(existing) = slot.as_mut() {
-                existing.congested |= health.congested;
-                existing.acknowledged_bps = existing.acknowledged_bps.min(health.acknowledged_bps);
-            } else {
-                *slot = Some(health);
-            }
-            if group.reports.iter().any(Option::is_none) {
-                return;
-            }
-
-            let congested = group
-                .reports
-                .iter()
-                .flatten()
-                .any(|report| report.congested);
-            let acknowledged_bps = group
-                .reports
-                .iter()
-                .flatten()
-                .map(|report| report.acknowledged_bps)
-                .min()
-                .unwrap_or(0);
-            group.reports.fill(None);
-            if congested {
-                group.healthy_rounds = 0;
-                Some((false, acknowledged_bps))
-            } else {
-                group.healthy_rounds = group.healthy_rounds.saturating_add(1);
-                if group.healthy_rounds >= RATE_CONTROL_HEALTHY_WINDOWS_BEFORE_INCREASE {
-                    group.healthy_rounds = 0;
-                    Some((true, acknowledged_bps))
-                } else {
-                    None
-                }
-            }
-        };
-        match action {
-            Some((true, _)) => self.increase(),
-            Some((false, acknowledged_bps)) => self.decrease(acknowledged_bps),
-            None => {}
-        }
-    }
-
-    fn set_target(&self, next: u64, increase: bool) {
-        let current = self.target_bitrate();
-        if next == current {
-            return;
-        }
-        self.target_bitrate.store(next, Ordering::Relaxed);
-        self.stats
-            .current_target_bitrate
-            .store(next, Ordering::Relaxed);
-        self.stats
-            .minimum_target_bitrate
-            .fetch_min(next, Ordering::Relaxed);
-        if increase {
-            self.stats
-                .adaptive_bitrate_increases
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats
-                .adaptive_bitrate_decreases
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        log::debug!(
-            "adaptive bitrate changed from {:.2} to {:.2} Mbit/s",
-            current as f64 / 1_000_000.0,
-            next as f64 / 1_000_000.0
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct LatencySample {
     pipeline_micros: u64,
@@ -3282,16 +3046,6 @@ struct LatencySample {
     keyframe: bool,
     encoded_bytes: u64,
     synthetic_phase: Option<SyntheticPhase>,
-}
-
-#[derive(Clone, Copy)]
-struct FrameTimings {
-    pipeline_started_at: Instant,
-    capture_age_micros: Option<u64>,
-    queue_wait_micros: u64,
-    encode_micros: u64,
-    prepare_micros: u64,
-    sender_lock_wait_micros: u64,
 }
 
 #[derive(Clone)]
@@ -4035,165 +3789,8 @@ impl Drop for PendingFrame {
     }
 }
 
-struct FrameQueueState {
-    pending: Option<PendingFrame>,
-    stopping: bool,
-}
-
-struct FrameQueue {
-    state: Mutex<FrameQueueState>,
-    available: Condvar,
-    stats: Arc<MirrorStats>,
-}
-
-#[derive(Clone)]
-struct FrameSubmitter {
-    queue: Arc<FrameQueue>,
-}
-
-impl FrameSubmitter {
-    fn submit(&self, frame: PendingFrame) -> Result<()> {
-        let mut state = self
-            .queue
-            .state
-            .lock()
-            .map_err(|_| anyhow!("raw-frame queue lock was poisoned"))?;
-        if state.stopping {
-            bail!("raw-frame queue has stopped");
-        }
-        self.queue
-            .stats
-            .raw_frames_submitted
-            .fetch_add(1, Ordering::Relaxed);
-        if state.pending.replace(frame).is_some() {
-            self.queue
-                .stats
-                .raw_frames_replaced
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.queue.available.notify_one();
-        Ok(())
-    }
-}
-
-struct EncoderWorker {
-    queue: Arc<FrameQueue>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl EncoderWorker {
-    fn start(
-        mut pipeline: MirrorPipeline,
-        max_frame_age: Option<Duration>,
-        failure: Arc<Mutex<Option<String>>>,
-        stats: Arc<MirrorStats>,
-    ) -> Result<(FrameSubmitter, Self)> {
-        let queue = Arc::new(FrameQueue {
-            state: Mutex::new(FrameQueueState {
-                pending: None,
-                stopping: false,
-            }),
-            available: Condvar::new(),
-            stats: Arc::clone(&stats),
-        });
-        let thread_queue = Arc::clone(&queue);
-        let thread = thread::Builder::new()
-            .name("cast-mirror-encoder".into())
-            .spawn(move || {
-                loop {
-                    let frame = {
-                        let mut state = match thread_queue.state.lock() {
-                            Ok(state) => state,
-                            Err(_) => {
-                                store_source_failure(
-                                    &failure,
-                                    "raw-frame queue lock was poisoned".to_owned(),
-                                );
-                                break;
-                            }
-                        };
-                        while state.pending.is_none() && !state.stopping {
-                            state = match thread_queue.available.wait(state) {
-                                Ok(state) => state,
-                                Err(_) => {
-                                    store_source_failure(
-                                        &failure,
-                                        "raw-frame queue wait was poisoned".to_owned(),
-                                    );
-                                    return;
-                                }
-                            };
-                        }
-                        if state.stopping {
-                            break;
-                        }
-                        state.pending.take().expect("pending frame was checked")
-                    };
-
-                    let queue_wait = frame.pipeline_started_at.elapsed();
-                    if pipeline.has_reference_frame()
-                        && max_frame_age.is_some_and(|deadline| queue_wait > deadline)
-                    {
-                        stats.raw_frames_expired.fetch_add(1, Ordering::Relaxed);
-                        log::trace!(
-                            "dropped raw frame after {:.1} ms queue wait",
-                            queue_wait.as_secs_f64() * 1_000.0
-                        );
-                        continue;
-                    }
-                    if let Err(error) = pipeline.encode(
-                        &frame.surface,
-                        frame.presentation_time,
-                        frame.pipeline_started_at,
-                        frame.capture_age_micros,
-                        duration_micros(queue_wait),
-                        frame.synthetic_phase,
-                    ) {
-                        store_source_failure(
-                            &failure,
-                            format!("mirroring encode worker failed: {error:#}"),
-                        );
-                        if let Ok(mut state) = thread_queue.state.lock() {
-                            state.stopping = true;
-                            state.pending.take();
-                        }
-                        thread_queue.available.notify_all();
-                        break;
-                    }
-                }
-            })
-            .context("could not start mirroring encoder worker")?;
-        Ok((
-            FrameSubmitter {
-                queue: Arc::clone(&queue),
-            },
-            Self {
-                queue,
-                thread: Some(thread),
-            },
-        ))
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if let Ok(mut state) = self.queue.state.lock() {
-            state.stopping = true;
-            state.pending.take();
-        }
-        self.queue.available.notify_all();
-        if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| anyhow!("mirroring encoder worker panicked"))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for EncoderWorker {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
+type FrameSubmitter = LatestFrameSubmitter<PendingFrame>;
+type EncoderWorker = LatestFrameWorker<PendingFrame>;
 
 struct SyntheticFrameSource {
     stop_signal: Arc<AtomicBool>,
@@ -4468,15 +4065,6 @@ impl MirrorFrameHandler {
 const SENDER_QUEUE_FRAMES: usize = 3;
 
 #[derive(Clone)]
-struct EncodedFrame {
-    rtp_timestamp: u32,
-    keyframe: bool,
-    data: Arc<Vec<u8>>,
-    timings: FrameTimings,
-    synthetic_phase: Option<SyntheticPhase>,
-}
-
-#[derive(Clone)]
 struct SenderSubmitter {
     host: IpAddr,
     sender: mpsc::SyncSender<EncodedFrame>,
@@ -4494,6 +4082,12 @@ impl SenderSubmitter {
                 bail!("Cast sender worker for {} stopped unexpectedly", self.host)
             }
         }
+    }
+}
+
+impl EncodedVideoSink for SenderSubmitter {
+    fn submit_video(&self, frame: EncodedFrame) -> Result<()> {
+        self.submit(frame)
     }
 }
 
@@ -4640,9 +4234,7 @@ impl MirrorPipeline {
             },
             synthetic_phase,
         };
-        for output in &self.outputs {
-            output.submit(frame.clone())?;
-        }
+        fan_out_video(&self.outputs, frame.clone())?;
         self.frame_index += 1;
         if keyframe || self.frame_index.is_multiple_of(self.fps as u64) {
             log::debug!(
@@ -4679,7 +4271,7 @@ impl MirrorPipeline {
         let fallback_step = RTP_VIDEO_TIMEBASE / self.fps as u64;
         let candidate = self
             .clock
-            .ticks(presentation_time, RTP_VIDEO_TIMEBASE)
+            .ticks(presentation_time.into(), RTP_VIDEO_TIMEBASE)
             .unwrap_or_else(|| {
                 self.last_timestamp
                     .map_or(0, |last| last.saturating_add(fallback_step))
@@ -4690,6 +4282,33 @@ impl MirrorPipeline {
         };
         self.last_timestamp = Some(timestamp);
         timestamp
+    }
+}
+
+impl LatestFrameBackend for MirrorPipeline {
+    type Frame = PendingFrame;
+
+    fn has_reference_frame(&self) -> bool {
+        self.has_reference_frame()
+    }
+
+    fn queue_started_at(&self, frame: &Self::Frame) -> Option<Instant> {
+        Some(frame.pipeline_started_at)
+    }
+
+    fn failure_context(&self) -> &'static str {
+        "mirroring encode worker failed"
+    }
+
+    fn process_frame(&mut self, frame: Self::Frame, queue_wait_micros: u64) -> Result<()> {
+        self.encode(
+            &frame.surface,
+            frame.presentation_time,
+            frame.pipeline_started_at,
+            frame.capture_age_micros,
+            queue_wait_micros,
+            frame.synthetic_phase,
+        )
     }
 }
 

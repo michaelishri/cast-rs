@@ -3,6 +3,7 @@ mod audio;
 #[cfg(target_os = "macos")]
 mod capture;
 mod cast;
+mod desktop;
 mod discovery;
 #[cfg(target_os = "macos")]
 mod live;

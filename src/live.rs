@@ -22,8 +22,9 @@ use videotoolbox::ProfileLevel;
 use videotoolbox::prelude::*;
 
 use crate::{
-    audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker, EncodedAudioFrame, MediaClock},
+    audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker},
     cast,
+    desktop::{EncodedAudioFrame, EncodedAudioSink, MediaClock},
     network::{http_url, local_ip_for, private_route},
     virtual_display::VirtualDisplaySession,
 };
@@ -468,7 +469,7 @@ impl LiveCapture {
         let (audio_submitter, audio_worker) = if options.audio && store.audio_enabled() {
             let audio_store = Arc::clone(&store);
             match AudioWorker::start(Arc::clone(&clock), Arc::clone(&failure), move |frame| {
-                audio_store.push_audio(frame)
+                audio_store.submit_audio(frame)
             }) {
                 Ok((submitter, worker)) => (Some(submitter), Some(worker)),
                 Err(error) => {
@@ -784,7 +785,7 @@ impl LivePipeline {
         let fallback_step = TIMESCALE / self.fps as u64;
         let candidate = self
             .clock
-            .ticks(presentation_time, TIMESCALE)
+            .ticks(presentation_time.into(), TIMESCALE)
             .unwrap_or_else(|| {
                 self.last_timestamp
                     .map_or(0, |last| last.saturating_add(fallback_step))
@@ -1047,6 +1048,12 @@ impl HlsStore {
             init_segments: self.init_requests.load(Ordering::Relaxed),
             media_segments: self.segment_requests.load(Ordering::Relaxed),
         }
+    }
+}
+
+impl EncodedAudioSink for HlsStore {
+    fn submit_audio(&self, frame: EncodedAudioFrame) -> Result<()> {
+        self.push_audio(frame)
     }
 }
 
@@ -1491,7 +1498,7 @@ mod tests {
         avcc_contains_nal_type, id3_timestamp, live_keyframe_interval, master_playlist, playlist,
         routed_response, validate_cast_hosts, validate_serve_only,
     };
-    use crate::audio::{self, EncodedAudioFrame};
+    use crate::{audio, desktop::EncodedAudioFrame};
     use std::{
         collections::HashMap,
         collections::VecDeque,
