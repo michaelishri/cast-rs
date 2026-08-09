@@ -4342,7 +4342,7 @@ impl MirrorFrameHandler {
         reason: &str,
     ) {
         let count = self.repeated_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % 120 == 0 {
+        if count == 1 || count.is_multiple_of(120) {
             log::debug!(
                 "encoded {count} idle mirroring samples by reusing the last frame (latest status={status:?}: {reason})"
             );
@@ -4351,7 +4351,7 @@ impl MirrorFrameHandler {
 
     fn record_skipped_sample(&self, status: Option<screencapturekit::SCFrameStatus>, reason: &str) {
         let count = self.skipped_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % 120 == 0 {
+        if count == 1 || count.is_multiple_of(120) {
             log::debug!(
                 "skipped {count} non-video mirroring samples (latest status={status:?}: {reason})"
             );
@@ -4538,7 +4538,7 @@ impl MirrorPipeline {
             output.submit(frame.clone())?;
         }
         self.frame_index += 1;
-        if keyframe || self.frame_index % self.fps as u64 == 0 {
+        if keyframe || self.frame_index.is_multiple_of(self.fps as u64) {
             log::debug!(
                 "sent mirroring frame {}: {} Annex-B bytes, keyframe={keyframe}, rtp_timestamp={timestamp}",
                 self.frame_index,
