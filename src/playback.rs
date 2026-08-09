@@ -416,7 +416,7 @@ fn prepare(
         percent: None,
     });
     let path = validate_path(&options.path)?;
-    let info = media::inspect(&path)?;
+    let info = media::inspect_quiet(&path)?;
     let plan = media::plan(&info, options.compatibility_mode)?;
     let title = display_title(&path);
     let duration = info.duration;

@@ -114,8 +114,16 @@ impl PreparationPlan {
 }
 
 pub fn inspect(path: &Path) -> Result<MediaInfo> {
+    inspect_with_log_level(path, ffmpeg::log::Level::Warning)
+}
+
+pub fn inspect_quiet(path: &Path) -> Result<MediaInfo> {
+    inspect_with_log_level(path, ffmpeg::log::Level::Quiet)
+}
+
+fn inspect_with_log_level(path: &Path, log_level: ffmpeg::log::Level) -> Result<MediaInfo> {
+    ffmpeg::log::set_level(log_level);
     ffmpeg::init().context("could not initialize the linked FFmpeg libraries")?;
-    ffmpeg::log::set_level(ffmpeg::log::Level::Warning);
     let input = format::input(path)
         .with_context(|| format!("could not inspect media container {}", path.display()))?;
     let container = input.format().name().to_owned();
