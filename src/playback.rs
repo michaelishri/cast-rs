@@ -28,6 +28,7 @@ use crate::{
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PREPARATION_TIMEOUT: Duration = Duration::from_secs(120);
+const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct PlaybackOptions {
@@ -64,6 +65,37 @@ pub enum PlaybackEvent {
     Ended(PlaybackEnd),
     Stopped,
     Failed(MediaFailure),
+}
+
+struct PreparationProgressEmitter {
+    events: Sender<PlaybackEvent>,
+    last_sent: Option<Instant>,
+}
+
+impl PreparationProgressEmitter {
+    fn new(events: Sender<PlaybackEvent>) -> Self {
+        Self {
+            events,
+            last_sent: None,
+        }
+    }
+
+    fn report(&mut self, percent: f64) {
+        self.report_at(percent, Instant::now());
+    }
+
+    fn report_at(&mut self, percent: f64, now: Instant) {
+        if self.last_sent.is_some_and(|last| {
+            now.saturating_duration_since(last) < PROGRESS_EVENT_INTERVAL && percent < 100.0
+        }) {
+            return;
+        }
+        self.last_sent = Some(now);
+        let _ = self.events.send(PlaybackEvent::Preparing {
+            stage: PreparationStage::Transcoding,
+            percent: Some(percent),
+        });
+    }
 }
 
 enum PlaybackCommand {
@@ -107,8 +139,8 @@ impl PlaybackHandle {
         })
     }
 
-    pub fn try_recv(&self) -> std::result::Result<PlaybackEvent, mpsc::TryRecvError> {
-        self.events.try_recv()
+    pub fn drain_events(&self, limit: usize) -> Vec<PlaybackEvent> {
+        drain_receiver(&self.events, limit)
     }
 
     pub fn toggle(&self) -> Result<()> {
@@ -155,6 +187,10 @@ impl PlaybackHandle {
             .join()
             .map_err(|_| anyhow!("local-video playback worker panicked"))
     }
+}
+
+fn drain_receiver<T>(receiver: &Receiver<T>, limit: usize) -> Vec<T> {
+    receiver.try_iter().take(limit).collect()
 }
 
 impl Drop for PlaybackHandle {
@@ -402,7 +438,7 @@ fn prepare_transcode(
             local_ip_for(options.receiver, options.cast_port)?,
             options.http_port,
         );
-        let sender = events.clone();
+        let mut progress_events = PreparationProgressEmitter::new(events.clone());
         let preparation = IncrementalHlsPreparation::start(
             path.to_owned(),
             info.clone(),
@@ -411,10 +447,7 @@ fn prepare_transcode(
             private_route()?,
             0.0,
             move |progress| {
-                let _ = sender.send(PlaybackEvent::Preparing {
-                    stage: PreparationStage::Transcoding,
-                    percent: Some(progress.percent),
-                });
+                progress_events.report(progress.percent);
             },
         )?;
         preparation.wait_until_playable(0.0, cancel, PREPARATION_TIMEOUT)?;
@@ -429,7 +462,7 @@ fn prepare_transcode(
         })
     } else {
         let (directory, output) = media::temporary_mp4_path()?;
-        let sender = events.clone();
+        let mut progress_events = PreparationProgressEmitter::new(events.clone());
         media::transcode_to_mp4_with_tracks(
             path,
             &output,
@@ -437,10 +470,7 @@ fn prepare_transcode(
             tracks,
             cancel,
             move |progress| {
-                let _ = sender.send(PlaybackEvent::Preparing {
-                    stage: PreparationStage::Transcoding,
-                    percent: Some(progress.percent),
-                });
+                progress_events.report(progress.percent);
                 Ok(())
             },
         )?;
@@ -594,5 +624,22 @@ mod tests {
             classify_error(&anyhow!("transcode failed")).kind,
             MediaFailureKind::Decode
         );
+    }
+
+    #[test]
+    fn progress_rate_and_per_tick_drain_are_bounded_under_load() {
+        let (sender, receiver) = mpsc::channel();
+        let mut progress = PreparationProgressEmitter::new(sender);
+        let started = Instant::now();
+        for index in 0_u32..1_000 {
+            progress.report_at(
+                f64::from(index) / 10.0,
+                started + Duration::from_millis(u64::from(index)),
+            );
+        }
+        let first_tick = drain_receiver(&receiver, 4);
+        assert_eq!(first_tick.len(), 4);
+        let remaining = drain_receiver(&receiver, usize::MAX);
+        assert!(remaining.len() <= 7);
     }
 }

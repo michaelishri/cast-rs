@@ -43,6 +43,7 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 18;
 const LOG_CAPACITY: usize = 500;
+const MAX_PLAYBACK_EVENTS_PER_TICK: usize = 16;
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3g2", "3gp", "asf", "avi", "f4v", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg",
     "mpg", "mts", "ogm", "ogv", "ts", "vob", "webm", "wmv",
@@ -444,7 +445,7 @@ impl App {
     fn poll_playback(&mut self) {
         let mut terminal_event = None;
         if let Some(playback) = &self.playback {
-            while let Ok(event) = playback.try_recv() {
+            for event in playback.drain_events(MAX_PLAYBACK_EVENTS_PER_TICK) {
                 match event {
                     PlaybackEvent::Preparing { stage, percent } => {
                         self.preparation = Some((stage, percent));
