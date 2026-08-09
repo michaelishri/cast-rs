@@ -1500,7 +1500,8 @@ dependencies = [
 
 [[package]]
 name = "rust_cast"
-version = "0.21.0"
+version = "0.22.0"
+source = "git+https://github.com/michaelishri/rust-cast.git?rev=fd0d04321901c81c2521126bf45cd17be164adc4#fd0d04321901c81c2521126bf45cd17be164adc4"
 dependencies = [
  "byteorder",
  "log",
