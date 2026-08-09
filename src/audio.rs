@@ -22,6 +22,156 @@ pub const RTP_PAYLOAD_TYPE: u8 = 97;
 const AUDIO_QUEUE_CAPACITY: usize = 64;
 const AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
 const MAX_CONTINUOUS_SILENCE_SAMPLES: u64 = SAMPLE_RATE as u64 * 2;
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const VOLUME_EPSILON: f32 = 0.001;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalOutputControl {
+    Volume(f32),
+    ToggleMute,
+}
+
+pub struct LocalOutputRedirect {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<()>>>,
+}
+
+impl LocalOutputRedirect {
+    pub fn start<F>(mut control: F) -> Result<Self>
+    where
+        F: FnMut(LocalOutputControl) + Send + 'static,
+    {
+        let snapshot = output_snapshot()?;
+        let mut tracker = OutputTracker::new(snapshot)?;
+        tracker.suppress()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("desktop-local-audio-redirect".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::SeqCst) {
+                    thread::sleep(OUTPUT_POLL_INTERVAL);
+                    let snapshot = match output_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            log::warn!("could not inspect the local audio output: {error:#}");
+                            continue;
+                        }
+                    };
+                    if snapshot.device_id != tracker.original.device_id {
+                        tracker.restore()?;
+                        tracker = match OutputTracker::new(snapshot) {
+                            Ok(tracker) => tracker,
+                            Err(error) => {
+                                log::warn!(
+                                    "new local audio output cannot be redirected: {error:#}"
+                                );
+                                return Ok(());
+                            }
+                        };
+                        tracker.suppress()?;
+                        continue;
+                    }
+                    let (events, needs_suppress) = tracker.observe(snapshot);
+                    for event in events {
+                        control(event);
+                    }
+                    if needs_suppress && let Err(error) = set_output_muted(snapshot.device_id, true)
+                    {
+                        log::warn!("could not keep the local audio output muted: {error:#}");
+                    }
+                }
+                tracker.restore()
+            })
+            .context("could not start local audio redirect worker")?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn stop(mut self) -> Result<()> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::SeqCst);
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| anyhow!("local audio redirect worker panicked"))?
+    }
+}
+
+impl Drop for LocalOutputRedirect {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            log::warn!("could not restore the local audio output: {error:#}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputSnapshot {
+    device_id: u32,
+    volume: Option<f32>,
+    muted: Option<bool>,
+}
+
+struct OutputTracker {
+    original: OutputSnapshot,
+    observed_volume: Option<f32>,
+}
+
+impl OutputTracker {
+    fn new(snapshot: OutputSnapshot) -> Result<Self> {
+        if snapshot.muted.is_none() {
+            bail!("the default output device does not expose a controllable mute state");
+        }
+        Ok(Self {
+            original: snapshot,
+            observed_volume: snapshot.volume,
+        })
+    }
+
+    fn suppress(&mut self) -> Result<()> {
+        set_output_muted(self.original.device_id, true)
+    }
+
+    fn observe(&mut self, snapshot: OutputSnapshot) -> (Vec<LocalOutputControl>, bool) {
+        let mut controls = Vec::with_capacity(2);
+        let mut volume_changed = false;
+        if let (Some(previous), Some(volume)) = (self.observed_volume, snapshot.volume)
+            && (volume - previous).abs() >= VOLUME_EPSILON
+        {
+            self.observed_volume = Some(volume);
+            volume_changed = true;
+            controls.push(LocalOutputControl::Volume(volume.clamp(0.0, 1.0)));
+        }
+        if snapshot.muted == Some(false) && !volume_changed {
+            controls.push(LocalOutputControl::ToggleMute);
+        }
+        (controls, snapshot.muted == Some(false))
+    }
+
+    fn restore(&self) -> Result<()> {
+        let mut first = None;
+        if let Some(volume) = self.original.volume
+            && let Err(error) = set_output_volume(self.original.device_id, volume)
+        {
+            first = Some(error);
+        }
+        if let Some(muted) = self.original.muted
+            && let Err(error) = set_output_muted(self.original.device_id, muted)
+            && first.is_none()
+        {
+            first = Some(error);
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
 
 pub struct PreparedAudioEncoder(AacEncoder);
 
@@ -391,6 +541,16 @@ fn store_failure(failure: &Mutex<Option<String>>, message: &str) {
 #[repr(C)]
 struct NativeAacEncoder(c_void);
 
+#[repr(C)]
+#[derive(Default)]
+struct NativeAudioOutputState {
+    device_id: u32,
+    volume: f32,
+    muted: u32,
+    has_volume: u32,
+    has_mute: u32,
+}
+
 unsafe extern "C" {
     fn cast_aac_encoder_create(
         sample_rate: u32,
@@ -408,6 +568,38 @@ unsafe extern "C" {
         output_length: *mut u32,
     ) -> i32;
     fn cast_aac_encoder_destroy(encoder: *mut NativeAacEncoder);
+    fn cast_audio_output_snapshot(state: *mut NativeAudioOutputState) -> i32;
+    fn cast_audio_output_set_volume(device_id: u32, volume: f32) -> i32;
+    fn cast_audio_output_set_muted(device_id: u32, muted: u32) -> i32;
+}
+
+fn output_snapshot() -> Result<OutputSnapshot> {
+    let mut state = NativeAudioOutputState::default();
+    let status = unsafe { cast_audio_output_snapshot(&mut state) };
+    if status != 0 {
+        bail!("CoreAudio could not inspect the default output device ({status})");
+    }
+    Ok(OutputSnapshot {
+        device_id: state.device_id,
+        volume: (state.has_volume != 0).then_some(state.volume),
+        muted: (state.has_mute != 0).then_some(state.muted != 0),
+    })
+}
+
+fn set_output_volume(device_id: u32, volume: f32) -> Result<()> {
+    let status = unsafe { cast_audio_output_set_volume(device_id, volume.clamp(0.0, 1.0)) };
+    if status != 0 {
+        bail!("CoreAudio could not restore the local output volume ({status})");
+    }
+    Ok(())
+}
+
+fn set_output_muted(device_id: u32, muted: bool) -> Result<()> {
+    let status = unsafe { cast_audio_output_set_muted(device_id, u32::from(muted)) };
+    if status != 0 {
+        bail!("CoreAudio could not update the local output mute state ({status})");
+    }
+    Ok(())
 }
 
 struct AacEncoder {
@@ -511,5 +703,42 @@ mod tests {
         assert_eq!(clock.ticks(CMTime::new(10, 1), 90_000), Some(0));
         assert_eq!(clock.ticks(CMTime::new(21, 2), 48_000), Some(24_000));
         assert_eq!(clock.ticks(CMTime::new(11, 1), 90_000), Some(90_000));
+    }
+
+    #[test]
+    fn output_tracker_forwards_volume_changes_and_reasserts_local_mute() {
+        let original = OutputSnapshot {
+            device_id: 7,
+            volume: Some(0.4),
+            muted: Some(false),
+        };
+        let mut tracker = OutputTracker::new(original).unwrap();
+        let (controls, needs_suppress) = tracker.observe(OutputSnapshot {
+            device_id: 7,
+            volume: Some(0.55),
+            muted: Some(false),
+        });
+        assert_eq!(controls, vec![LocalOutputControl::Volume(0.55)]);
+        assert!(needs_suppress);
+
+        let (controls, needs_suppress) = tracker.observe(OutputSnapshot {
+            device_id: 7,
+            volume: Some(0.55),
+            muted: Some(false),
+        });
+        assert_eq!(controls, vec![LocalOutputControl::ToggleMute]);
+        assert!(needs_suppress);
+    }
+
+    #[test]
+    fn output_tracker_rejects_devices_without_mute_control() {
+        let error = OutputTracker::new(OutputSnapshot {
+            device_id: 7,
+            volume: Some(0.4),
+            muted: None,
+        })
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("controllable mute"));
     }
 }

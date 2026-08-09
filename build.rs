@@ -4,6 +4,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=native/virtual_display.m");
         println!("cargo:rerun-if-changed=native/audio_encoder.c");
+        println!("cargo:rerun-if-changed=native/audio_output.c");
         if std::env::var("DOCS_RS").as_deref() != Ok("1") {
             cc::Build::new()
                 .file("native/virtual_display.m")
@@ -12,9 +13,13 @@ fn main() {
             cc::Build::new()
                 .file("native/audio_encoder.c")
                 .compile("cast_audio_encoder");
+            cc::Build::new()
+                .file("native/audio_output.c")
+                .compile("cast_audio_output");
         }
         println!("cargo:rustc-link-lib=framework=AppKit");
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=Foundation");
 
