@@ -44,6 +44,11 @@ const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 18;
 const LOG_CAPACITY: usize = 500;
 const MAX_PLAYBACK_EVENTS_PER_TICK: usize = 16;
+const MAX_TERMINAL_EVENTS_PER_TICK: usize = 64;
+const PRESS_DEBOUNCE: Duration = Duration::from_millis(30);
+const NAVIGATION_REPEAT_INTERVAL: Duration = Duration::from_millis(50);
+const VOLUME_REPEAT_INTERVAL: Duration = Duration::from_millis(125);
+const SEEK_REPEAT_INTERVAL: Duration = Duration::from_millis(250);
 const VIDEO_EXTENSIONS: &[&str] = &[
     "3g2", "3gp", "asf", "avi", "f4v", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg",
     "mpg", "mts", "ogm", "ogv", "ts", "vob", "webm", "wmv",
@@ -68,6 +73,44 @@ enum Focus {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PlayerKeyAction {
     Seek(f32),
+}
+
+#[derive(Debug, Default)]
+struct KeyDebouncer {
+    last_accepted: Option<(KeyCode, KeyModifiers, Instant)>,
+}
+
+impl KeyDebouncer {
+    fn accept(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        let repeat_interval = key_repeat_interval(key.code);
+        if key.kind == KeyEventKind::Repeat && repeat_interval.is_none() {
+            return false;
+        }
+        let interval = repeat_interval.unwrap_or(PRESS_DEBOUNCE);
+        if self
+            .last_accepted
+            .as_ref()
+            .is_some_and(|(code, modifiers, accepted)| {
+                *code == key.code
+                    && *modifiers == key.modifiers
+                    && now.saturating_duration_since(*accepted) < interval
+            })
+        {
+            return false;
+        }
+        self.last_accepted = Some((key.code, key.modifiers, now));
+        true
+    }
+
+    fn release(&mut self, key: &KeyEvent) {
+        if self
+            .last_accepted
+            .as_ref()
+            .is_some_and(|(code, modifiers, _)| *code == key.code && *modifiers == key.modifiers)
+        {
+            self.last_accepted = None;
+        }
+    }
 }
 
 impl Focus {
@@ -343,6 +386,7 @@ struct App {
     log_scroll: usize,
     regions: Regions,
     last_click: Option<LastClick>,
+    key_debouncer: KeyDebouncer,
     shift_held: bool,
     shift_hint_until: Option<Instant>,
     quit: bool,
@@ -385,6 +429,7 @@ impl App {
             log_scroll: 0,
             regions: Regions::default(),
             last_click: None,
+            key_debouncer: KeyDebouncer::default(),
             shift_held: false,
             shift_hint_until: None,
             quit: false,
@@ -574,9 +619,17 @@ impl App {
     }
 
     fn adjust_volume(&mut self, delta: f32) {
+        let level = (self.volume.level.unwrap_or(0.5) + delta).clamp(0.0, 1.0);
+        self.set_volume(level);
+    }
+
+    fn set_volume(&mut self, level: f32) {
+        let level = level.clamp(0.0, 1.0);
         if let Some(playback) = &self.playback {
-            let level = self.volume.level.unwrap_or(0.5) + delta;
-            let _ = playback.set_volume(level.clamp(0.0, 1.0));
+            self.volume.level = Some(level);
+            if let Err(error) = playback.set_volume(level) {
+                self.status = format!("Receiver volume control failed: {error:#}");
+            }
         }
     }
 
@@ -634,6 +687,10 @@ impl App {
             return;
         }
         if key.kind == KeyEventKind::Release {
+            self.key_debouncer.release(&key);
+            return;
+        }
+        if !self.key_debouncer.accept(&key, Instant::now()) {
             return;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -874,9 +931,7 @@ impl App {
         if self.regions.volume.contains(point) {
             let ratio = f32::from(point.x.saturating_sub(self.regions.volume.x))
                 / f32::from(self.regions.volume.width.max(1));
-            if let Some(playback) = &self.playback {
-                let _ = playback.set_volume(ratio);
-            }
+            self.set_volume(ratio);
             return;
         }
         if self.regions.receiver.contains(point) {
@@ -1067,16 +1122,30 @@ pub fn run(options: TuiOptions, log_receiver: Receiver<String>) -> Result<()> {
     while !app.quit {
         app.tick(&log_receiver);
         terminal.terminal.draw(|frame| render(frame, &mut app))?;
-        if event::poll(TICK).context("could not poll terminal events")? {
-            match event::read().context("could not read terminal event")? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
-            }
-        }
+        process_terminal_events(&mut app)?;
     }
     app.stop_playback();
     terminal.restore()
+}
+
+fn process_terminal_events(app: &mut App) -> Result<()> {
+    if !event::poll(TICK).context("could not poll terminal events")? {
+        return Ok(());
+    }
+    for index in 0..MAX_TERMINAL_EVENTS_PER_TICK {
+        match event::read().context("could not read terminal event")? {
+            Event::Key(key) => app.handle_key(key),
+            Event::Mouse(mouse) => app.handle_mouse(mouse),
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        }
+        if app.quit
+            || index + 1 == MAX_TERMINAL_EVENTS_PER_TICK
+            || !event::poll(Duration::ZERO).context("could not poll pending terminal events")?
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -1462,6 +1531,20 @@ fn volume_key_delta(character: char) -> Option<f32> {
     }
 }
 
+fn key_repeat_interval(code: KeyCode) -> Option<Duration> {
+    match code {
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => Some(NAVIGATION_REPEAT_INTERVAL),
+        KeyCode::Char('+' | '=' | '-') => Some(VOLUME_REPEAT_INTERVAL),
+        KeyCode::Left | KeyCode::Right => Some(SEEK_REPEAT_INTERVAL),
+        _ => None,
+    }
+}
+
 fn move_index(current: usize, length: usize, amount: isize) -> usize {
     if length == 0 {
         return 0;
@@ -1604,6 +1687,54 @@ mod tests {
         assert_eq!(volume_key_delta('='), Some(0.05));
         assert_eq!(volume_key_delta('-'), Some(-0.05));
         assert_eq!(volume_key_delta('m'), None);
+    }
+
+    #[test]
+    fn held_keys_are_throttled_by_action_and_one_shot_repeats_are_ignored() {
+        let start = Instant::now();
+        let mut debouncer = KeyDebouncer::default();
+        let volume_press = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT);
+        let volume_repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('+'),
+            KeyModifiers::SHIFT,
+            KeyEventKind::Repeat,
+        );
+        assert!(debouncer.accept(&volume_press, start));
+        assert!(!debouncer.accept(&volume_press, start + Duration::from_millis(10)));
+        assert!(!debouncer.accept(&volume_repeat, start + Duration::from_millis(50)));
+        assert!(debouncer.accept(&volume_repeat, start + VOLUME_REPEAT_INTERVAL));
+
+        let seek_repeat =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(debouncer.accept(&seek_repeat, start));
+        assert!(!debouncer.accept(&seek_repeat, start + Duration::from_millis(200)));
+
+        let toggle_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(!debouncer.accept(&toggle_repeat, start));
+
+        let mut navigation = KeyDebouncer::default();
+        let down_repeat =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(navigation.accept(&down_repeat, start));
+        assert!(!navigation.accept(&down_repeat, start + Duration::from_millis(25)));
+        assert!(navigation.accept(&down_repeat, start + NAVIGATION_REPEAT_INTERVAL));
+    }
+
+    #[test]
+    fn key_release_allows_an_immediate_second_press() {
+        let now = Instant::now();
+        let mut debouncer = KeyDebouncer::default();
+        let press = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(debouncer.accept(&press, now));
+        assert!(!debouncer.accept(&press, now));
+        debouncer.release(&release);
+        assert!(debouncer.accept(&press, now));
     }
 
     #[test]
