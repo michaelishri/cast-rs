@@ -3003,9 +3003,7 @@ fn answer_display_frame_rate(display: &Value) -> Option<u32> {
     match value {
         Value::Number(number) => number.as_u64()?.try_into().ok(),
         Value::String(value) => {
-            let (numerator, denominator) = value
-                .split_once('/')
-                .map_or((value.as_str(), "1"), |parts| parts);
+            let (numerator, denominator) = value.split_once('/').unwrap_or((value.as_str(), "1"));
             let numerator = numerator.parse::<u32>().ok()?;
             let denominator = denominator.parse::<u32>().ok()?.max(1);
             Some(numerator.div_ceil(denominator))

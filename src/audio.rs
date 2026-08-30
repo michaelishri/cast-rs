@@ -368,8 +368,10 @@ fn decode_f32(bytes: &[u8], frames: usize) -> Result<Vec<f32>> {
         bail!("captured audio buffer is truncated");
     }
     Ok(bytes[..needed]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect())
 }
 
@@ -377,7 +379,7 @@ fn decode_interleaved_stereo(bytes: &[u8], frames: usize) -> Result<(Vec<f32>, V
     let values = decode_f32(bytes, frames.saturating_mul(2))?;
     let mut left = Vec::with_capacity(frames);
     let mut right = Vec::with_capacity(frames);
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         left.push(pair[0]);
         right.push(pair[1]);
     }

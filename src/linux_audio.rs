@@ -195,7 +195,7 @@ impl AudioPipeline {
         let trim = usize::try_from(self.next_sample.saturating_sub(timestamp))
             .unwrap_or(frames)
             .min(frames);
-        for pair in pcm.chunks_exact(CHANNELS as usize).skip(trim) {
+        for pair in pcm.as_chunks::<{ CHANNELS as usize }>().0.iter().skip(trim) {
             self.left.push_back(pair[0]);
             self.right.push_back(pair[1]);
         }
@@ -637,8 +637,10 @@ fn copy_pipewire_audio(
         bail!("PipeWire audio buffer does not contain whole stereo frames");
     }
     let pcm = bytes
-        .chunks_exact(mem::size_of::<f32>())
-        .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+        .as_chunks::<{ mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|sample| f32::from_le_bytes(*sample))
         .collect::<Vec<_>>();
     let frames = u64::try_from(pcm.len() / CHANNELS as usize).unwrap_or(u64::MAX);
     let timestamp = data.sample_cursor.unwrap_or_else(|| {
