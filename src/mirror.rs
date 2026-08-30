@@ -581,8 +581,7 @@ fn print_auto_tune_report(base: &MirrorOptions, trials: &[AutoTuneTrial]) {
         "\nScore = p95 + 25% of the p95→p99 tail + 10 ms per retransmission percentage point + 2 ms per raw-drop percentage point + 2 ms per frame-rate shortfall percentage point."
     );
     println!(
-        "Settings within {:.0} ms are treated as measurement noise, with fewer non-default controls preferred.",
-        AUTO_TUNE_NOISE_MARGIN_MS
+        "Settings within {AUTO_TUNE_NOISE_MARGIN_MS:.0} ms are treated as measurement noise, with fewer non-default controls preferred."
     );
     println!("Winner: {} ({})", winner.name, winner.config.description());
     if winner.result.requested_fps != winner.result.effective_fps {

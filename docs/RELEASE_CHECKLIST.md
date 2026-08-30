@@ -146,8 +146,8 @@ patch release; do not move or replace a published tag.
   gh run watch "$RELEASE_RUN" --repo "$UPSTREAM" --exit-status --interval 10
   ```
 
-- [ ] Verify the non-draft, non-prerelease GitHub release has the four expected archives:
-      macOS `arm64`/`x86_64` and Linux `aarch64`/`x86_64`, with one checksum per archive and an
+- [ ] Verify the non-draft, non-prerelease GitHub release has all ten expected assets: macOS
+      `arm64`/`x86_64` and Linux `aarch64`/`x86_64` archives, one checksum per archive, and an
       `ldd` audit for each Linux archive.
 
   ```sh
@@ -170,7 +170,8 @@ patch release; do not move or replace a published tag.
   ```
 
 - [ ] Complete [the Linux release matrix](LINUX_VALIDATION.md) on the tagged archives. The release
-      workflow performs the native Ubuntu 22.04 x86_64/aarch64 archive smoke tests; record the
+      workflow performs native x86_64 and aarch64 archive smoke tests; the x86_64 build establishes
+      the Ubuntu 22.04/glibc 2.35 floor, while the hosted aarch64 build uses Ubuntu 24.04. Record the
       GNOME/KDE and real-device results in the release issue before calling Linux support complete.
 
 ## 4. Update the Homebrew formula

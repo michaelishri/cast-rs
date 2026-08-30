@@ -1,6 +1,6 @@
 # Linux release validation
 
-Run this matrix for a release candidate built by `.github/workflows/release.yml`. The ordinary CI workflow uses the same `scripts/package-linux-release.sh` path before release and retains the x86_64/aarch64 archives, checksums, and `ldd` reports as `validation-linux-*` artifacts. Linux source checks compile against both the Ubuntu 22.04 header floor and Ubuntu 24.04 current-header baseline. Desktop rows require real GNOME and KDE Wayland sessions plus a Cast video receiver; do not substitute X11.
+Run this matrix for a release candidate built by `.github/workflows/release.yml`. The ordinary CI workflow uses the same `scripts/package-linux-release.sh` path before release and retains the x86_64/aarch64 archives, checksums, and `ldd` reports as `validation-linux-*` artifacts. Linux source checks compile against both the Ubuntu 22.04 header floor and Ubuntu 24.04 current-header baseline. The native aarch64 archive uses GitHub's supported Ubuntu 24.04 ARM64 image; the x86_64 Ubuntu 22.04 job establishes the glibc 2.35 binary floor. Desktop rows require real GNOME and KDE Wayland sessions plus a Cast video receiver; do not substitute X11.
 
 ## Automated release gate
 
