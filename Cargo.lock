@@ -306,6 +306,7 @@ dependencies = [
  "ffmpeg-next",
  "futures-lite",
  "getrandom 0.4.3",
+ "libc",
  "libloading",
  "log",
  "mdns-sd",

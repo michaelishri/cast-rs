@@ -14,10 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
-    linux_capture::{CapturedFrame, CursorImage, FrameSink, RunningCapture},
+    linux_capture::{CaptureEpoch, CapturedFrame, CursorImage, FrameSink, start_desktop_capture},
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
-    portal::{PipeWireCapture, PortalSourceKind},
 };
 
 pub(crate) struct CaptureOptions {
@@ -32,7 +31,6 @@ pub(crate) struct CaptureOptions {
 }
 
 pub(crate) fn capture(options: CaptureOptions) -> Result<()> {
-    let selection = crate::portal::select(PortalSourceKind::Normal, options.force_chooser)?;
     let writer = BufWriter::new(
         File::create(&options.output)
             .with_context(|| format!("could not create {}", options.output.display()))?,
@@ -58,7 +56,15 @@ pub(crate) fn capture(options: CaptureOptions) -> Result<()> {
         "cast-linux-capture-encoder",
     )?;
     let sink: Arc<dyn FrameSink> = Arc::new(PortalFrameSubmitter { submitter });
-    let mut capture = RunningCapture::new(PipeWireCapture::start(selection, sink)?);
+    let mut capture = start_desktop_capture(
+        None,
+        options.backend,
+        options.display,
+        options.force_chooser,
+        options.fps,
+        sink,
+        CaptureEpoch::new(),
+    )?;
     println!(
         "Capturing {} at up to {} fps for {}s...",
         capture.source_description(),

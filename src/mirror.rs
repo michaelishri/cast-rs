@@ -61,13 +61,16 @@ use crate::synthetic::SyntheticFrameGenerator;
 use crate::virtual_display::VirtualDisplaySession;
 #[cfg(target_os = "linux")]
 use crate::{
-    linux_capture::{CaptureEpoch, CapturedFrame, FrameSink, RunningCapture},
+    linux_capture::{
+        CaptureEpoch, CapturedFrame, FrameSink, RunningCapture, start_desktop_capture,
+        validate_source_options,
+    },
     linux_desktop::composite_cursor,
     linux_encoder::{
         EncodingPriority, LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame,
     },
     media::H264Provider,
-    portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
+    portal::{PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
@@ -141,6 +144,8 @@ fn validate_cast_hosts(hosts: &[IpAddr]) -> Result<()> {
 pub fn cast_desktop(options: MirrorOptions) -> Result<()> {
     validate_cast_hosts(&options.cast_hosts)?;
     #[cfg(target_os = "linux")]
+    preflight_linux_capture(&options)?;
+    #[cfg(target_os = "linux")]
     preflight_linux_encoder(&options)?;
     let interrupted = install_interrupt_handler()?;
     if options.extend && options.cast_hosts.len() > 1 {
@@ -173,6 +178,8 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
         bail!("latency profiling requires a fixed duration");
     }
     #[cfg(target_os = "linux")]
+    preflight_linux_capture(&options)?;
+    #[cfg(target_os = "linux")]
     preflight_linux_encoder(&options)?;
     let interrupted = install_interrupt_handler()?;
     if auto_tune {
@@ -199,6 +206,19 @@ pub fn profile_desktop(options: MirrorOptions, auto_tune: bool) -> Result<()> {
         )
         .map(|_| ())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_linux_capture(options: &MirrorOptions) -> Result<()> {
+    if !options.synthetic {
+        validate_source_options(
+            options.capture_backend,
+            options.display_name.as_deref(),
+            options.select_source,
+            options.extend,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -961,6 +981,17 @@ fn run_desktop(
     if options.extend && options.synthetic {
         bail!("--extend cannot be combined with --synthetic");
     }
+    #[cfg(target_os = "linux")]
+    let capture_backend = if options.synthetic {
+        None
+    } else {
+        Some(validate_source_options(
+            options.capture_backend,
+            options.display_name.as_deref(),
+            options.select_source,
+            options.extend,
+        )?)
+    };
     let prepared_audio = if options.audio && {
         #[cfg(target_os = "linux")]
         {
@@ -999,11 +1030,14 @@ fn run_desktop(
         (false, display) => display,
     };
     #[cfg(target_os = "linux")]
-    if virtual_display.is_none() && !options.synthetic {
+    if virtual_display.is_none()
+        && !options.synthetic
+        && capture_backend == Some(crate::linux_x11::Backend::Portal)
+    {
         // Complete the privacy/capability preflight before launching a Cast
         // receiver. Ownership moves into PipeWireCapture after negotiation.
         virtual_display = Some(crate::portal::select(
-            PortalSourceKind::Normal,
+            crate::portal::PortalSourceKind::Normal,
             options.select_source,
         )?);
     }
@@ -1382,13 +1416,16 @@ fn run_desktop(
         }
         #[cfg(target_os = "linux")]
         {
-            let selection = match virtual_display.take() {
-                Some(selection) => selection,
-                None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
-            };
             let sink: Arc<dyn FrameSink> = Arc::new(MirrorPortalSink { submitter });
-            let capture =
-                RunningCapture::new(PipeWireCapture::start_at(selection, sink, capture_epoch)?);
+            let capture = start_desktop_capture(
+                virtual_display.take(),
+                options.capture_backend,
+                options.display_name.clone(),
+                options.select_source,
+                options.fps,
+                sink,
+                capture_epoch,
+            )?;
             let source_description = capture.source_description();
             match mode {
                 RunMode::Cast => println!(

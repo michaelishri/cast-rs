@@ -479,10 +479,6 @@ pub(crate) struct PipeWireCapture {
 }
 
 impl PipeWireCapture {
-    pub(crate) fn start(selection: PortalSelection, sink: Arc<dyn FrameSink>) -> Result<Self> {
-        Self::start_at(selection, sink, CaptureEpoch::new())
-    }
-
     pub(crate) fn start_at(
         mut selection: PortalSelection,
         sink: Arc<dyn FrameSink>,

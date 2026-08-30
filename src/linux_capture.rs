@@ -7,6 +7,10 @@ use std::{
 use anyhow::Result;
 
 use crate::linux_encoder::RawPixelFormat;
+use crate::{
+    linux_x11::{Backend, BackendPreference, DisplayConnection, X11Capture, resolve_backend},
+    portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
+};
 
 /// Monotonic epoch shared by every media stream in one Linux desktop session.
 #[derive(Clone)]
@@ -89,6 +93,67 @@ pub(crate) struct CapturedFrame {
 
 pub(crate) trait FrameSink: Send + Sync + 'static {
     fn submit(&self, frame: CapturedFrame);
+}
+
+pub(crate) fn validate_source_options(
+    preference: BackendPreference,
+    display_name: Option<&str>,
+    force_chooser: bool,
+    extend: bool,
+) -> Result<Backend> {
+    let backend = resolve_backend(preference)?;
+    match backend {
+        Backend::X11 => {
+            if force_chooser {
+                anyhow::bail!("--select-source is available only with --backend portal");
+            }
+            if extend {
+                anyhow::bail!(
+                    "--extend is not supported by the X11 backend; use --backend portal or omit --extend"
+                );
+            }
+            DisplayConnection::connect()?.select_monitor(display_name)?;
+        }
+        Backend::Portal if display_name.is_some() => {
+            anyhow::bail!("--display is available only with --backend x11");
+        }
+        Backend::Portal => {}
+    }
+    Ok(backend)
+}
+
+pub(crate) fn start_desktop_capture(
+    preselected_portal: Option<PortalSelection>,
+    preference: BackendPreference,
+    display_name: Option<String>,
+    force_chooser: bool,
+    fps: u32,
+    sink: Arc<dyn FrameSink>,
+    capture_epoch: CaptureEpoch,
+) -> Result<RunningCapture> {
+    if let Some(selection) = preselected_portal {
+        return Ok(RunningCapture::new(PipeWireCapture::start_at(
+            selection,
+            sink,
+            capture_epoch,
+        )?));
+    }
+    match validate_source_options(preference, display_name.as_deref(), force_chooser, false)? {
+        Backend::X11 => Ok(RunningCapture::new(X11Capture::start(
+            display_name,
+            fps,
+            sink,
+            capture_epoch,
+        )?)),
+        Backend::Portal => {
+            let selection = crate::portal::select(PortalSourceKind::Normal, force_chooser)?;
+            Ok(RunningCapture::new(PipeWireCapture::start_at(
+                selection,
+                sink,
+                capture_epoch,
+            )?))
+        }
+    }
 }
 
 pub(crate) trait CaptureBackend {

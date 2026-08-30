@@ -43,11 +43,14 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
-    linux_capture::{CaptureEpoch, CapturedFrame, FrameSink, RunningCapture},
+    linux_capture::{
+        CaptureEpoch, CapturedFrame, FrameSink, RunningCapture, start_desktop_capture,
+        validate_source_options,
+    },
     linux_desktop::composite_cursor,
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
-    portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
+    portal::{PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
@@ -95,6 +98,13 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
+    #[cfg(target_os = "linux")]
+    validate_source_options(
+        options.capture_backend,
+        options.display_name.as_deref(),
+        options.select_source,
+        options.extend,
+    )?;
     #[cfg(target_os = "linux")]
     LinuxVideoEncoder::preflight(
         options.provider,
@@ -983,10 +993,6 @@ impl LiveCapture {
         audio_submitter: Option<AudioSubmitter>,
         capture_epoch: CaptureEpoch,
     ) -> Result<Self> {
-        let selection = match extended_display {
-            Some(selection) => selection,
-            None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
-        };
         let pipeline = LinuxLivePipeline {
             encoder: None,
             muxer: None,
@@ -1014,8 +1020,15 @@ impl LiveCapture {
         let (sink, cadence) =
             LinuxFrameCadence::start(submitter, options.fps, Arc::clone(&failure))?;
         let sink: Arc<dyn FrameSink> = Arc::new(sink);
-        let capture =
-            RunningCapture::new(PipeWireCapture::start_at(selection, sink, capture_epoch)?);
+        let capture = start_desktop_capture(
+            extended_display,
+            options.capture_backend,
+            options.display_name.clone(),
+            options.select_source,
+            options.fps,
+            sink,
+            capture_epoch,
+        )?;
         println!(
             "Capturing {} into {}x{}, {} fps HLS...",
             capture.source_description(),
