@@ -25,7 +25,7 @@ Repeat applicable portal rows on current GNOME Wayland and KDE Plasma Wayland, a
 | --- | --- |
 | Encoder | `auto`, explicit NVENC, explicit VA-API, explicit OpenH264; unavailable explicit providers fail before receiver startup |
 | Source | remembered normal source, `--select-source`, portal denial, expired restore token, window and monitor, `--extend` capability success/failure |
-| X11 source | auto detection, explicit `--backend x11`, primary and named RandR monitors, invalid name, missing DISPLAY/Xauthority, MIT-SHM and core GetImage fallback, `--extend` temporary output creation and cleanup |
+| X11 source | auto detection, explicit `--backend x11`, primary and named RandR monitors, invalid name, missing DISPLAY/Xauthority, MIT-SHM and core GetImage fallback, `--extend` prepared-output mode change and cleanup |
 | Mirror | audio on/off, one receiver, receiver group, extended receiver group, adaptive and `--fixed-bitrate`, speed-default and `--quality-priority` encoder/scaler paths |
 | HLS | audio on/off, one/multiple receivers, normal/extended sources |
 | Diagnostics | `displays`, `capture`, normal `profile`, synthetic profile and synthetic `--auto-tune` |
@@ -33,6 +33,6 @@ Repeat applicable portal rows on current GNOME Wayland and KDE Plasma Wayland, a
 | Cleanup | normal exit, Ctrl-C, portal close, forced capture/encoder/network failure, panic harness; verify source sessions close and output state restores |
 | Codec setup | interactive denial, `--yes`, `--check`, corrupt/missing module, checksum failure, non-interactive missing-codec path |
 
-For X11 `--extend`, record the GPU/Xorg driver, connector and CRTC chosen, generated mode, expanded framebuffer geometry, and final restored geometry. Exercise normal exit, Ctrl-C, partial multi-output startup, outputs ending in a different order, and a real display hotplug where available. Confirm that unsupported drivers or exhausted connectors/CRTCs fail without leaving a temporary mode or enlarged framebuffer.
+For X11 `--extend`, record the GPU/Xorg driver, DRM and X11 connector names, provider capabilities, CRTC chosen, prepared mode, generated mode, expanded framebuffer geometry, and final restored geometry. Exercise normal exit, Ctrl-C, partial multi-output startup, outputs ending in a different order, and a real display hotplug where available. Confirm that a disconnected connector, a physically sized/primary output, a cross-GPU sink-provider output, an already-claimed output, and exhausted connectors/CRTCs fail without leaving a temporary mode or enlarged framebuffer. Capture a distinctive window on the extended output and verify the decoded frame is not black, sliced, or repeated before performing the receiver test.
 
 Wayland-native capture outside the existing portal path and V4L2 M2M encoding are explicitly unsupported. File playback and the TUI remain usable when their other system requirements are met.

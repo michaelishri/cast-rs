@@ -4,7 +4,7 @@ use std::{
     os::fd::AsRawFd,
     ptr::NonNull,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -16,8 +16,8 @@ use x11rb::{
     connection::{Connection, RequestConnection},
     protocol::{
         randr::{
-            Connection as RandrConnection, ConnectionExt as _, ModeFlag, ModeInfo, Rotation,
-            SetConfig,
+            Connection as RandrConnection, ConnectionExt as _, ModeFlag, ModeInfo,
+            ProviderCapability, Rotation, SetConfig,
         },
         shm::{self, ConnectionExt as _},
         xfixes::ConnectionExt as _,
@@ -35,6 +35,33 @@ use crate::{
 
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 static X11_LAYOUT: Mutex<()> = Mutex::new(());
+static X11_CLAIMS: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct OutputClaim {
+    output: u32,
+    armed: bool,
+}
+
+impl OutputClaim {
+    fn new(output: u32) -> Self {
+        Self {
+            output,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutputClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            release_output_claim(self.output);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum BackendPreference {
@@ -153,13 +180,23 @@ impl DisplayConnection {
     }
 }
 
-/// A temporary RandR output used as an off-screen extended desktop.
+#[derive(Clone)]
+struct SavedCrtc {
+    x: i16,
+    y: i16,
+    mode: u32,
+    rotation: Rotation,
+    outputs: Vec<u32>,
+}
+
+/// A temporary mode on a DRM-forced, same-GPU headless RandR output.
 pub(crate) struct X11VirtualDisplay {
     display: DisplayConnection,
     output: u32,
     crtc: u32,
     mode: u32,
     monitor_name: String,
+    saved: SavedCrtc,
     stopped: bool,
 }
 
@@ -177,66 +214,76 @@ impl X11VirtualDisplay {
             .randr_get_screen_resources_current(root)?
             .reply()
             .context("could not read current X11 output resources")?;
-        let active_crtcs = resources
-            .crtcs
-            .iter()
-            .copied()
-            .filter_map(|crtc| {
-                display
-                    .connection
-                    .randr_get_crtc_info(crtc, resources.config_timestamp)
-                    .ok()?
-                    .reply()
-                    .ok()
-                    .filter(|info| info.mode != 0)
-                    .map(|_| crtc)
-            })
-            .collect::<HashSet<_>>();
-
+        let primary = display
+            .connection
+            .randr_get_output_primary(root)?
+            .reply()?
+            .output;
+        let source_outputs = source_provider_outputs(&display, root)?;
+        let mut claims = X11_CLAIMS
+            .lock()
+            .map_err(|_| anyhow!("X11 output claim lock was poisoned"))?;
         let mut selected = None;
         for output in &resources.outputs {
             let info = display
                 .connection
                 .randr_get_output_info(*output, resources.config_timestamp)?
                 .reply()?;
-            if info.connection != RandrConnection::DISCONNECTED || info.crtc != 0 {
+            if !is_headless_output_candidate(
+                info.connection,
+                info.mm_width,
+                info.mm_height,
+                *output,
+                primary,
+                &source_outputs,
+                &claims,
+            ) || info.crtc == 0
+            {
                 continue;
             }
-            if let Some(crtc) = info
-                .crtcs
-                .iter()
-                .copied()
-                .find(|crtc| !active_crtcs.contains(crtc))
-            {
-                let name =
-                    String::from_utf8(info.name).context("an X11 output name was not UTF-8")?;
-                selected = Some((*output, crtc, name));
-                break;
+            let crtc = display
+                .connection
+                .randr_get_crtc_info(info.crtc, resources.config_timestamp)?
+                .reply()?;
+            if crtc.mode == 0 || crtc.outputs.as_slice() != [*output] {
+                continue;
             }
+            let name = String::from_utf8(info.name).context("an X11 output name was not UTF-8")?;
+            selected = Some((
+                *output,
+                info.crtc,
+                name,
+                SavedCrtc {
+                    x: crtc.x,
+                    y: crtc.y,
+                    mode: crtc.mode,
+                    rotation: crtc.rotation,
+                    outputs: crtc.outputs,
+                },
+            ));
+            break;
         }
-        let (output, crtc, monitor_name) = selected.ok_or_else(|| anyhow!(
-            "X11 cannot create another extended desktop: no unused disconnected output with a free CRTC is available"
+        let (output, crtc, monitor_name, saved) = selected.ok_or_else(|| anyhow!(
+            "X11 extended desktop needs an unused same-GPU connector that was forced connected at the DRM layer; see the Linux X11 extended-display setup instructions"
         ))?;
+        claims.insert(output);
+        drop(claims);
+        let mut output_claim = OutputClaim::new(output);
 
-        let monitors = display.monitors()?;
-        let x = monitors
+        let (base_width, base_height) = active_crtc_extent(&display, Some(crtc), None)?;
+        let x = i32::from(base_width);
+        let y = display
+            .monitors()?
             .iter()
-            .map(|m| i32::from(m.x) + i32::from(m.width))
-            .max()
-            .unwrap_or(0);
-        let y = monitors
-            .iter()
-            .find(|m| m.primary)
-            .map_or(0, |m| i32::from(m.y));
+            .find(|monitor| monitor.primary)
+            .map_or(0, |monitor| i32::from(monitor.y));
         let new_width = u16::try_from(
             x.checked_add(i32::from(width))
                 .ok_or_else(|| anyhow!("extended desktop width overflowed"))?,
         )
         .context("extended desktop exceeds the X11 coordinate range")?;
-        let new_height = u16::try_from(
-            (y + i32::from(height)).max(i32::from(display.screen().height_in_pixels)),
-        )
-        .context("extended desktop exceeds the X11 coordinate range")?;
+        let new_height = u16::try_from((y + i32::from(height)).max(i32::from(base_height)))
+            .context("extended desktop exceeds the X11 coordinate range")?;
         let range = display
             .connection
             .randr_get_screen_size_range(root)?
@@ -262,22 +309,9 @@ impl X11VirtualDisplay {
                 .connection
                 .randr_add_output_mode(output, mode)?
                 .check()
-                .context("could not attach the temporary mode to the unused X11 output")?;
-            let screen = display.screen();
-            let mm_width = pixels_to_mm(
-                new_width,
-                screen.width_in_pixels,
-                screen.width_in_millimeters,
-            );
-            let mm_height = pixels_to_mm(
-                new_height,
-                screen.height_in_pixels,
-                screen.height_in_millimeters,
-            );
-            display
-                .connection
-                .randr_set_screen_size(root, new_width, new_height, mm_width, mm_height)?
-                .check()?;
+                .context("could not attach the temporary mode to the prepared X11 output")?;
+            set_crtc(&display, crtc, 0, 0, 0, Rotation::ROTATE0, &[])?;
+            set_screen_size(&display, new_width, new_height)?;
             let current = display
                 .connection
                 .randr_get_screen_resources_current(root)?
@@ -306,21 +340,7 @@ impl X11VirtualDisplay {
             Ok(())
         })();
         if let Err(error) = setup {
-            if let Ok(cookie) = display.connection.randr_get_screen_resources_current(root)
-                && let Ok(current) = cookie.reply()
-                && let Ok(cookie) = display.connection.randr_set_crtc_config(
-                    crtc,
-                    0,
-                    current.config_timestamp,
-                    0,
-                    0,
-                    0,
-                    Rotation::ROTATE0,
-                    &[],
-                )
-            {
-                let _ = cookie.reply();
-            }
+            let _ = restore_crtc(&display, crtc, &saved);
             if let Ok(cookie) = display.connection.randr_delete_output_mode(output, mode) {
                 let _ = cookie.check();
             }
@@ -337,9 +357,11 @@ impl X11VirtualDisplay {
             crtc,
             mode,
             monitor_name,
+            saved,
             stopped: false,
         };
         session.check()?;
+        output_claim.disarm();
         println!(
             "Created temporary X11 extended display {ordinal} ({}) at {}x{}+{}+{}.",
             session.monitor_name, width, height, x, y
@@ -374,6 +396,14 @@ impl X11VirtualDisplay {
                 self.monitor_name
             );
         }
+        let output = self
+            .display
+            .connection
+            .randr_get_output_info(self.output, resources.config_timestamp)?
+            .reply()?;
+        if output.connection != RandrConnection::CONNECTED {
+            bail!("prepared X11 display {} disconnected", self.monitor_name);
+        }
         self.display.select_monitor(Some(&self.monitor_name))?;
         Ok(())
     }
@@ -383,51 +413,208 @@ impl X11VirtualDisplay {
             return Ok(());
         }
         self.stopped = true;
-        let _layout = X11_LAYOUT
-            .lock()
-            .map_err(|_| anyhow!("X11 layout lock was poisoned"))?;
-        let root = self.display.root();
-        let resources = self
-            .display
-            .connection
-            .randr_get_screen_resources_current(root)?
-            .reply()?;
-        let reply = self
-            .display
-            .connection
-            .randr_set_crtc_config(
-                self.crtc,
-                0,
-                resources.config_timestamp,
-                0,
-                0,
-                0,
-                Rotation::ROTATE0,
-                &[],
-            )?
-            .reply()?;
-        if reply.status != SetConfig::SUCCESS {
-            bail!(
-                "could not disable temporary X11 output {}",
-                self.monitor_name
+        let result = {
+            let _layout = X11_LAYOUT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut first_error = None;
+            record_cleanup_error(
+                &mut first_error,
+                set_crtc(&self.display, self.crtc, 0, 0, 0, Rotation::ROTATE0, &[]),
             );
-        }
-        self.display
-            .connection
-            .randr_delete_output_mode(self.output, self.mode)?
-            .check()?;
-        self.display
-            .connection
-            .randr_destroy_mode(self.mode)?
-            .check()?;
-        resize_to_active_crtcs(&self.display)?;
-        self.display.connection.flush()?;
-        println!(
-            "Removed temporary X11 extended display {}.",
-            self.monitor_name
-        );
-        Ok(())
+            let restored = restore_crtc(&self.display, self.crtc, &self.saved);
+            let restored_ok = restored.is_ok();
+            record_cleanup_error(&mut first_error, restored);
+            record_cleanup_error(
+                &mut first_error,
+                delete_output_mode(&self.display, self.output, self.mode),
+            );
+            record_cleanup_error(&mut first_error, destroy_mode(&self.display, self.mode));
+            record_cleanup_error(&mut first_error, resize_to_active_crtcs(&self.display));
+            record_cleanup_error(
+                &mut first_error,
+                self.display.connection.flush().map_err(Into::into),
+            );
+            if restored_ok {
+                println!(
+                    "Restored prepared X11 extended display {}.",
+                    self.monitor_name
+                );
+            }
+            first_error.map_or(Ok(()), Err)
+        };
+        release_output_claim(self.output);
+        result
     }
+}
+
+fn record_cleanup_error(first_error: &mut Option<anyhow::Error>, result: Result<()>) {
+    if let Err(error) = result
+        && first_error.is_none()
+    {
+        *first_error = Some(error);
+    }
+}
+
+fn delete_output_mode(display: &DisplayConnection, output: u32, mode: u32) -> Result<()> {
+    display
+        .connection
+        .randr_delete_output_mode(output, mode)?
+        .check()?;
+    Ok(())
+}
+
+fn destroy_mode(display: &DisplayConnection, mode: u32) -> Result<()> {
+    display.connection.randr_destroy_mode(mode)?.check()?;
+    Ok(())
+}
+
+fn release_output_claim(output: u32) {
+    if let Ok(mut claims) = X11_CLAIMS.lock() {
+        claims.remove(&output);
+    }
+}
+
+fn is_headless_output_candidate(
+    connection: RandrConnection,
+    mm_width: u32,
+    mm_height: u32,
+    output: u32,
+    primary: u32,
+    source_outputs: &HashSet<u32>,
+    claims: &HashSet<u32>,
+) -> bool {
+    connection == RandrConnection::CONNECTED
+        && mm_width == 0
+        && mm_height == 0
+        && output != primary
+        && source_outputs.contains(&output)
+        && !claims.contains(&output)
+}
+
+fn source_provider_outputs(display: &DisplayConnection, root: u32) -> Result<HashSet<u32>> {
+    let providers = display.connection.randr_get_providers(root)?.reply()?;
+    let mut outputs = HashSet::new();
+    for provider in providers.providers {
+        let info = display
+            .connection
+            .randr_get_provider_info(provider, providers.timestamp)?
+            .reply()?;
+        if u32::from(info.capabilities) & u32::from(ProviderCapability::SOURCE_OUTPUT) != 0 {
+            outputs.extend(info.outputs);
+        }
+    }
+    Ok(outputs)
+}
+
+fn set_screen_size(display: &DisplayConnection, width: u16, height: u16) -> Result<()> {
+    let screen = display.screen();
+    display
+        .connection
+        .randr_set_screen_size(
+            display.root(),
+            width,
+            height,
+            pixels_to_mm(width, screen.width_in_pixels, screen.width_in_millimeters),
+            pixels_to_mm(
+                height,
+                screen.height_in_pixels,
+                screen.height_in_millimeters,
+            ),
+        )?
+        .check()?;
+    Ok(())
+}
+
+fn set_crtc(
+    display: &DisplayConnection,
+    crtc: u32,
+    x: i16,
+    y: i16,
+    mode: u32,
+    rotation: Rotation,
+    outputs: &[u32],
+) -> Result<()> {
+    let resources = display
+        .connection
+        .randr_get_screen_resources_current(display.root())?
+        .reply()?;
+    let reply = display
+        .connection
+        .randr_set_crtc_config(
+            crtc,
+            0,
+            resources.config_timestamp,
+            x,
+            y,
+            mode,
+            rotation,
+            outputs,
+        )?
+        .reply()?;
+    if reply.status != SetConfig::SUCCESS {
+        bail!("X11 rejected CRTC configuration: {:?}", reply.status);
+    }
+    Ok(())
+}
+
+fn restore_crtc(display: &DisplayConnection, crtc: u32, saved: &SavedCrtc) -> Result<()> {
+    set_crtc(display, crtc, 0, 0, 0, Rotation::ROTATE0, &[])?;
+    if saved.mode != 0 {
+        let (width, height) = active_crtc_extent(display, Some(crtc), Some(saved))?;
+        set_screen_size(display, width, height)?;
+        set_crtc(
+            display,
+            crtc,
+            saved.x,
+            saved.y,
+            saved.mode,
+            saved.rotation,
+            &saved.outputs,
+        )?;
+    }
+    Ok(())
+}
+
+fn active_crtc_extent(
+    display: &DisplayConnection,
+    excluded: Option<u32>,
+    extra: Option<&SavedCrtc>,
+) -> Result<(u16, u16)> {
+    let resources = display
+        .connection
+        .randr_get_screen_resources_current(display.root())?
+        .reply()?;
+    let mut width = 1_i32;
+    let mut height = 1_i32;
+    for crtc in resources.crtcs {
+        if Some(crtc) == excluded {
+            continue;
+        }
+        let info = display
+            .connection
+            .randr_get_crtc_info(crtc, resources.config_timestamp)?
+            .reply()?;
+        if info.mode != 0 {
+            width = width.max(i32::from(info.x) + i32::from(info.width));
+            height = height.max(i32::from(info.y) + i32::from(info.height));
+        }
+    }
+    if let Some(extra) = extra
+        && extra.mode != 0
+    {
+        let mode = display
+            .connection
+            .randr_get_screen_resources_current(display.root())?
+            .reply()?
+            .modes
+            .into_iter()
+            .find(|mode| mode.id == extra.mode)
+            .ok_or_else(|| anyhow!("saved X11 mode {} no longer exists", extra.mode))?;
+        width = width.max(i32::from(extra.x) + i32::from(mode.width));
+        height = height.max(i32::from(extra.y) + i32::from(mode.height));
+    }
+    Ok((u16::try_from(width)?, u16::try_from(height)?))
 }
 
 impl Drop for X11VirtualDisplay {
@@ -438,6 +625,7 @@ impl Drop for X11VirtualDisplay {
                 self.monitor_name
             );
         }
+        release_output_claim(self.output);
     }
 }
 
@@ -962,6 +1150,66 @@ mod tests {
     }
 
     #[test]
+    fn extended_output_must_be_connected_headless_and_source_capable() {
+        let source_outputs = HashSet::from([11]);
+        let unclaimed = HashSet::new();
+        assert!(is_headless_output_candidate(
+            RandrConnection::CONNECTED,
+            0,
+            0,
+            11,
+            10,
+            &source_outputs,
+            &unclaimed,
+        ));
+        assert!(!is_headless_output_candidate(
+            RandrConnection::DISCONNECTED,
+            0,
+            0,
+            11,
+            10,
+            &source_outputs,
+            &unclaimed,
+        ));
+        assert!(!is_headless_output_candidate(
+            RandrConnection::CONNECTED,
+            600,
+            340,
+            11,
+            10,
+            &source_outputs,
+            &unclaimed,
+        ));
+        assert!(!is_headless_output_candidate(
+            RandrConnection::CONNECTED,
+            0,
+            0,
+            10,
+            10,
+            &source_outputs,
+            &unclaimed,
+        ));
+        assert!(!is_headless_output_candidate(
+            RandrConnection::CONNECTED,
+            0,
+            0,
+            12,
+            10,
+            &source_outputs,
+            &unclaimed,
+        ));
+        assert!(!is_headless_output_candidate(
+            RandrConnection::CONNECTED,
+            0,
+            0,
+            11,
+            10,
+            &source_outputs,
+            &HashSet::from([11]),
+        ));
+    }
+
+    #[test]
     fn generated_virtual_mode_has_valid_60_hz_timings() {
         let mode = generated_mode(1280, 720, 12).unwrap();
         assert_eq!((mode.width, mode.height, mode.name_len), (1280, 720, 12));
@@ -1104,6 +1352,109 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+        assert!(sink.count.load(Ordering::Relaxed) >= 4);
+        assert!(sink.changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn extended_output_captures_and_restores_when_integration_test_is_enabled() {
+        if env::var_os("CAST_X11_EXTEND_INTEGRATION_TEST").is_none() {
+            return;
+        }
+        let mut virtual_display = X11VirtualDisplay::start(1280, 720, 1).unwrap();
+        let display = DisplayConnection::connect().unwrap();
+        let monitor = display
+            .select_monitor(Some(virtual_display.monitor_name()))
+            .unwrap();
+        assert_eq!((monitor.width, monitor.height), (1280, 720));
+
+        let window = display.connection.generate_id().unwrap();
+        display
+            .connection
+            .create_window(
+                COPY_DEPTH_FROM_PARENT,
+                window,
+                display.root(),
+                monitor.x,
+                monitor.y,
+                96,
+                96,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                &CreateWindowAux::new()
+                    .override_redirect(1)
+                    .background_pixel(0x00ff0000),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        display
+            .connection
+            .map_window(window)
+            .unwrap()
+            .check()
+            .unwrap();
+        display.connection.flush().unwrap();
+
+        let sink = Arc::new(CountingSink {
+            count: AtomicUsize::new(0),
+            first_checksum: AtomicU64::new(0),
+            changed: AtomicBool::new(false),
+        });
+        let erased: Arc<dyn FrameSink> = sink.clone();
+        let mut capture = X11Capture::start(
+            Some(virtual_display.monitor_name().to_owned()),
+            10,
+            erased,
+            CaptureEpoch::new(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(250));
+        display
+            .connection
+            .change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().background_pixel(0x000000ff),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        display
+            .connection
+            .clear_area(false, window, 0, 0, 0, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        display.connection.flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        capture.check().unwrap();
+        capture.stop().unwrap();
+        display
+            .connection
+            .destroy_window(window)
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let saved = virtual_display.saved.clone();
+        let crtc = virtual_display.crtc;
+        virtual_display.stop().unwrap();
+        let resources = display
+            .connection
+            .randr_get_screen_resources_current(display.root())
+            .unwrap()
+            .reply()
+            .unwrap();
+        let restored = display
+            .connection
+            .randr_get_crtc_info(crtc, resources.config_timestamp)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(restored.mode, saved.mode);
+        assert_eq!((restored.x, restored.y), (saved.x, saved.y));
+        assert_eq!(restored.outputs, saved.outputs);
         assert!(sink.count.load(Ordering::Relaxed) >= 4);
         assert!(sink.changed.load(Ordering::Relaxed));
     }
