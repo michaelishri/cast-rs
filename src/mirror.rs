@@ -116,6 +116,10 @@ pub struct MirrorOptions {
     pub prioritize_encoding_speed: bool,
     pub audio: bool,
     #[cfg(target_os = "linux")]
+    pub capture_backend: crate::linux_x11::BackendPreference,
+    #[cfg(target_os = "linux")]
+    pub display_name: Option<String>,
+    #[cfg(target_os = "linux")]
     pub select_source: bool,
     #[cfg(target_os = "linux")]
     pub provider: H264Provider,

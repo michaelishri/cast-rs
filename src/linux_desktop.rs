@@ -21,6 +21,8 @@ use crate::{
 };
 
 pub(crate) struct CaptureOptions {
+    pub(crate) backend: crate::linux_x11::BackendPreference,
+    pub(crate) display: Option<String>,
     pub(crate) force_chooser: bool,
     pub(crate) duration: Duration,
     pub(crate) fps: u32,

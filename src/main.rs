@@ -15,6 +15,8 @@ mod linux_desktop;
 mod linux_encoder;
 #[cfg(target_os = "linux")]
 mod linux_pipewire;
+#[cfg(target_os = "linux")]
+mod linux_x11;
 mod live;
 mod media;
 mod media_server;
@@ -83,6 +85,9 @@ enum Command {
     #[cfg(target_os = "linux")]
     /// Report XDG desktop portal capture capabilities and remembered-source status.
     Displays {
+        /// Desktop capture backend; auto prefers X11 inside an X11 session.
+        #[arg(long, value_enum, default_value_t = linux_x11::BackendPreference::Auto)]
+        backend: linux_x11::BackendPreference,
         /// Open the privacy-preserving source chooser and remember the selected monitor or window.
         #[arg(long)]
         select_source: bool,
@@ -182,6 +187,12 @@ enum Command {
     #[cfg(target_os = "linux")]
     /// Capture and encode a short Annex-B H.264 diagnostic sample through the desktop portal.
     Capture {
+        /// Desktop capture backend; auto prefers X11 inside an X11 session.
+        #[arg(long, value_enum, default_value_t = linux_x11::BackendPreference::Auto)]
+        backend: linux_x11::BackendPreference,
+        /// Active X11 RandR monitor name; defaults to the primary monitor.
+        #[arg(long, conflicts_with = "select_source")]
+        display: Option<String>,
         /// Force a new portal source chooser instead of reusing the remembered source.
         #[arg(long)]
         select_source: bool,
@@ -256,6 +267,12 @@ enum Command {
         host: Vec<IpAddr>,
         #[arg(long, default_value_t = 8009)]
         cast_port: u16,
+        /// Desktop capture backend; auto prefers X11 inside an X11 session.
+        #[arg(long, value_enum, default_value_t = linux_x11::BackendPreference::Auto)]
+        backend: linux_x11::BackendPreference,
+        /// Active X11 RandR monitor name; defaults to the primary monitor.
+        #[arg(long, conflicts_with_all = ["select_source", "extend", "synthetic"])]
+        display: Option<String>,
         /// Force a new portal source chooser instead of reusing the remembered source.
         #[arg(long, conflicts_with_all = ["extend", "synthetic"])]
         select_source: bool,
@@ -348,6 +365,12 @@ enum Command {
         host: Vec<IpAddr>,
         #[arg(long, default_value_t = 8009)]
         cast_port: u16,
+        /// Desktop capture backend; auto prefers X11 inside an X11 session.
+        #[arg(long, value_enum, default_value_t = linux_x11::BackendPreference::Auto)]
+        backend: linux_x11::BackendPreference,
+        /// Active X11 RandR monitor name; defaults to the primary monitor.
+        #[arg(long, conflicts_with_all = ["select_source", "extend"])]
+        display: Option<String>,
         #[arg(long, value_enum, default_value_t = DesktopTransport::Mirror)]
         transport: DesktopTransport,
         /// Force a new portal source chooser instead of reusing the remembered source.
@@ -480,7 +503,18 @@ fn main() -> Result<()> {
         #[cfg(target_os = "macos")]
         Command::Displays => capture::list_displays()?,
         #[cfg(target_os = "linux")]
-        Command::Displays { select_source } => portal::list_sources(select_source)?,
+        Command::Displays {
+            backend,
+            select_source,
+        } => match linux_x11::resolve_backend(backend)? {
+            linux_x11::Backend::X11 => {
+                if select_source {
+                    anyhow::bail!("--select-source is available only with --backend portal");
+                }
+                linux_x11::list_monitors()?;
+            }
+            linux_x11::Backend::Portal => portal::list_sources(select_source)?,
+        },
         Command::Url {
             host,
             port,
@@ -593,6 +627,8 @@ fn main() -> Result<()> {
         })?,
         #[cfg(target_os = "linux")]
         Command::Capture {
+            backend,
+            display,
             select_source,
             seconds,
             fps,
@@ -600,6 +636,8 @@ fn main() -> Result<()> {
             encoder,
             output,
         } => linux_desktop::capture(linux_desktop::CaptureOptions {
+            backend,
+            display,
             force_chooser: select_source,
             duration: Duration::from_secs(seconds),
             fps,
@@ -648,6 +686,8 @@ fn main() -> Result<()> {
         Command::Profile {
             host,
             cast_port,
+            backend,
+            display,
             select_source,
             extend,
             seconds,
@@ -679,6 +719,8 @@ fn main() -> Result<()> {
                 adaptive_bitrate: !fixed_bitrate,
                 prioritize_encoding_speed: !quality_priority,
                 audio: false,
+                capture_backend: backend,
+                display_name: display,
                 select_source,
                 provider: encoder.into(),
             },
@@ -753,6 +795,8 @@ fn main() -> Result<()> {
             host,
             cast_port,
             transport,
+            backend,
+            display,
             select_source,
             extend,
             audio,
@@ -789,6 +833,8 @@ fn main() -> Result<()> {
                     adaptive_bitrate: !fixed_bitrate,
                     prioritize_encoding_speed: !quality_priority,
                     audio,
+                    capture_backend: backend,
+                    display_name: display.clone(),
                     select_source,
                     provider: encoder.into(),
                 })?;
@@ -812,6 +858,8 @@ fn main() -> Result<()> {
                     duration: seconds.map(Duration::from_secs),
                     serve_only,
                     audio,
+                    capture_backend: backend,
+                    display_name: display,
                     select_source,
                     provider: encoder.into(),
                 })?;
@@ -976,7 +1024,8 @@ mod tests {
         assert!(matches!(
             displays.command,
             Command::Displays {
-                select_source: true
+                select_source: true,
+                ..
             }
         ));
         let capture = Cli::try_parse_from([
@@ -995,10 +1044,17 @@ mod tests {
                 ..
             }
         ));
-        let error = Cli::try_parse_from(["cast", "capture", "--display", "1"])
-            .err()
-            .expect("macOS --display was exposed on Linux");
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        let x11 =
+            Cli::try_parse_from(["cast", "capture", "--backend", "x11", "--display", "HDMI-1"])
+                .unwrap();
+        assert!(matches!(
+            x11.command,
+            Command::Capture {
+                backend: crate::linux_x11::BackendPreference::X11,
+                display: Some(ref name),
+                ..
+            } if name == "HDMI-1"
+        ));
     }
 
     #[test]
@@ -1038,7 +1094,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn linux_desktop_and_profile_use_portal_source_controls() {
+    fn linux_desktop_and_profile_parse_x11_and_portal_source_controls() {
         let desktop = Cli::try_parse_from([
             "cast",
             "desktop",
@@ -1056,6 +1112,25 @@ mod tests {
                 encoder: H264Encoder::Vaapi,
                 ..
             }
+        ));
+        let x11 = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.1",
+            "--backend",
+            "x11",
+            "--display",
+            "DP-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            x11.command,
+            Command::Desktop {
+                backend: crate::linux_x11::BackendPreference::X11,
+                display: Some(ref name),
+                ..
+            } if name == "DP-1"
         ));
         let conflict = Cli::try_parse_from([
             "cast",

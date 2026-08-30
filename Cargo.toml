@@ -38,6 +38,7 @@ pipewire = { version = "0.9.2", default-features = false, features = ["v0_3_44"]
 sha2 = "0.10"
 tokio = { version = "1.47", features = ["rt-multi-thread"] }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+x11rb = { version = "0.14", default-features = false, features = ["image", "randr", "shm", "xfixes"] }
 
 [patch.crates-io]
 # pipewire-rs 0.9.2 exposes post-0.3.65 video fields without guarding them,
