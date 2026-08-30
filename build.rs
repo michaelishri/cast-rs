@@ -28,5 +28,9 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
         // Release archives place the linked FFmpeg libraries next to the executable.
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
+    } else if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // Linux release archives place redistributable media libraries here. The
+        // packaging job also gives each bundled library a sibling-relative RUNPATH.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
     }
 }

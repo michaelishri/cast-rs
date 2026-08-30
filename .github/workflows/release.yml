@@ -78,9 +78,71 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  linux:
+    name: Build Linux ${{ matrix.archive_arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - archive_arch: x86_64
+            runner: ubuntu-22.04
+          - archive_arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install build and audit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
+
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
+      - name: Validate and build release binary
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked
+          cargo build --locked --release
+
+      - name: Package release archive, checksum, and dependency audit
+        shell: bash
+        run: ./scripts/package-linux-release.sh "${{ matrix.archive_arch }}"
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-${{ matrix.archive_arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, linux]
     runs-on: ubuntu-latest
 
     steps:

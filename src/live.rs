@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    ffi::c_void,
     io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -11,22 +10,50 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+
 use anyhow::{Context, Result, anyhow, bail};
 use muxide::{
     api::{MuxerBuilder, VideoCodec},
     fragmented::FragmentedMuxer,
 };
+#[cfg(target_os = "macos")]
 use screencapturekit::IOSurface;
+#[cfg(target_os = "macos")]
 use screencapturekit::prelude::*;
+#[cfg(target_os = "macos")]
 use videotoolbox::ProfileLevel;
+#[cfg(target_os = "macos")]
 use videotoolbox::prelude::*;
 
+#[cfg(target_os = "macos")]
+use crate::audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker};
+#[cfg(target_os = "macos")]
+use crate::desktop::MediaClock;
+#[cfg(target_os = "linux")]
+use crate::linux_audio::{self as audio, AudioSubmitter, AudioWorker, PipeWireAudioCapture};
+#[cfg(target_os = "macos")]
+use crate::virtual_display::VirtualDisplaySession;
 use crate::{
-    audio::{self, AudioFrameHandler, AudioSubmitter, AudioWorker, EncodedAudioFrame, MediaClock},
     cast,
+    desktop::{EncodedAudioFrame, EncodedAudioSink},
     network::{http_url, local_ip_for, private_route},
-    virtual_display::VirtualDisplaySession,
 };
+#[cfg(target_os = "linux")]
+use crate::{
+    desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
+    linux_desktop::composite_cursor,
+    linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
+    linux_pipewire::CaptureEpoch,
+    media::H264Provider,
+    portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
+};
+
+#[cfg(target_os = "macos")]
+type ExtendedDisplaySession = VirtualDisplaySession;
+#[cfg(target_os = "linux")]
+type ExtendedDisplaySession = PortalSelection;
 
 const TIMESCALE: u64 = 90_000;
 const PLAYLIST_WINDOW_SEGMENTS: usize = 8;
@@ -47,9 +74,15 @@ pub struct LiveOptions {
     pub duration: Option<Duration>,
     pub serve_only: bool,
     pub audio: bool,
+    #[cfg(target_os = "linux")]
+    pub select_source: bool,
+    #[cfg(target_os = "linux")]
+    pub provider: H264Provider,
 }
 
 pub fn cast_desktop(options: LiveOptions) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let mut options = options;
     if options.bitrate <= 0 {
         bail!("bitrate must be greater than zero");
     }
@@ -58,6 +91,29 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
+    #[cfg(target_os = "linux")]
+    LinuxVideoEncoder::preflight(
+        options.provider,
+        even(options.width),
+        even(options.height),
+        options.fps,
+        options.bitrate as u32,
+        EncodingPriority::Speed,
+    )
+    .context("Linux H.264 provider preflight failed")?;
+    #[cfg(target_os = "linux")]
+    let prepared_audio = if options.audio {
+        match audio::prepare() {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                options.audio = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let width = even(options.width);
     let height = even(options.height);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -70,10 +126,16 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         for (index, host) in options.cast_hosts.iter().copied().enumerate() {
             let ordinal = u32::try_from(index + 1)
                 .context("the number of extended displays exceeded the supported ordinal range")?;
-            let session = VirtualDisplaySession::start(width, height, options.fps, ordinal)?;
+            let session = start_extended_display(width, height, options.fps, ordinal)?;
+            #[cfg(target_os = "macos")]
             println!(
                 "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
                 session.display_id()
+            );
+            #[cfg(target_os = "linux")]
+            println!(
+                "Mapped receiver {host} to portal virtual source {ordinal} (PipeWire node {}).",
+                session.node_id()
             );
             virtual_displays.push((host, session));
         }
@@ -151,22 +213,73 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         target.url = http_url(address, &format!("/{}/master.m3u8", target.route));
     }
 
+    #[cfg(target_os = "linux")]
+    let capture_epoch = CaptureEpoch::new();
+    #[cfg(target_os = "linux")]
+    let (audio_submitter, audio_worker, pipewire_audio) = if let Some(encoder) = prepared_audio {
+        let mut seen_stores = HashSet::new();
+        let audio_stores = targets
+            .iter()
+            .filter(|target| seen_stores.insert(Arc::as_ptr(&target.store) as usize))
+            .map(|target| Arc::clone(&target.store))
+            .collect::<Vec<_>>();
+        match AudioWorker::start_prepared(encoder, Arc::clone(&failure), move |frame| {
+            for store in &audio_stores {
+                store.submit_audio(frame.clone())?;
+            }
+            Ok(())
+        }) {
+            Ok((submitter, worker)) => {
+                match PipeWireAudioCapture::start(
+                    submitter.clone(),
+                    Arc::clone(&failure),
+                    capture_epoch.clone(),
+                ) {
+                    Ok(capture) => (Some(submitter), Some(worker), Some(capture)),
+                    Err(error) => {
+                        eprintln!(
+                            "System audio is unavailable; continuing with video only: {error:#}"
+                        );
+                        worker.stop()?;
+                        disable_target_audio(&targets)?;
+                        (None, None, None)
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("System audio is unavailable; continuing with video only: {error:#}");
+                disable_target_audio(&targets)?;
+                (None, None, None)
+            }
+        }
+    } else {
+        (None, None, None)
+    };
+
     let mut captures = Vec::new();
     if options.extend {
-        for (target, (_, session)) in targets.iter().zip(virtual_displays.iter()) {
+        for (target, (_, session)) in targets.iter().zip(virtual_displays.drain(..)) {
             captures.push(LiveCapture::start(
-                Some(session.display_id()),
+                Some(session),
                 &options,
                 Arc::clone(&target.store),
                 Arc::clone(&failure),
+                #[cfg(target_os = "linux")]
+                audio_submitter.clone(),
+                #[cfg(target_os = "linux")]
+                capture_epoch.clone(),
             )?);
         }
     } else {
         captures.push(LiveCapture::start(
-            options.display_id,
+            None,
             &options,
             Arc::clone(shared_store.as_ref().expect("shared HLS store exists")),
             Arc::clone(&failure),
+            #[cfg(target_os = "linux")]
+            audio_submitter.clone(),
+            #[cfg(target_os = "linux")]
+            capture_epoch.clone(),
         )?);
     }
 
@@ -178,8 +291,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         if let Some(error) = take_failure(&failure)? {
             bail!("live HLS startup failed: {error}");
         }
-        for (_, session) in &mut virtual_displays {
-            session.ensure_alive()?;
+        for capture in &mut captures {
+            capture.check()?;
         }
         if startup_started.elapsed() >= Duration::from_secs(12) {
             bail!("timed out waiting for {STARTUP_SEGMENTS} HLS media segments");
@@ -220,8 +333,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             if let Some(error) = take_failure(&failure)? {
                 bail!("live HLS group failed: {error}");
             }
-            for (_, session) in &mut virtual_displays {
-                session.ensure_alive()?;
+            for capture in &mut captures {
+                capture.check()?;
             }
             for (host, session) in &receiver_sessions {
                 session
@@ -241,6 +354,10 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             capture_result = Err(error);
         }
     }
+    #[cfg(target_os = "linux")]
+    let audio_capture_result = pipewire_audio.map(PipeWireAudioCapture::stop).transpose();
+    #[cfg(target_os = "linux")]
+    let audio_worker_result = audio_worker.map(AudioWorker::stop).transpose();
     log::debug!("released desktop capture resources before display teardown");
     let mut receiver_result = Ok(());
     for (_, session) in &mut receiver_sessions {
@@ -261,18 +378,42 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
     print_hls_stats(&targets);
 
-    let mut display_result = Ok(());
-    for (_, session) in virtual_displays.iter_mut().rev() {
-        if let Err(error) = session.stop()
-            && display_result.is_ok()
-        {
-            display_result = Err(error);
-        }
-    }
     run_result?;
     capture_result?;
-    receiver_result?;
-    display_result
+    #[cfg(target_os = "linux")]
+    audio_capture_result?;
+    #[cfg(target_os = "linux")]
+    audio_worker_result?;
+    receiver_result
+}
+
+#[cfg(target_os = "linux")]
+fn disable_target_audio(targets: &[HlsTarget]) -> Result<()> {
+    for target in targets {
+        target.store.disable_audio()?;
+        target.audio.store(false, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn start_extended_display(
+    width: u32,
+    height: u32,
+    fps: u32,
+    ordinal: u32,
+) -> Result<ExtendedDisplaySession> {
+    VirtualDisplaySession::start(width, height, fps, ordinal)
+}
+
+#[cfg(target_os = "linux")]
+fn start_extended_display(
+    _width: u32,
+    _height: u32,
+    _fps: u32,
+    _ordinal: u32,
+) -> Result<ExtendedDisplaySession> {
+    crate::portal::select(PortalSourceKind::Virtual, true)
 }
 
 struct HlsTarget {
@@ -417,15 +558,18 @@ fn print_hls_stats(targets: &[HlsTarget]) {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct LiveCapture {
     stream: Option<SCStream>,
     store: Arc<HlsStore>,
     audio_worker: Option<AudioWorker>,
+    extended_display: Option<ExtendedDisplaySession>,
 }
 
+#[cfg(target_os = "macos")]
 impl LiveCapture {
     fn start(
-        display_id: Option<u32>,
+        extended_display: Option<ExtendedDisplaySession>,
         options: &LiveOptions,
         store: Arc<HlsStore>,
         failure: Arc<Mutex<Option<String>>>,
@@ -436,6 +580,10 @@ impl LiveCapture {
             "could not enumerate displays; grant Screen Recording permission in System Settings",
         )?;
         let displays = content.displays();
+        let display_id = extended_display
+            .as_ref()
+            .map(VirtualDisplaySession::display_id)
+            .or(options.display_id);
         let display = match display_id {
             Some(id) => displays
                 .iter()
@@ -468,7 +616,7 @@ impl LiveCapture {
         let (audio_submitter, audio_worker) = if options.audio && store.audio_enabled() {
             let audio_store = Arc::clone(&store);
             match AudioWorker::start(Arc::clone(&clock), Arc::clone(&failure), move |frame| {
-                audio_store.push_audio(frame)
+                audio_store.submit_audio(frame)
             }) {
                 Ok((submitter, worker)) => (Some(submitter), Some(worker)),
                 Err(error) => {
@@ -551,7 +699,15 @@ impl LiveCapture {
             stream: Some(stream),
             store,
             audio_worker,
+            extended_display,
         })
+    }
+
+    fn check(&mut self) -> Result<()> {
+        if let Some(session) = self.extended_display.as_mut() {
+            session.ensure_alive()?;
+        }
+        Ok(())
     }
 
     fn is_ready(&self) -> bool {
@@ -570,10 +726,14 @@ impl LiveCapture {
         if let Some(worker) = self.audio_worker.take() {
             worker.stop()?;
         }
+        if let Some(mut session) = self.extended_display.take() {
+            session.stop()?;
+        }
         Ok(())
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for LiveCapture {
     fn drop(&mut self) {
         if let Err(error) = self.stop_and_release() {
@@ -582,6 +742,7 @@ impl Drop for LiveCapture {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct LiveFrameHandler {
     pipeline: Mutex<LivePipeline>,
     failure: Arc<Mutex<Option<String>>>,
@@ -589,6 +750,7 @@ struct LiveFrameHandler {
     skipped_samples: AtomicU64,
 }
 
+#[cfg(target_os = "macos")]
 impl SCStreamOutputTrait for LiveFrameHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, output_type: SCStreamOutputType) {
         if output_type != SCStreamOutputType::Screen {
@@ -636,6 +798,7 @@ impl SCStreamOutputTrait for LiveFrameHandler {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl LiveFrameHandler {
     fn record_repeated_sample(
         &self,
@@ -660,6 +823,7 @@ impl LiveFrameHandler {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct LivePipeline {
     encoder: CompressionSession,
     muxer: Option<FragmentedMuxer>,
@@ -677,12 +841,14 @@ struct LivePipeline {
     bitrate: u32,
 }
 
+#[cfg(target_os = "macos")]
 enum FrameSource {
     Fresh,
     Repeated,
     Unavailable,
 }
 
+#[cfg(target_os = "macos")]
 impl LivePipeline {
     fn encode_sample(
         &mut self,
@@ -784,7 +950,7 @@ impl LivePipeline {
         let fallback_step = TIMESCALE / self.fps as u64;
         let candidate = self
             .clock
-            .ticks(presentation_time, TIMESCALE)
+            .ticks(presentation_time.into(), TIMESCALE)
             .unwrap_or_else(|| {
                 self.last_timestamp
                     .map_or(0, |last| last.saturating_add(fallback_step))
@@ -795,6 +961,470 @@ impl LivePipeline {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct LiveCapture {
+    capture: Option<PipeWireCapture>,
+    cadence: Option<LinuxFrameCadence>,
+    encoder_worker: Option<LatestFrameWorker<CapturedFrame>>,
+    store: Arc<HlsStore>,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveCapture {
+    fn start(
+        extended_display: Option<ExtendedDisplaySession>,
+        options: &LiveOptions,
+        store: Arc<HlsStore>,
+        failure: Arc<Mutex<Option<String>>>,
+        audio_submitter: Option<AudioSubmitter>,
+        capture_epoch: CaptureEpoch,
+    ) -> Result<Self> {
+        let selection = match extended_display {
+            Some(selection) => selection,
+            None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
+        };
+        let pipeline = LinuxLivePipeline {
+            encoder: None,
+            muxer: None,
+            store: Arc::clone(&store),
+            frame_index: 0,
+            frames_in_segment: 0,
+            segment_start_timestamp: None,
+            fps: options.fps,
+            width: even(options.width),
+            height: even(options.height),
+            bitrate: options.bitrate as u32,
+            provider: options.provider,
+            audio_submitter,
+        };
+        let observer: Arc<dyn LatestFrameObserver> = Arc::new(LiveQueueObserver);
+        let (submitter, worker) = LatestFrameWorker::start(
+            pipeline,
+            Some(Duration::from_millis(
+                2_000_u64.div_ceil(u64::from(options.fps.max(1))),
+            )),
+            Arc::clone(&failure),
+            observer,
+            "cast-linux-hls-encoder",
+        )?;
+        let (sink, cadence) =
+            LinuxFrameCadence::start(submitter, options.fps, Arc::clone(&failure))?;
+        let sink: Arc<dyn FrameSink> = Arc::new(sink);
+        let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
+        println!(
+            "Capturing the selected portal source into {}x{}, {} fps HLS...",
+            even(options.width),
+            even(options.height),
+            options.fps
+        );
+        Ok(Self {
+            capture: Some(capture),
+            cadence: Some(cadence),
+            encoder_worker: Some(worker),
+            store,
+        })
+    }
+
+    fn check(&mut self) -> Result<()> {
+        if let Some(capture) = &self.capture {
+            capture.check()?;
+        }
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.store
+            .wait_until_ready(Duration::ZERO, STARTUP_SEGMENTS)
+    }
+
+    fn stop_and_release(&mut self) -> Result<()> {
+        if let Some(mut capture) = self.capture.take() {
+            capture.stop()?;
+        }
+        if let Some(mut cadence) = self.cadence.take() {
+            cadence.stop()?;
+        }
+        if let Some(mut worker) = self.encoder_worker.take() {
+            worker.stop()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveCapture {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_and_release() {
+            log::warn!("could not stop Linux live desktop capture: {error:#}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LivePortalSink {
+    state: Arc<LinuxFrameCadenceState>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for LivePortalSink {
+    fn submit(&self, frame: CapturedFrame) {
+        match self.state.frame.lock() {
+            Ok(mut pending) => {
+                *pending = Some(frame);
+                self.state.available.notify_one();
+            }
+            Err(_) => {
+                record_live_failure(&self.failure, "Linux HLS cadence frame lock was poisoned");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxFrameCadenceState {
+    frame: Mutex<Option<CapturedFrame>>,
+    available: Condvar,
+    stopping: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxFrameCadence {
+    state: Arc<LinuxFrameCadenceState>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxFrameCadence {
+    fn start(
+        submitter: LatestFrameSubmitter<CapturedFrame>,
+        fps: u32,
+        failure: Arc<Mutex<Option<String>>>,
+    ) -> Result<(LivePortalSink, Self)> {
+        let state = Arc::new(LinuxFrameCadenceState {
+            frame: Mutex::new(None),
+            available: Condvar::new(),
+            stopping: AtomicBool::new(false),
+        });
+        let thread_state = Arc::clone(&state);
+        let frame_period = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+        let timestamp_step = TIMESCALE.div_ceil(u64::from(fps.max(1)));
+        let thread_failure = Arc::clone(&failure);
+        let thread = thread::Builder::new()
+            .name("cast-linux-hls-cadence".to_owned())
+            .spawn(move || {
+                let mut current: Option<CapturedFrame> = None;
+                let mut last_timestamp = None;
+                let mut next_tick = Instant::now();
+                loop {
+                    let mut pending = match thread_state.frame.lock() {
+                        Ok(pending) => pending,
+                        Err(_) => {
+                            record_live_failure(
+                                &thread_failure,
+                                "Linux HLS cadence frame lock was poisoned",
+                            );
+                            return;
+                        }
+                    };
+                    while current.is_none()
+                        && pending.is_none()
+                        && !thread_state.stopping.load(Ordering::SeqCst)
+                    {
+                        pending = match thread_state.available.wait(pending) {
+                            Ok(pending) => pending,
+                            Err(_) => {
+                                record_live_failure(
+                                    &thread_failure,
+                                    "Linux HLS cadence frame wait was poisoned",
+                                );
+                                return;
+                            }
+                        };
+                    }
+                    if thread_state.stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(frame) = pending.take() {
+                        current = Some(frame);
+                    }
+                    let now = Instant::now();
+                    if now < next_tick {
+                        let timeout = next_tick.saturating_duration_since(now);
+                        drop(
+                            match thread_state.available.wait_timeout(pending, timeout) {
+                                Ok((pending, _)) => pending,
+                                Err(_) => {
+                                    record_live_failure(
+                                        &thread_failure,
+                                        "Linux HLS cadence frame wait was poisoned",
+                                    );
+                                    return;
+                                }
+                            },
+                        );
+                        continue;
+                    }
+                    drop(pending);
+
+                    let mut frame = current
+                        .as_ref()
+                        .expect("cadence waits for its first captured frame")
+                        .clone();
+                    frame.timestamp =
+                        advance_timestamp(last_timestamp, frame.timestamp, timestamp_step);
+                    last_timestamp = Some(frame.timestamp);
+                    if let Err(error) = submitter.submit(frame) {
+                        log::debug!("HLS cadence stopped after its encoder queue closed: {error}");
+                        return;
+                    }
+                    next_tick += frame_period;
+                    if next_tick <= now {
+                        next_tick = now + frame_period;
+                    }
+                }
+            })
+            .context("could not start Linux HLS frame cadence worker")?;
+        Ok((
+            LivePortalSink {
+                state: Arc::clone(&state),
+                failure,
+            },
+            Self {
+                state,
+                thread: Some(thread),
+            },
+        ))
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.state.stopping.store(true, Ordering::SeqCst);
+        self.state.available.notify_all();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("Linux HLS frame cadence worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxFrameCadence {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            log::warn!("could not stop Linux HLS frame cadence worker: {error:#}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_live_failure(failure: &Mutex<Option<String>>, message: &str) {
+    match failure.lock() {
+        Ok(mut failure) => {
+            if failure.is_none() {
+                *failure = Some(message.to_owned());
+            }
+        }
+        Err(_) => log::error!("could not store Linux live capture failure: {message}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LiveQueueObserver;
+
+#[cfg(target_os = "linux")]
+impl LatestFrameObserver for LiveQueueObserver {
+    fn submitted(&self) {}
+    fn replaced(&self) {}
+    fn expired(&self) {}
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxLivePipeline {
+    encoder: Option<LinuxVideoEncoder>,
+    muxer: Option<FragmentedMuxer>,
+    store: Arc<HlsStore>,
+    frame_index: u64,
+    frames_in_segment: u32,
+    segment_start_timestamp: Option<u64>,
+    fps: u32,
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    provider: H264Provider,
+    audio_submitter: Option<AudioSubmitter>,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for LinuxLivePipeline {}
+
+#[cfg(target_os = "linux")]
+impl LinuxLivePipeline {
+    fn write_packet(&mut self, data: &[u8], timestamp: u64, keyframe: bool) -> Result<()> {
+        let converted = annex_b_to_avcc(data)?;
+        if self.muxer.is_none() {
+            if !keyframe {
+                return Ok(());
+            }
+            let (sps, pps) = converted
+                .parameter_sets
+                .ok_or_else(|| anyhow!("first Linux H.264 keyframe contained no SPS/PPS"))?;
+            let codec = avc_codec_string(&sps).unwrap_or_else(|| "avc1.4D001F".into());
+            let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
+                .video(VideoCodec::H264, self.width, self.height, self.fps as f64)
+                .with_sps(sps)
+                .with_pps(pps)
+                .new_with_fragment()
+                .context("could not initialize the Linux fragmented MP4 muxer")?;
+            self.store.set_init(
+                muxer.init_segment(),
+                &codec,
+                self.width,
+                self.height,
+                self.fps,
+                self.bitrate,
+            )?;
+            self.muxer = Some(muxer);
+            self.segment_start_timestamp = Some(timestamp);
+        }
+        let muxer = self
+            .muxer
+            .as_mut()
+            .ok_or_else(|| anyhow!("Linux HLS muxer did not initialize on a keyframe"))?;
+        if keyframe && self.frames_in_segment > 0 {
+            if let Some(segment) = muxer.flush_segment() {
+                let start = self.segment_start_timestamp.unwrap_or(timestamp);
+                let duration = timestamp.saturating_sub(start) as f64 / TIMESCALE as f64;
+                if let Some(audio) = &self.audio_submitter {
+                    audio.advance_to(video_to_audio_timestamp(timestamp));
+                }
+                self.store
+                    .push_segment(segment, duration.max(0.001), start, timestamp)?;
+            }
+            self.frames_in_segment = 0;
+            self.segment_start_timestamp = Some(timestamp);
+        }
+        muxer
+            .write_video(timestamp, timestamp, &converted.data, keyframe)
+            .context("could not add Linux H.264 frame to fragmented MP4")?;
+        self.frame_index = self.frame_index.saturating_add(1);
+        self.frames_in_segment = self.frames_in_segment.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LatestFrameBackend for LinuxLivePipeline {
+    type Frame = CapturedFrame;
+
+    fn has_reference_frame(&self) -> bool {
+        self.muxer.is_some()
+    }
+
+    fn failure_context(&self) -> &'static str {
+        "Linux HLS encode worker failed"
+    }
+
+    fn process_frame(&mut self, mut frame: Self::Frame, _queue_wait_micros: u64) -> Result<()> {
+        if let Some(cursor) = frame.cursor.take() {
+            composite_cursor(&mut frame, &cursor);
+        }
+        if self.encoder.is_none() {
+            self.encoder = Some(LinuxVideoEncoder::new(
+                self.provider,
+                self.width,
+                self.height,
+                self.fps,
+                self.bitrate,
+                frame.format,
+                EncodingPriority::Speed,
+            )?);
+        }
+        let packets = self
+            .encoder
+            .as_mut()
+            .expect("Linux HLS encoder was initialized")
+            .encode(RawVideoFrame {
+                data: &frame.data,
+                stride: frame.stride,
+                width: frame.width,
+                height: frame.height,
+                format: frame.format,
+                timestamp: frame.timestamp,
+            })?;
+        for packet in packets {
+            self.write_packet(&packet.data, packet.timestamp, packet.keyframe)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct AvccPacket {
+    data: Vec<u8>,
+    parameter_sets: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+#[cfg(target_os = "linux")]
+fn annex_b_to_avcc(data: &[u8]) -> Result<AvccPacket> {
+    let units = annex_b_units(data)?;
+    let mut output = Vec::with_capacity(data.len());
+    let mut sps = None;
+    let mut pps = None;
+    for unit in units {
+        if unit.len() > u32::MAX as usize {
+            bail!("H.264 NAL unit exceeded the AVCC length range");
+        }
+        match unit.first().map(|byte| byte & 0x1f) {
+            Some(7) => sps = Some(unit.to_vec()),
+            Some(8) => pps = Some(unit.to_vec()),
+            _ => {}
+        }
+        output.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+        output.extend_from_slice(unit);
+    }
+    let parameter_sets = sps.zip(pps);
+    Ok(AvccPacket {
+        data: output,
+        parameter_sets,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn annex_b_units(data: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let length = if data[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        starts.push((index, length));
+        index += length;
+    }
+    if starts.is_empty() {
+        bail!("Linux H.264 packet was not Annex-B framed");
+    }
+    let mut units = Vec::with_capacity(starts.len());
+    for (position, (start, prefix)) in starts.iter().copied().enumerate() {
+        let end = starts.get(position + 1).map_or(data.len(), |next| next.0);
+        let unit = &data[start + prefix..end];
+        if !unit.is_empty() {
+            units.push(unit);
+        }
+    }
+    if units.is_empty() {
+        bail!("Linux H.264 packet contained no NAL units");
+    }
+    Ok(units)
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn advance_timestamp(last: Option<u64>, candidate: u64, fallback_step: u64) -> u64 {
     match last {
         Some(last) if candidate <= last => last.saturating_add(fallback_step),
@@ -802,6 +1432,7 @@ fn advance_timestamp(last: Option<u64>, candidate: u64, fallback_step: u64) -> u
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 const fn live_keyframe_interval(fps: u32) -> i32 {
     let interval = fps.saturating_add(1) / 2;
     if interval == 0 { 1 } else { interval as i32 }
@@ -1047,6 +1678,12 @@ impl HlsStore {
             init_segments: self.init_requests.load(Ordering::Relaxed),
             media_segments: self.segment_requests.load(Ordering::Relaxed),
         }
+    }
+}
+
+impl EncodedAudioSink for HlsStore {
+    fn submit_audio(&self, frame: EncodedAudioFrame) -> Result<()> {
+        self.push_audio(frame)
     }
 }
 
@@ -1396,6 +2033,7 @@ fn write_http(
     Ok(())
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn avcc_contains_nal_type(data: &[u8], wanted: u8) -> Result<bool> {
     let mut offset = 0;
     while offset < data.len() {
@@ -1419,6 +2057,7 @@ fn avc_codec_string(sps: &[u8]) -> Option<String> {
     (sps.len() >= 4).then(|| format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]))
 }
 
+#[cfg(target_os = "macos")]
 fn h264_parameter_sets(sample: *mut c_void) -> Result<(Vec<u8>, Vec<u8>)> {
     if sample.is_null() {
         bail!("encoded keyframe had no CoreMedia sample buffer");
@@ -1471,7 +2110,8 @@ const fn even(value: u32) -> u32 {
     value - value % 2
 }
 
-#[cfg_attr(target_os = "macos", link(name = "CoreMedia", kind = "framework"))]
+#[cfg(target_os = "macos")]
+#[link(name = "CoreMedia", kind = "framework")]
 unsafe extern "C" {
     fn CMSampleBufferGetFormatDescription(sample_buffer: *mut c_void) -> *mut c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -1486,18 +2126,35 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::audio;
     use super::{
         HlsRoute, HlsState, HlsStore, Segment, TIMESCALE, advance_timestamp, avc_codec_string,
         avcc_contains_nal_type, id3_timestamp, live_keyframe_interval, master_playlist, playlist,
         routed_response, validate_cast_hosts, validate_serve_only,
     };
-    use crate::audio::{self, EncodedAudioFrame};
+    #[cfg(target_os = "linux")]
+    use super::{
+        LinuxFrameCadence, LinuxLivePipeline, LiveQueueObserver, annex_b_to_avcc, annex_b_units,
+    };
+    #[cfg(target_os = "macos")]
+    use crate::audio;
+    use crate::desktop::EncodedAudioFrame;
+    #[cfg(target_os = "linux")]
+    use crate::{
+        desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameWorker},
+        linux_encoder::RawPixelFormat,
+        media::H264Provider,
+        portal::{CapturedFrame, FrameSink},
+    };
     use std::{
         collections::HashMap,
         collections::VecDeque,
         net::IpAddr,
         sync::{Arc, atomic::AtomicBool},
     };
+    #[cfg(target_os = "linux")]
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn detects_idr_in_avcc() {
@@ -1509,6 +2166,116 @@ mod tests {
     #[test]
     fn rejects_truncated_avcc() {
         assert!(avcc_contains_nal_type(&[0, 0, 0, 4, 0x65], 5).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn converts_linux_annex_b_and_extracts_parameter_sets() {
+        let annex_b = [
+            0, 0, 0, 1, 0x67, 0x4d, 0, 0x1f, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa,
+        ];
+        let units = annex_b_units(&annex_b).unwrap();
+        assert_eq!(units.len(), 3);
+        let converted = annex_b_to_avcc(&annex_b).unwrap();
+        assert_eq!(
+            converted.parameter_sets,
+            Some((vec![0x67, 0x4d, 0, 0x1f], vec![0x68, 0xce]))
+        );
+        assert_eq!(&converted.data[..4], &4_u32.to_be_bytes());
+        assert!(annex_b_units(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn openh264_linux_pipeline_publishes_hls_when_module_is_available() {
+        if crate::setup::find_compatible().unwrap().is_none() {
+            return;
+        }
+        let store = Arc::new(HlsStore::new(false));
+        let mut pipeline = LinuxLivePipeline {
+            encoder: None,
+            muxer: None,
+            store: Arc::clone(&store),
+            frame_index: 0,
+            frames_in_segment: 0,
+            segment_start_timestamp: None,
+            fps: 30,
+            width: 64,
+            height: 64,
+            bitrate: 1_000_000,
+            provider: H264Provider::Openh264,
+            audio_submitter: None,
+        };
+        for index in 0..65_u64 {
+            let mut data = vec![0_u8; 64 * 64 * 4];
+            data[0] = index as u8;
+            pipeline
+                .process_frame(
+                    CapturedFrame {
+                        data,
+                        stride: 64 * 4,
+                        width: 64,
+                        height: 64,
+                        format: RawPixelFormat::Bgra,
+                        timestamp: index * 3_000,
+                        cursor: None,
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        assert!(store.wait_until_ready(Duration::ZERO, 1));
+        assert!(store.response("/master.m3u8", false).unwrap().is_some());
+        assert!(store.response("/segment-0.m4s", false).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_cadence_publishes_hls_from_one_damage_frame_when_module_is_available() {
+        if crate::setup::find_compatible().unwrap().is_none() {
+            return;
+        }
+        let store = Arc::new(HlsStore::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let pipeline = LinuxLivePipeline {
+            encoder: None,
+            muxer: None,
+            store: Arc::clone(&store),
+            frame_index: 0,
+            frames_in_segment: 0,
+            segment_start_timestamp: None,
+            fps: 10,
+            width: 64,
+            height: 64,
+            bitrate: 1_000_000,
+            provider: H264Provider::Openh264,
+            audio_submitter: None,
+        };
+        let observer: Arc<dyn LatestFrameObserver> = Arc::new(LiveQueueObserver);
+        let (submitter, mut encoder_worker) = LatestFrameWorker::start(
+            pipeline,
+            None,
+            Arc::clone(&failure),
+            observer,
+            "test-linux-hls-encoder",
+        )
+        .unwrap();
+        let (sink, mut cadence) =
+            LinuxFrameCadence::start(submitter, 10, Arc::clone(&failure)).unwrap();
+        sink.submit(CapturedFrame {
+            data: vec![0_u8; 64 * 64 * 4],
+            stride: 64 * 4,
+            width: 64,
+            height: 64,
+            format: RawPixelFormat::Bgra,
+            timestamp: 0,
+            cursor: None,
+        });
+
+        assert!(store.wait_until_ready(Duration::from_secs(3), 1));
+        cadence.stop().unwrap();
+        encoder_worker.stop().unwrap();
+        assert_eq!(*failure.lock().unwrap(), None);
     }
 
     #[test]

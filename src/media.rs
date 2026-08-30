@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -398,6 +398,229 @@ const VIDEO_BIT_RATE: usize = 6_000_000;
 const AUDIO_BIT_RATE: usize = 192_000;
 const AUDIO_RATE: u32 = 48_000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub enum H264Provider {
+    #[default]
+    Auto,
+    Nvenc,
+    Vaapi,
+    Openh264,
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+static H264_PROVIDER: AtomicU8 = AtomicU8::new(0);
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn configure_h264_provider(provider: H264Provider) {
+    H264_PROVIDER.store(provider as u8, Ordering::Relaxed);
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn configured_h264_provider() -> H264Provider {
+    match H264_PROVIDER.load(Ordering::Relaxed) {
+        1 => H264Provider::Nvenc,
+        2 => H264Provider::Vaapi,
+        3 => H264Provider::Openh264,
+        _ => H264Provider::Auto,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_encoder_name() -> Result<&'static str> {
+    select_linux_encoder(configured_h264_provider())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn select_linux_encoder(provider: H264Provider) -> Result<&'static str> {
+    available_linux_encoders(provider).map(|encoders| encoders[0])
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn available_linux_encoders(provider: H264Provider) -> Result<Vec<&'static str>> {
+    let available = |name: &'static str| {
+        encoder::find_by_name(name).is_some()
+            && match name {
+                "h264_nvenc" => {
+                    std::path::Path::new("/dev/nvidia0").exists()
+                        && unsafe { libloading::Library::new("libnvidia-encode.so.1") }.is_ok()
+                }
+                "h264_vaapi" => {
+                    has_vaapi_render_node(std::path::Path::new("/dev/dri"))
+                        && unsafe { libloading::Library::new("libva-drm.so.2") }.is_ok()
+                }
+                "libopenh264" => crate::setup::find_compatible().ok().flatten().is_some(),
+                _ => false,
+            }
+    };
+    resolve_linux_providers(provider, available)
+}
+
+#[cfg(target_os = "linux")]
+fn has_vaapi_render_node(directory: &std::path::Path) -> bool {
+    directory.read_dir().is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_dri_render_node_name)
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_dri_render_node_name(name: &str) -> bool {
+    name.strip_prefix("renderD").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(test)]
+fn resolve_linux_provider(
+    requested: H264Provider,
+    available: impl FnMut(&'static str) -> bool,
+) -> Result<&'static str> {
+    resolve_linux_providers(requested, available).map(|providers| providers[0])
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn resolve_linux_providers(
+    requested: H264Provider,
+    mut available: impl FnMut(&'static str) -> bool,
+) -> Result<Vec<&'static str>> {
+    let candidates = match requested {
+        H264Provider::Auto => ["h264_nvenc", "h264_vaapi", "libopenh264"].as_slice(),
+        H264Provider::Nvenc => ["h264_nvenc"].as_slice(),
+        H264Provider::Vaapi => ["h264_vaapi"].as_slice(),
+        H264Provider::Openh264 => ["libopenh264"].as_slice(),
+    };
+    let available = candidates
+        .iter()
+        .copied()
+        .filter(|name| available(name))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        Err(match requested {
+            H264Provider::Auto | H264Provider::Openh264 => anyhow!(
+                "no usable Linux H.264 encoder is available; install NVENC/VA-API support or run `cast setup --yes` for OpenH264"
+            ),
+            H264Provider::Nvenc => anyhow!(
+                "the requested NVENC provider is unavailable; check the NVIDIA device, driver, and linked FFmpeg support"
+            ),
+            H264Provider::Vaapi => anyhow!(
+                "the requested VA-API provider is unavailable; check /dev/dri access, the VA-API driver, and linked FFmpeg support"
+            ),
+        })
+    } else {
+        Ok(available)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct VaapiFrames {
+    device: *mut ffmpeg::ffi::AVBufferRef,
+    frames: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for VaapiFrames {}
+
+#[cfg(target_os = "linux")]
+impl VaapiFrames {
+    pub(crate) fn attach(
+        encoder: &mut encoder::video::Video,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let mut device = std::ptr::null_mut();
+        let status = unsafe {
+            ffmpeg::ffi::av_hwdevice_ctx_create(
+                &mut device,
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            bail!(
+                "could not open the default VA-API device: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let frames = unsafe { ffmpeg::ffi::av_hwframe_ctx_alloc(device) };
+        if frames.is_null() {
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device) };
+            bail!("could not allocate a VA-API frame context");
+        }
+        let context = unsafe { (*frames).data.cast::<ffmpeg::ffi::AVHWFramesContext>() };
+        unsafe {
+            (*context).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*context).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*context).width = width as i32;
+            (*context).height = height as i32;
+            (*context).initial_pool_size = 8;
+        }
+        let status = unsafe { ffmpeg::ffi::av_hwframe_ctx_init(frames) };
+        if status < 0 {
+            let mut frames = frames;
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut frames);
+                ffmpeg::ffi::av_buffer_unref(&mut device);
+            }
+            bail!(
+                "could not initialize VA-API frames: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let encoder_frames = unsafe { ffmpeg::ffi::av_buffer_ref(frames) };
+        if encoder_frames.is_null() {
+            let mut frames = frames;
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut frames);
+                ffmpeg::ffi::av_buffer_unref(&mut device);
+            }
+            bail!("could not retain the VA-API frame context");
+        }
+        unsafe { (*encoder.as_mut_ptr()).hw_frames_ctx = encoder_frames };
+        Ok(Self { device, frames })
+    }
+
+    pub(crate) fn upload(&self, source: &frame::Video) -> Result<frame::Video> {
+        let mut target = frame::Video::empty();
+        let status =
+            unsafe { ffmpeg::ffi::av_hwframe_get_buffer(self.frames, target.as_mut_ptr(), 0) };
+        if status < 0 {
+            bail!(
+                "could not allocate a VA-API video surface: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        let status = unsafe {
+            ffmpeg::ffi::av_hwframe_transfer_data(target.as_mut_ptr(), source.as_ptr(), 0)
+        };
+        if status < 0 {
+            bail!(
+                "could not upload a video frame to VA-API: {}",
+                ffmpeg::Error::from(status)
+            );
+        }
+        target.set_pts(source.pts());
+        target.set_kind(source.kind());
+        Ok(target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VaapiFrames {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.frames);
+            ffmpeg::ffi::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
 struct VideoTranscoder {
     output_index: usize,
     input_time_base: Rational,
@@ -409,6 +632,8 @@ struct VideoTranscoder {
     output_height: u32,
     frame_duration: i64,
     last_output_dts: Option<i64>,
+    #[cfg(target_os = "linux")]
+    vaapi: Option<VaapiFrames>,
 }
 
 impl VideoTranscoder {
@@ -421,17 +646,33 @@ impl VideoTranscoder {
             .decoder()
             .video()
             .context("could not open the source video decoder")?;
-        let hardware = encoder::find_by_name("h264_videotoolbox");
-        let selected_encoder = hardware
-            .or_else(|| encoder::find(codec::Id::H264))
-            .ok_or_else(|| anyhow!("linked FFmpeg libraries do not provide an H.264 encoder"))?;
+        #[cfg(target_os = "macos")]
+        let (selected_encoder, hardware) = {
+            let hardware = encoder::find_by_name("h264_videotoolbox");
+            let selected = hardware
+                .or_else(|| encoder::find(codec::Id::H264))
+                .ok_or_else(|| {
+                    anyhow!("linked FFmpeg libraries do not provide an H.264 encoder")
+                })?;
+            (selected, hardware.is_some())
+        };
+        #[cfg(target_os = "linux")]
+        let selected_encoder = {
+            let name = linux_encoder_name()?;
+            encoder::find_by_name(name)
+                .ok_or_else(|| anyhow!("selected H.264 encoder {name} disappeared"))?
+        };
         let advertised_formats = selected_encoder
             .video()
             .context("selected H.264 encoder is not a video encoder")?
             .formats()
             .map(|formats| formats.collect::<Vec<_>>())
             .unwrap_or_default();
-        let output_format = if advertised_formats.contains(&Pixel::NV12) {
+        #[cfg(target_os = "linux")]
+        let uses_vaapi = selected_encoder.name() == "h264_vaapi";
+        let output_format = if advertised_formats.contains(&Pixel::NV12)
+            || cfg!(target_os = "linux") && selected_encoder.name() == "h264_vaapi"
+        {
             Pixel::NV12
         } else {
             Pixel::YUV420P
@@ -453,6 +694,13 @@ impl VideoTranscoder {
         encoder.set_width(output_width);
         encoder.set_height(output_height);
         encoder.set_aspect_ratio(decoder.aspect_ratio());
+        #[cfg(target_os = "linux")]
+        encoder.set_format(if uses_vaapi {
+            Pixel::VAAPI
+        } else {
+            output_format
+        });
+        #[cfg(target_os = "macos")]
         encoder.set_format(output_format);
         encoder.set_bit_rate(VIDEO_BIT_RATE);
         encoder.set_max_bit_rate(VIDEO_BIT_RATE);
@@ -483,15 +731,25 @@ impl VideoTranscoder {
             encoder_flags.insert(codec::Flags::GLOBAL_HEADER);
         }
         encoder.set_flags(encoder_flags);
+        #[cfg(target_os = "linux")]
+        let vaapi = uses_vaapi
+            .then(|| VaapiFrames::attach(&mut encoder, output_width, output_height))
+            .transpose()?;
         let mut options = Dictionary::new();
         options.set("profile", "main");
-        if hardware.is_some() {
+        #[cfg(target_os = "macos")]
+        if hardware {
             options.set("allow_sw", "1");
             options.set("realtime", "0");
         }
         let encoder = encoder
             .open_as_with(selected_encoder, options)
-            .context("could not open the H.264 compatibility encoder")?;
+            .with_context(|| {
+                format!(
+                    "could not open the selected H.264 compatibility encoder {}",
+                    selected_encoder.name()
+                )
+            })?;
         output_stream.set_parameters(&encoder);
         let scaler = ScalingContext::get(
             decoder.format(),
@@ -514,6 +772,8 @@ impl VideoTranscoder {
             output_height,
             frame_duration,
             last_output_dts: None,
+            #[cfg(target_os = "linux")]
+            vaapi,
         })
     }
 
@@ -563,6 +823,18 @@ impl VideoTranscoder {
                 .context("could not convert a decoded video frame")?;
             converted.set_pts(decoded.timestamp());
             converted.set_kind(ffmpeg::picture::Type::None);
+            #[cfg(target_os = "linux")]
+            if let Some(vaapi) = &self.vaapi {
+                let uploaded = vaapi.upload(&converted)?;
+                self.encoder
+                    .send_frame(&uploaded)
+                    .context("VA-API H.264 encoder rejected a video frame")?;
+            } else {
+                self.encoder
+                    .send_frame(&converted)
+                    .context("H.264 encoder rejected a video frame")?;
+            }
+            #[cfg(target_os = "macos")]
             self.encoder
                 .send_frame(&converted)
                 .context("H.264 encoder rejected a video frame")?;
@@ -1249,6 +1521,60 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn linux_auto_provider_prefers_nvenc_then_vaapi_then_openh264() {
+        assert_eq!(
+            resolve_linux_providers(H264Provider::Auto, |_| true).unwrap(),
+            ["h264_nvenc", "h264_vaapi", "libopenh264"]
+        );
+        assert_eq!(
+            resolve_linux_provider(H264Provider::Auto, |_| true).unwrap(),
+            "h264_nvenc"
+        );
+        assert_eq!(
+            resolve_linux_provider(H264Provider::Auto, |name| name != "h264_nvenc").unwrap(),
+            "h264_vaapi"
+        );
+        assert_eq!(
+            resolve_linux_provider(H264Provider::Auto, |name| name == "libopenh264").unwrap(),
+            "libopenh264"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vaapi_detection_accepts_every_numbered_render_node() {
+        assert!(is_dri_render_node_name("renderD128"));
+        assert!(is_dri_render_node_name("renderD129"));
+        assert!(!is_dri_render_node_name("renderD"));
+        assert!(!is_dri_render_node_name("card0"));
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::File::create(directory.path().join("renderD129")).unwrap();
+        assert!(has_vaapi_render_node(directory.path()));
+    }
+
+    #[test]
+    fn explicit_linux_provider_never_falls_back() {
+        let error =
+            resolve_linux_provider(H264Provider::Nvenc, |name| name == "h264_vaapi").unwrap_err();
+        assert!(error.to_string().contains("requested NVENC"));
+        assert_eq!(
+            resolve_linux_provider(H264Provider::Vaapi, |name| name == "h264_vaapi").unwrap(),
+            "h264_vaapi"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linked_linux_ffmpeg_registers_delayed_and_hardware_encoders() {
+        assert!(encoder::find_by_name("h264_nvenc").is_some());
+        let module_available = crate::setup::find_compatible().unwrap().is_some();
+        if module_available {
+            assert!(encoder::find_by_name("libopenh264").is_some());
+        }
+    }
 
     fn media(container: &str, video: codec::Id, audio: Option<codec::Id>) -> MediaInfo {
         MediaInfo {

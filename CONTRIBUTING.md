@@ -4,12 +4,10 @@ Thanks for helping improve Cast. This guide covers the local development setup, 
 
 ## Prerequisites
 
-Developing Cast requires:
+Developing Cast requires Rust 1.88 or newer. Platform prerequisites are:
 
-- macOS 13 or newer;
-- Rust 1.88 or newer;
-- Xcode 15 or newer, including its Swift toolchain;
-- Homebrew packages `nasm` and `pkg-config`.
+- macOS 13 or newer, Xcode 15 or newer (including Swift), and Homebrew `nasm`/`pkg-config`; or
+- glibc Linux with `build-essential`, `libpipewire-0.3-dev`, `libva-dev`, `nasm`, and `pkg-config` (Ubuntu 22.04 package names).
 
 The project links pinned FFmpeg libraries for media inspection and compatibility conversion. Build them once into a local directory, then point Cargo at their pkg-config metadata:
 
@@ -19,6 +17,16 @@ brew install nasm pkg-config
 PKG_CONFIG_PATH="$PWD/.build/ffmpeg-dist/lib/pkgconfig" \
   cargo build --release
 ```
+
+On Ubuntu, replace the Homebrew command with:
+
+```sh
+sudo apt-get install build-essential libpipewire-0.3-dev libva-dev nasm pkg-config
+```
+
+`vendor/libspa` is the pinned pipewire-rs 0.9.2 crate with a narrow compatibility patch for the
+`spa_video_info_raw` layout shipped by Ubuntu 22.04. Keep its version aligned with the `pipewire`
+dependency and verify changes against both the Ubuntu 22.04 release runner and current headers.
 
 The helper builds FFmpeg 8.0.1 shared libraries without FFmpeg command-line programs. Release archives include those libraries, so end users do not need this setup.
 
@@ -39,18 +47,18 @@ Before opening a pull request, run the local quality gate:
 
 ```sh
 cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo build --locked --release
 ```
 
-`profile --synthetic` deliberately bypasses ScreenCaptureKit and generates a deterministic workload, which makes it the preferred regression check for capture, encoder, and transport changes. `capture` is a diagnostic command that writes length-prefixed H.264 samples in AVCC form, not a playable video file.
+`profile --synthetic` deliberately bypasses platform capture and generates a deterministic workload, which makes it the preferred regression check for encoder and transport changes. The `capture` diagnostic writes AVCC on macOS and Annex-B H.264 on Linux; neither output is a standalone media file.
 
 ## Architecture notes
 
 Cast discovers receivers with mDNS and controls them through a pinned revision of the [`rust-cast` fork](https://github.com/michaelishri/rust-cast/tree/cast-rs). Local video is served only from the receiver-facing LAN interface at a fresh random URL; the server supports HTTP ranges so receivers can seek and read MP4 metadata efficiently.
 
-The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. The `desktop` path uses ScreenCaptureKit, VideoToolbox, and (when `--audio` is set) an AudioToolbox AAC-LC encoder. The low-latency path performs the Cast Streaming offer/answer exchange and sends H.264 and AAC as separately encrypted Cast RTP streams. HLS remains a compatibility fallback, with fMP4 video and an alternate packed-AAC rendition.
+The `video` path either serves compatible media directly, remuxes it, or prepares fragmented-MP4 HLS while playback proceeds. It retains prepared segments until shutdown so backward seeking works. On macOS, `desktop` uses ScreenCaptureKit, VideoToolbox, and AudioToolbox. On Linux, it uses the ScreenCast portal, PipeWire, FFmpeg AAC, and NVENC/VA-API/OpenH264. The low-latency path performs the Cast Streaming offer/answer exchange and sends H.264 and AAC as separately encrypted Cast RTP streams. HLS remains a compatibility fallback, with fMP4 video and an alternate packed-AAC rendition.
 
 The reusable local-video playback controller owns inspection, preparation, the private HTTP/HLS server, Cast control, and cleanup on a worker thread. Presentation adapters consume structured preparation, status, volume, completion, and categorized-failure events. Receiver handoff deliberately keeps the prepared source alive, interpolates the latest receiver position, and loads it on the new receiver with the same paused/playing intent. Keep the existing line-oriented `video` adapter compatible when changing this layer.
 
@@ -74,4 +82,7 @@ Follow the full [release checklist](docs/RELEASE_CHECKLIST.md). After the versio
 ./scripts/release.sh
 ```
 
-The helper runs formatting, Clippy, and tests, then pushes the matching tag. GitHub Actions verifies the tag/version agreement, builds separate Apple Silicon and Intel archives, creates SHA-256 files, and publishes the GitHub release. The checklist also covers the Homebrew formula, bottles, verification, and recovery.
+The helper runs formatting, Clippy, and tests, then pushes the matching tag. GitHub Actions verifies
+the tag/version agreement, builds separate Apple Silicon, Intel, Linux x86_64, and Linux aarch64
+archives, audits Linux dynamic-library resolution, creates SHA-256 files, and publishes the GitHub
+release. The checklist also covers the Homebrew formula, bottles, verification, and recovery.

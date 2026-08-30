@@ -3,16 +3,27 @@ mod audio;
 #[cfg(target_os = "macos")]
 mod capture;
 mod cast;
+mod desktop;
 mod discovery;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+mod linux_audio;
+#[cfg(target_os = "linux")]
+mod linux_desktop;
+#[cfg(target_os = "linux")]
+mod linux_encoder;
+#[cfg(target_os = "linux")]
+mod linux_pipewire;
 mod live;
 mod media;
 mod media_server;
-#[cfg(target_os = "macos")]
 mod mirror;
 mod network;
 mod playback;
 mod player_controls;
+#[cfg(target_os = "linux")]
+mod portal;
+#[cfg(target_os = "linux")]
+mod setup;
 #[cfg(target_os = "macos")]
 mod synthetic;
 mod tui;
@@ -30,13 +41,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Cast local video and a macOS desktop to Google Cast devices"
+    about = "Cast local video and a desktop to Google Cast devices"
 )]
 struct Cli {
     /// Increase diagnostic output; use -vv for frame-level tracing.
@@ -54,9 +65,26 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         timeout: u64,
     },
+    #[cfg(target_os = "linux")]
+    /// Install or check the optional Cisco OpenH264 runtime module.
+    Setup {
+        /// Confirm the verified download without prompting.
+        #[arg(long)]
+        yes: bool,
+        /// Check local availability without downloading or changing files.
+        #[arg(long, conflicts_with = "yes")]
+        check: bool,
+    },
     #[cfg(target_os = "macos")]
     /// List displays visible to macOS ScreenCaptureKit.
     Displays,
+    #[cfg(target_os = "linux")]
+    /// Report XDG desktop portal capture capabilities and remembered-source status.
+    Displays {
+        /// Open the privacy-preserving source chooser and remember the selected monitor or window.
+        #[arg(long)]
+        select_source: bool,
+    },
     /// Ask a Cast device to play an existing media URL.
     Url {
         /// Chromecast IP address (shown by `cast devices`).
@@ -88,7 +116,7 @@ enum Command {
         /// Cast control port.
         #[arg(long, visible_alias = "port", default_value_t = 8009)]
         cast_port: u16,
-        /// Local HTTP port; 0 asks macOS to select an available port.
+        /// Local HTTP port; 0 asks the OS to select an available port.
         #[arg(long, default_value_t = 0)]
         http_port: u16,
         /// Initial playback position in seconds.
@@ -100,6 +128,10 @@ enum Command {
         /// Convert incompatible containers/codecs using linked media libraries.
         #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
         transcode: TranscodeMode,
+        #[cfg(target_os = "linux")]
+        /// Linux H.264 encoder used when video conversion is required.
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
         /// Deliver transcoded media as it is prepared or after a complete MP4 is ready.
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
@@ -121,6 +153,10 @@ enum Command {
         /// Convert incompatible containers/codecs using linked media libraries.
         #[arg(long, value_enum, default_value_t = TranscodeMode::Auto)]
         transcode: TranscodeMode,
+        #[cfg(target_os = "linux")]
+        /// Linux H.264 encoder used when video conversion is required.
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
         /// Deliver transcoded media incrementally or after a complete MP4 is ready.
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
@@ -139,6 +175,25 @@ enum Command {
         bitrate: i32,
         /// Output is length-prefixed H.264 (AVCC), not yet a standalone media file.
         #[arg(long, default_value = "capture.avcc")]
+        output: PathBuf,
+    },
+    #[cfg(target_os = "linux")]
+    /// Capture and encode a short Annex-B H.264 diagnostic sample through the desktop portal.
+    Capture {
+        /// Force a new portal source chooser instead of reusing the remembered source.
+        #[arg(long)]
+        select_source: bool,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: u32,
+        #[arg(long, default_value_t = 6_000_000)]
+        bitrate: u32,
+        /// Linux H.264 encoder used for the diagnostic capture.
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
+        /// Output is Annex-B H.264 elementary-stream data.
+        #[arg(long, default_value = "capture.h264")]
         output: PathBuf,
     },
     #[cfg(target_os = "macos")]
@@ -188,6 +243,47 @@ enum Command {
         #[arg(long)]
         fixed_bitrate: bool,
         /// Prefer encoding quality over VideoToolbox's lowest-latency speed path.
+        #[arg(long)]
+        quality_priority: bool,
+    },
+    #[cfg(target_os = "linux")]
+    /// Measure the portal mirroring path and recommend receiver latency settings.
+    Profile {
+        /// Chromecast IP address; repeat --host to profile a receiver group.
+        #[arg(long, required = true, action = ArgAction::Append)]
+        host: Vec<IpAddr>,
+        #[arg(long, default_value_t = 8009)]
+        cast_port: u16,
+        /// Force a new portal source chooser instead of reusing the remembered source.
+        #[arg(long, conflicts_with_all = ["extend", "synthetic"])]
+        select_source: bool,
+        /// Create one portal virtual source per receiver when supported by the compositor.
+        #[arg(long, conflicts_with_all = ["select_source", "synthetic", "auto_tune"])]
+        extend: bool,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(10..=3600))]
+        seconds: u64,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=5000))]
+        probe_delay_ms: u64,
+        /// Use a deterministic synthetic workload without opening the portal.
+        #[arg(long)]
+        synthetic: bool,
+        #[arg(long, requires = "synthetic")]
+        auto_tune: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: u32,
+        #[arg(long, default_value_t = 1280, value_parser = clap::value_parser!(u32).range(2..=3840))]
+        width: u32,
+        #[arg(long, default_value_t = 720, value_parser = clap::value_parser!(u32).range(2..=2160))]
+        height: u32,
+        #[arg(long, default_value_t = 6_000_000)]
+        bitrate: i32,
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1000))]
+        max_frame_age_ms: Option<u64>,
+        #[arg(long)]
+        fixed_bitrate: bool,
+        /// Prefer encoding quality over the lowest-latency scaler and provider preset.
         #[arg(long)]
         quality_priority: bool,
     },
@@ -243,6 +339,49 @@ enum Command {
         #[arg(long)]
         serve_only: bool,
     },
+    #[cfg(target_os = "linux")]
+    /// Capture a portal-selected desktop source and cast it to Google Cast receivers.
+    Desktop {
+        #[arg(long, required = true, action = ArgAction::Append)]
+        host: Vec<IpAddr>,
+        #[arg(long, default_value_t = 8009)]
+        cast_port: u16,
+        #[arg(long, value_enum, default_value_t = DesktopTransport::Mirror)]
+        transport: DesktopTransport,
+        /// Force a new portal source chooser instead of reusing the remembered source.
+        #[arg(long, conflicts_with = "extend")]
+        select_source: bool,
+        /// Create one portal virtual source per receiver when supported by the compositor.
+        #[arg(long, conflicts_with = "select_source")]
+        extend: bool,
+        #[arg(long)]
+        audio: bool,
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..=5000))]
+        target_delay_ms: u64,
+        #[arg(long, default_value_t = 8080)]
+        http_port: u16,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: u32,
+        #[arg(long, default_value_t = 1280, value_parser = clap::value_parser!(u32).range(2..=3840))]
+        width: u32,
+        #[arg(long, default_value_t = 720, value_parser = clap::value_parser!(u32).range(2..=2160))]
+        height: u32,
+        #[arg(long, default_value_t = 6_000_000)]
+        bitrate: i32,
+        #[arg(long, value_enum, default_value_t = H264Encoder::Auto)]
+        encoder: H264Encoder,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1000))]
+        max_frame_age_ms: Option<u64>,
+        #[arg(long)]
+        fixed_bitrate: bool,
+        /// Prefer encoding quality over the lowest-latency scaler and provider preset.
+        #[arg(long)]
+        quality_priority: bool,
+        #[arg(long)]
+        seconds: Option<u64>,
+        #[arg(long)]
+        serve_only: bool,
+    },
     #[cfg(target_os = "macos")]
     /// Internal owner process for a temporary virtual display.
     #[command(name = "__virtual-display-helper", hide = true)]
@@ -285,6 +424,27 @@ enum TranscodeMode {
     Always,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, ValueEnum)]
+enum H264Encoder {
+    Auto,
+    Nvenc,
+    Vaapi,
+    Openh264,
+}
+
+#[cfg(target_os = "linux")]
+impl From<H264Encoder> for media::H264Provider {
+    fn from(value: H264Encoder) -> Self {
+        match value {
+            H264Encoder::Auto => Self::Auto,
+            H264Encoder::Nvenc => Self::Nvenc,
+            H264Encoder::Vaapi => Self::Vaapi,
+            H264Encoder::Openh264 => Self::Openh264,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum TranscodeDeliveryMode {
     Complete,
@@ -292,6 +452,7 @@ enum TranscodeDeliveryMode {
 }
 
 fn main() -> Result<()> {
+    install_crypto_provider()?;
     let cli = Cli::parse();
     let interactive_video = interactive_video_output(
         cli.verbose,
@@ -312,8 +473,12 @@ fn main() -> Result<()> {
                 print_devices(&devices);
             }
         }
+        #[cfg(target_os = "linux")]
+        Command::Setup { yes, check } => setup::run(yes, check)?,
         #[cfg(target_os = "macos")]
         Command::Displays => capture::list_displays()?,
+        #[cfg(target_os = "linux")]
+        Command::Displays { select_source } => portal::list_sources(select_source)?,
         Command::Url {
             host,
             port,
@@ -352,38 +517,19 @@ fn main() -> Result<()> {
             start_at,
             content_type,
             transcode,
+            #[cfg(target_os = "linux")]
+            encoder,
             transcode_delivery,
-        } => video::cast_video(video::VideoOptions {
-            cast_host: host,
-            cast_port,
-            http_port,
-            file,
-            start_at,
-            content_type,
-            compatibility_mode: match transcode {
-                TranscodeMode::Auto => media::CompatibilityMode::Auto,
-                TranscodeMode::Never => media::CompatibilityMode::Never,
-                TranscodeMode::Always => media::CompatibilityMode::Always,
-            },
-            transcode_delivery: match transcode_delivery {
-                TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
-                TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
-            },
-            interactive: interactive_video,
-        })?,
-        Command::Tui {
-            directory,
-            host,
-            cast_port,
-            http_port,
-            transcode,
-            transcode_delivery,
-        } => tui::run(
-            tui::TuiOptions {
-                directory,
-                host,
+        } => {
+            #[cfg(target_os = "linux")]
+            media::configure_h264_provider(encoder.into());
+            video::cast_video(video::VideoOptions {
+                cast_host: host,
                 cast_port,
                 http_port,
+                file,
+                start_at,
+                content_type,
                 compatibility_mode: match transcode {
                     TranscodeMode::Auto => media::CompatibilityMode::Auto,
                     TranscodeMode::Never => media::CompatibilityMode::Never,
@@ -393,11 +539,42 @@ fn main() -> Result<()> {
                     TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
                     TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
                 },
-            },
-            log_capture
-                .expect("TUI log capture was initialized")
-                .receiver,
-        )?,
+                interactive: interactive_video,
+            })?
+        }
+        Command::Tui {
+            directory,
+            host,
+            cast_port,
+            http_port,
+            transcode,
+            #[cfg(target_os = "linux")]
+            encoder,
+            transcode_delivery,
+        } => {
+            #[cfg(target_os = "linux")]
+            media::configure_h264_provider(encoder.into());
+            tui::run(
+                tui::TuiOptions {
+                    directory,
+                    host,
+                    cast_port,
+                    http_port,
+                    compatibility_mode: match transcode {
+                        TranscodeMode::Auto => media::CompatibilityMode::Auto,
+                        TranscodeMode::Never => media::CompatibilityMode::Never,
+                        TranscodeMode::Always => media::CompatibilityMode::Always,
+                    },
+                    transcode_delivery: match transcode_delivery {
+                        TranscodeDeliveryMode::Complete => video::TranscodeDelivery::Complete,
+                        TranscodeDeliveryMode::Incremental => video::TranscodeDelivery::Incremental,
+                    },
+                },
+                log_capture
+                    .expect("TUI log capture was initialized")
+                    .receiver,
+            )?
+        }
         #[cfg(target_os = "macos")]
         Command::Capture {
             display,
@@ -410,6 +587,22 @@ fn main() -> Result<()> {
             duration: Duration::from_secs(seconds),
             fps,
             bitrate,
+            output,
+        })?,
+        #[cfg(target_os = "linux")]
+        Command::Capture {
+            select_source,
+            seconds,
+            fps,
+            bitrate,
+            encoder,
+            output,
+        } => linux_desktop::capture(linux_desktop::CaptureOptions {
+            force_chooser: select_source,
+            duration: Duration::from_secs(seconds),
+            fps,
+            bitrate,
+            provider: encoder.into(),
             output,
         })?,
         #[cfg(target_os = "macos")]
@@ -446,6 +639,46 @@ fn main() -> Result<()> {
                 adaptive_bitrate: !fixed_bitrate,
                 prioritize_encoding_speed: !quality_priority,
                 audio: false,
+            },
+            auto_tune,
+        )?,
+        #[cfg(target_os = "linux")]
+        Command::Profile {
+            host,
+            cast_port,
+            select_source,
+            extend,
+            seconds,
+            probe_delay_ms,
+            synthetic,
+            auto_tune,
+            fps,
+            width,
+            height,
+            bitrate,
+            encoder,
+            max_frame_age_ms,
+            fixed_bitrate,
+            quality_priority,
+        } => mirror::profile_desktop(
+            mirror::MirrorOptions {
+                cast_hosts: host,
+                cast_port,
+                display_id: None,
+                extend,
+                fps,
+                width,
+                height,
+                bitrate,
+                target_delay: Duration::from_millis(probe_delay_ms),
+                duration: Some(Duration::from_secs(seconds)),
+                synthetic,
+                max_frame_age: max_frame_age_ms.map(Duration::from_millis),
+                adaptive_bitrate: !fixed_bitrate,
+                prioritize_encoding_speed: !quality_priority,
+                audio: false,
+                select_source,
+                provider: encoder.into(),
             },
             auto_tune,
         )?,
@@ -513,6 +746,75 @@ fn main() -> Result<()> {
                 })?;
             }
         },
+        #[cfg(target_os = "linux")]
+        Command::Desktop {
+            host,
+            cast_port,
+            transport,
+            select_source,
+            extend,
+            audio,
+            target_delay_ms,
+            http_port,
+            fps,
+            width,
+            height,
+            bitrate,
+            encoder,
+            max_frame_age_ms,
+            fixed_bitrate,
+            quality_priority,
+            seconds,
+            serve_only,
+        } => match transport {
+            DesktopTransport::Mirror => {
+                if serve_only {
+                    anyhow::bail!("--serve-only is available only with --transport hls");
+                }
+                mirror::cast_desktop(mirror::MirrorOptions {
+                    cast_hosts: host,
+                    cast_port,
+                    display_id: None,
+                    extend,
+                    fps,
+                    width,
+                    height,
+                    bitrate,
+                    target_delay: Duration::from_millis(target_delay_ms),
+                    duration: seconds.map(Duration::from_secs),
+                    synthetic: false,
+                    max_frame_age: max_frame_age_ms.map(Duration::from_millis),
+                    adaptive_bitrate: !fixed_bitrate,
+                    prioritize_encoding_speed: !quality_priority,
+                    audio,
+                    select_source,
+                    provider: encoder.into(),
+                })?;
+            }
+            DesktopTransport::Hls => {
+                if max_frame_age_ms.is_some() || fixed_bitrate || quality_priority {
+                    anyhow::bail!(
+                        "--max-frame-age-ms, --fixed-bitrate, and --quality-priority apply only to --transport mirror"
+                    );
+                }
+                live::cast_desktop(live::LiveOptions {
+                    cast_hosts: host,
+                    cast_port,
+                    display_id: None,
+                    extend,
+                    http_port,
+                    fps,
+                    width,
+                    height,
+                    bitrate,
+                    duration: seconds.map(Duration::from_secs),
+                    serve_only,
+                    audio,
+                    select_source,
+                    provider: encoder.into(),
+                })?;
+            }
+        },
         #[cfg(target_os = "macos")]
         Command::VirtualDisplayHelper {
             width,
@@ -526,6 +828,12 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn install_crypto_provider() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("could not install the process-wide Rustls AWS-LC crypto provider"))
 }
 
 fn print_devices(devices: &[discovery::CastService]) {
@@ -634,10 +942,13 @@ fn interactive_video_output(verbosity: u8, stdin_terminal: bool, stdout_terminal
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, TranscodeDeliveryMode, TranscodeMode, interactive_video_output};
-    use clap::Parser;
-    #[cfg(target_os = "macos")]
-    use clap::error::ErrorKind;
+    #[cfg(target_os = "linux")]
+    use super::H264Encoder;
+    use super::{
+        Cli, Command, TranscodeDeliveryMode, TranscodeMode, install_crypto_provider,
+        interactive_video_output,
+    };
+    use clap::{Parser, error::ErrorKind};
     #[cfg(target_os = "macos")]
     use std::net::IpAddr;
 
@@ -648,6 +959,132 @@ mod tests {
         assert!(!interactive_video_output(2, true, true));
         assert!(!interactive_video_output(0, false, true));
         assert!(!interactive_video_output(0, true, false));
+    }
+
+    #[test]
+    fn installs_the_process_wide_tls_crypto_provider() {
+        install_crypto_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_portal_diagnostics_are_exposed_without_macos_options() {
+        let displays = Cli::try_parse_from(["cast", "displays", "--select-source"]).unwrap();
+        assert!(matches!(
+            displays.command,
+            Command::Displays {
+                select_source: true
+            }
+        ));
+        let capture = Cli::try_parse_from([
+            "cast",
+            "capture",
+            "--select-source",
+            "--encoder",
+            "openh264",
+        ])
+        .unwrap();
+        assert!(matches!(
+            capture.command,
+            Command::Capture {
+                select_source: true,
+                encoder: H264Encoder::Openh264,
+                ..
+            }
+        ));
+        let error = Cli::try_parse_from(["cast", "capture", "--display", "1"])
+            .err()
+            .expect("macOS --display was exposed on Linux");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_setup_and_encoder_selection_parse_without_exposing_desktop_early() {
+        let cli = Cli::try_parse_from(["cast", "setup", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Setup {
+                check: true,
+                yes: false
+            }
+        ));
+        let error = Cli::try_parse_from(["cast", "setup", "--check", "--yes"])
+            .err()
+            .expect("conflicting setup switches were accepted");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+
+        let cli = Cli::try_parse_from([
+            "cast",
+            "video",
+            "sample.mp4",
+            "--host",
+            "192.0.2.1",
+            "--encoder",
+            "vaapi",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Video {
+                encoder: H264Encoder::Vaapi,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_desktop_and_profile_use_portal_source_controls() {
+        let desktop = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.1",
+            "--select-source",
+            "--encoder",
+            "vaapi",
+        ])
+        .unwrap();
+        assert!(matches!(
+            desktop.command,
+            Command::Desktop {
+                select_source: true,
+                encoder: H264Encoder::Vaapi,
+                ..
+            }
+        ));
+        let conflict = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.1",
+            "--select-source",
+            "--extend",
+        ])
+        .err()
+        .expect("portal chooser and virtual sources were accepted together");
+        assert_eq!(conflict.kind(), ErrorKind::ArgumentConflict);
+
+        let profile = Cli::try_parse_from([
+            "cast",
+            "profile",
+            "--host",
+            "192.0.2.1",
+            "--synthetic",
+            "--seconds",
+            "60",
+        ])
+        .unwrap();
+        assert!(matches!(
+            profile.command,
+            Command::Profile {
+                synthetic: true,
+                select_source: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -670,6 +1107,7 @@ mod tests {
                 http_port: 0,
                 transcode: TranscodeMode::Auto,
                 transcode_delivery: TranscodeDeliveryMode::Incremental,
+                ..
             } if directory == std::path::Path::new(".")
         ));
 
@@ -698,6 +1136,7 @@ mod tests {
                 http_port: 8080,
                 transcode: TranscodeMode::Always,
                 transcode_delivery: TranscodeDeliveryMode::Complete,
+                ..
             } if directory == std::path::Path::new("/tmp")
         ));
     }

@@ -4,59 +4,10 @@ use screencapturekit::{
     cm::{IOSurfaceLockOptions, PlaneProperties},
 };
 
+use crate::desktop::{SyntheticPhase, phase_for_frame};
+
 const PIXEL_FORMAT_420V: u32 = u32::from_be_bytes(*b"420v");
 const ROW_ALIGNMENT: usize = 64;
-pub(crate) const SYNTHETIC_CYCLE_SECONDS: u64 = 10;
-pub(crate) const SYNTHETIC_WORKLOAD_NAME: &str = "synthetic-v1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SyntheticPhase {
-    Static,
-    PartialMotion,
-    FullMotion,
-    SceneCuts,
-}
-
-impl SyntheticPhase {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Static,
-        Self::PartialMotion,
-        Self::FullMotion,
-        Self::SceneCuts,
-    ];
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Static => "static",
-            Self::PartialMotion => "partial motion",
-            Self::FullMotion => "full motion",
-            Self::SceneCuts => "scene cuts",
-        }
-    }
-
-    pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Static => 0,
-            Self::PartialMotion => 1,
-            Self::FullMotion => 2,
-            Self::SceneCuts => 3,
-        }
-    }
-}
-
-pub(crate) fn phase_for_frame(frame_index: u64, fps: u32) -> (SyntheticPhase, u64) {
-    let cycle_frames = u64::from(fps.max(1)).saturating_mul(SYNTHETIC_CYCLE_SECONDS);
-    let position = frame_index % cycle_frames;
-    let phase_index = position.saturating_mul(4) / cycle_frames;
-    let phase_start = phase_index.saturating_mul(cycle_frames) / 4;
-    let phase = match phase_index {
-        0 => SyntheticPhase::Static,
-        1 => SyntheticPhase::PartialMotion,
-        2 => SyntheticPhase::FullMotion,
-        _ => SyntheticPhase::SceneCuts,
-    };
-    (phase, position.saturating_sub(phase_start))
-}
 
 pub(crate) struct SyntheticFrameGenerator {
     surface: IOSurface,
@@ -404,7 +355,8 @@ fn tile_hash(tile_x: usize, tile_y: usize, frame_index: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyntheticFrameGenerator, SyntheticPhase, phase_for_frame};
+    use super::SyntheticFrameGenerator;
+    use crate::desktop::{SyntheticPhase, phase_for_frame};
     use screencapturekit::cm::IOSurfaceLockOptions;
 
     #[test]

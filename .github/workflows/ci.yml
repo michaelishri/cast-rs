@@ -9,6 +9,127 @@ permissions:
   contents: read
 
 jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm pkg-config
+
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+  linux-current-headers:
+    name: Linux current-header compatibility
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm pkg-config
+
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
+      - name: Compile and test current PipeWire headers
+        run: cargo test --locked
+
+  linux-release:
+    name: Linux archive (${{ matrix.archive_arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - archive_arch: x86_64
+            runner: ubuntu-22.04
+          - archive_arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install build and audit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
+
+      - name: Cache linked media libraries
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg-libraries.sh') }}
+
+      - name: Build linked media libraries
+        shell: bash
+        run: |
+          ./scripts/build-ffmpeg-libraries.sh "$PWD/.build/ffmpeg-dist"
+          echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package and smoke-test release archive
+        run: ./scripts/package-linux-release.sh "${{ matrix.archive_arch }}"
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-linux-${{ matrix.archive_arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   check:
     name: macOS checks
     runs-on: macos-26
@@ -37,7 +158,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --locked
