@@ -106,7 +106,7 @@ cast displays --backend portal --select-source
 
 `--backend auto` is the default: Cast selects X11 when `XDG_SESSION_TYPE=x11` or `DISPLAY` is present and reachable, and otherwise uses the portal. Use `--backend x11 --display eDP-1` to select a named RandR monitor, or `--backend portal` to override detection. X11 commands must run as the logged-in desktop user with valid `DISPLAY` and Xauthority access; SSH sessions normally need those values forwarded from the desktop session.
 
-`--select-source` forces the portal chooser; otherwise Cast asks the portal to restore the previous choice and falls back to a new prompt when needed. `--extend` is portal-only and requests one virtual source per receiver when the compositor advertises support. Wayland capture continues to use the existing portal path; the native backend in this release targets X11 only.
+`--select-source` forces the portal chooser; otherwise Cast asks the portal to restore the previous choice and falls back to a new prompt when needed. On X11, `--extend` temporarily activates an unused disconnected RandR output and free CRTC for each receiver, places it to the right of the current desktop, and restores the layout on exit. On portal-backed sessions it requests one virtual source per receiver when the compositor advertises support. Wayland capture continues to use the existing portal path.
 
 Linux chooses H.264 in this order: NVIDIA NVENC, VA-API, then OpenH264. Override it with `--encoder nvenc`, `--encoder vaapi`, or `--encoder openh264` on `video`, `capture`, `profile`, and `desktop`. An explicit unavailable encoder fails with an actionable diagnostic instead of silently selecting another. X11 uses RandR monitor geometry, MIT-SHM frame transfer with a core GetImage fallback, and XFixes cursor images; the portal path continues to use PipeWire. GPU encoding still requires a working vendor driver and device permissions.
 
@@ -183,7 +183,7 @@ Use `--extend` when each receiver should display an independent desktop. Cast cr
 cast desktop --host 192.168.1.50 --extend
 ```
 
-Move windows onto the new display while Cast is running. With `--audio`, every receiver gets the same encoded system mix. On macOS, `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. On Linux, it requests portal virtual sources and fails before receiver startup when the compositor does not advertise that capability. It cannot be combined with `--display`.
+Move windows onto the new display while Cast is running. With `--audio`, every receiver gets the same encoded system mix. On macOS, `--extend` is experimental because it uses Apple’s private `CGVirtualDisplay` API, which may stop working in a future macOS version. On Linux X11, it requires an unused disconnected RandR output, a free CRTC, and enough framebuffer space; driver stacks that reject modes on disconnected outputs fail before receiver startup. On portal-backed Linux sessions it requests portal virtual sources and fails when the compositor does not advertise that capability. It cannot be combined with `--display`.
 
 ## Everyday commands
 
@@ -244,6 +244,8 @@ This takes 60 seconds across six short trials and prints a recommended command. 
 **macOS asks for permission or the display is blank** — Grant Screen Recording permission to the terminal app, then quit and reopen it if macOS does not apply the change immediately.
 
 **Linux X11 cannot connect or lists no monitors** — Run Cast as the logged-in desktop user and verify `XDG_SESSION_TYPE=x11`, `DISPLAY`, and `XAUTHORITY`. From SSH, copy the values from the desktop session rather than guessing them. Run `cast -v displays --backend x11`; an unreachable display or missing RandR support is reported directly and never silently falls back to the portal.
+
+**Linux X11 extended display is unavailable** — `--extend` needs one disconnected RandR connector and one free CRTC per receiver. Some GPU drivers refuse to activate disconnected connectors; Cast reports that failure and leaves the existing layout intact. Cast does not install a virtual DRM driver or modify Xorg configuration. It stops capture before removing temporary modes and recomputes the framebuffer from the outputs that remain active so unrelated hotplug changes are preserved.
 
 **Linux portal is missing or the chooser does not open** — Install the portal backend matching the GNOME or KDE session plus PipeWire, then run `cast -v displays --backend portal`. Use `--backend x11` only in an X11 session.
 
