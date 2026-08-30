@@ -1,6 +1,7 @@
 use std::{
     convert::TryFrom,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -179,7 +180,25 @@ pub(crate) fn start_desktop_capture(
             )),
             ExtendedDisplaySession::X11(session) => {
                 let monitor = session.monitor_name().to_owned();
-                let capture = X11Capture::start(Some(monitor), fps, sink, capture_epoch)?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let capture = loop {
+                    session.check()?;
+                    match X11Capture::start(
+                        Some(monitor.clone()),
+                        fps,
+                        Arc::clone(&sink),
+                        capture_epoch.clone(),
+                    ) {
+                        Ok(capture) => break capture,
+                        Err(error) if Instant::now() < deadline => {
+                            log::debug!(
+                                "temporary X11 monitor {monitor} is not capture-ready yet: {error:#}"
+                            );
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
                 Ok(RunningCapture::with_virtual_display(capture, *session))
             }
         };
