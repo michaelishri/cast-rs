@@ -44,19 +44,16 @@ use crate::{
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
     linux_capture::{
-        CaptureEpoch, CapturedFrame, FrameSink, RunningCapture, start_desktop_capture,
-        validate_source_options,
+        CaptureEpoch, CapturedFrame, ExtendedDisplaySession, FrameSink, RunningCapture,
+        start_desktop_capture, validate_source_options,
     },
     linux_desktop::composite_cursor,
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
-    portal::{PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
 type ExtendedDisplaySession = VirtualDisplaySession;
-#[cfg(target_os = "linux")]
-type ExtendedDisplaySession = PortalSelection;
 
 const TIMESCALE: u64 = 90_000;
 const PLAYLIST_WINDOW_SEGMENTS: usize = 8;
@@ -140,7 +137,14 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         for (index, host) in options.cast_hosts.iter().copied().enumerate() {
             let ordinal = u32::try_from(index + 1)
                 .context("the number of extended displays exceeded the supported ordinal range")?;
-            let session = start_extended_display(width, height, options.fps, ordinal)?;
+            let session = start_extended_display(
+                width,
+                height,
+                options.fps,
+                ordinal,
+                #[cfg(target_os = "linux")]
+                options.capture_backend,
+            )?;
             #[cfg(target_os = "macos")]
             println!(
                 "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
@@ -148,8 +152,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             );
             #[cfg(target_os = "linux")]
             println!(
-                "Mapped receiver {host} to portal virtual source {ordinal} (PipeWire node {}).",
-                session.node_id()
+                "Mapped receiver {host} to extended source {ordinal} ({}).",
+                session.description()
             );
             virtual_displays.push((host, session));
         }
@@ -422,12 +426,13 @@ fn start_extended_display(
 
 #[cfg(target_os = "linux")]
 fn start_extended_display(
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     _fps: u32,
-    _ordinal: u32,
+    ordinal: u32,
+    backend: crate::linux_x11::BackendPreference,
 ) -> Result<ExtendedDisplaySession> {
-    crate::portal::select(PortalSourceKind::Virtual, true)
+    ExtendedDisplaySession::start(backend, width, height, ordinal)
 }
 
 struct HlsTarget {

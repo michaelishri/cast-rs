@@ -62,21 +62,18 @@ use crate::virtual_display::VirtualDisplaySession;
 #[cfg(target_os = "linux")]
 use crate::{
     linux_capture::{
-        CaptureEpoch, CapturedFrame, FrameSink, RunningCapture, start_desktop_capture,
-        validate_source_options,
+        CaptureEpoch, CapturedFrame, ExtendedDisplaySession, FrameSink, RunningCapture,
+        start_desktop_capture, validate_source_options,
     },
     linux_desktop::composite_cursor,
     linux_encoder::{
         EncodingPriority, LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame,
     },
     media::H264Provider,
-    portal::{PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
 type ExtendedDisplaySession = VirtualDisplaySession;
-#[cfg(target_os = "linux")]
-type ExtendedDisplaySession = PortalSelection;
 
 const CAST_STREAMING_APP_ID: &str = "0F5096E8";
 const CAST_STREAMING_NAMESPACE: &str = "urn:x-cast:com.google.cast.webrtc";
@@ -653,12 +650,13 @@ fn start_extended_display(
 
 #[cfg(target_os = "linux")]
 fn start_extended_display(
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     _fps: u32,
-    _ordinal: u32,
+    ordinal: u32,
+    backend: crate::linux_x11::BackendPreference,
 ) -> Result<ExtendedDisplaySession> {
-    crate::portal::select(PortalSourceKind::Virtual, true)
+    ExtendedDisplaySession::start(backend, width, height, ordinal)
 }
 
 fn ensure_extended_display_alive(session: &mut ExtendedDisplaySession) -> Result<()> {
@@ -826,7 +824,14 @@ fn run_extended_desktop(
     for (index, host) in options.cast_hosts.iter().copied().enumerate() {
         let ordinal = u32::try_from(index + 1)
             .context("the number of extended displays exceeded the supported ordinal range")?;
-        let session = start_extended_display(width, height, options.fps, ordinal)?;
+        let session = start_extended_display(
+            width,
+            height,
+            options.fps,
+            ordinal,
+            #[cfg(target_os = "linux")]
+            options.capture_backend,
+        )?;
         #[cfg(target_os = "macos")]
         println!(
             "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
@@ -834,8 +839,8 @@ fn run_extended_desktop(
         );
         #[cfg(target_os = "linux")]
         println!(
-            "Mapped receiver {host} to portal virtual source {ordinal} (PipeWire node {}).",
-            session.node_id()
+            "Mapped receiver {host} to extended source {ordinal} ({}).",
+            session.description()
         );
         displays.push((host, session));
     }
@@ -1026,7 +1031,14 @@ fn run_desktop(
     );
     let mut virtual_display = match (options.extend, precreated_display) {
         (true, Some(_)) => bail!("temporary display ownership was specified twice"),
-        (true, None) => Some(start_extended_display(width, height, options.fps, 1)?),
+        (true, None) => Some(start_extended_display(
+            width,
+            height,
+            options.fps,
+            1,
+            #[cfg(target_os = "linux")]
+            options.capture_backend,
+        )?),
         (false, display) => display,
     };
     #[cfg(target_os = "linux")]
@@ -1036,10 +1048,10 @@ fn run_desktop(
     {
         // Complete the privacy/capability preflight before launching a Cast
         // receiver. Ownership moves into PipeWireCapture after negotiation.
-        virtual_display = Some(crate::portal::select(
+        virtual_display = Some(ExtendedDisplaySession::Portal(crate::portal::select(
             crate::portal::PortalSourceKind::Normal,
             options.select_source,
-        )?);
+        )?));
     }
     #[cfg(target_os = "macos")]
     if let Some(session) = virtual_display.as_ref() {

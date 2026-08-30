@@ -8,7 +8,10 @@ use anyhow::Result;
 
 use crate::linux_encoder::RawPixelFormat;
 use crate::{
-    linux_x11::{Backend, BackendPreference, DisplayConnection, X11Capture, resolve_backend},
+    linux_x11::{
+        Backend, BackendPreference, DisplayConnection, X11Capture, X11VirtualDisplay,
+        resolve_backend,
+    },
     portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
 };
 
@@ -107,12 +110,9 @@ pub(crate) fn validate_source_options(
             if force_chooser {
                 anyhow::bail!("--select-source is available only with --backend portal");
             }
-            if extend {
-                anyhow::bail!(
-                    "--extend is not supported by the X11 backend; use --backend portal or omit --extend"
-                );
+            if !extend {
+                DisplayConnection::connect()?.select_monitor(display_name)?;
             }
-            DisplayConnection::connect()?.select_monitor(display_name)?;
         }
         Backend::Portal if display_name.is_some() => {
             anyhow::bail!("--display is available only with --backend x11");
@@ -122,8 +122,49 @@ pub(crate) fn validate_source_options(
     Ok(backend)
 }
 
+pub(crate) enum ExtendedDisplaySession {
+    Portal(PortalSelection),
+    X11(Box<X11VirtualDisplay>),
+}
+
+impl ExtendedDisplaySession {
+    pub(crate) fn start(
+        preference: BackendPreference,
+        width: u32,
+        height: u32,
+        ordinal: u32,
+    ) -> Result<Self> {
+        match resolve_backend(preference)? {
+            Backend::X11 => Ok(Self::X11(Box::new(X11VirtualDisplay::start(
+                width, height, ordinal,
+            )?))),
+            Backend::Portal => Ok(Self::Portal(crate::portal::select(
+                PortalSourceKind::Virtual,
+                true,
+            )?)),
+        }
+    }
+
+    pub(crate) fn description(&self) -> String {
+        match self {
+            Self::Portal(selection) => format!(
+                "portal virtual source (PipeWire node {})",
+                selection.node_id()
+            ),
+            Self::X11(session) => format!("X11 output {}", session.monitor_name()),
+        }
+    }
+
+    pub(crate) fn check(&mut self) -> Result<()> {
+        match self {
+            Self::Portal(selection) => selection.check(),
+            Self::X11(session) => session.check(),
+        }
+    }
+}
+
 pub(crate) fn start_desktop_capture(
-    preselected_portal: Option<PortalSelection>,
+    extended_display: Option<ExtendedDisplaySession>,
     preference: BackendPreference,
     display_name: Option<String>,
     force_chooser: bool,
@@ -131,12 +172,17 @@ pub(crate) fn start_desktop_capture(
     sink: Arc<dyn FrameSink>,
     capture_epoch: CaptureEpoch,
 ) -> Result<RunningCapture> {
-    if let Some(selection) = preselected_portal {
-        return Ok(RunningCapture::new(PipeWireCapture::start_at(
-            selection,
-            sink,
-            capture_epoch,
-        )?));
+    if let Some(display) = extended_display {
+        return match display {
+            ExtendedDisplaySession::Portal(selection) => Ok(RunningCapture::new(
+                PipeWireCapture::start_at(selection, sink, capture_epoch)?,
+            )),
+            ExtendedDisplaySession::X11(session) => {
+                let monitor = session.monitor_name().to_owned();
+                let capture = X11Capture::start(Some(monitor), fps, sink, capture_epoch)?;
+                Ok(RunningCapture::with_virtual_display(capture, *session))
+            }
+        };
     }
     match validate_source_options(preference, display_name.as_deref(), force_chooser, false)? {
         Backend::X11 => Ok(RunningCapture::new(X11Capture::start(
@@ -164,6 +210,7 @@ pub(crate) trait CaptureBackend {
 
 pub(crate) struct RunningCapture {
     backend: Box<dyn CaptureBackend>,
+    virtual_display: Option<Box<X11VirtualDisplay>>,
     stopped: bool,
 }
 
@@ -171,6 +218,18 @@ impl RunningCapture {
     pub(crate) fn new(backend: impl CaptureBackend + 'static) -> Self {
         Self {
             backend: Box::new(backend),
+            virtual_display: None,
+            stopped: false,
+        }
+    }
+
+    fn with_virtual_display(
+        backend: impl CaptureBackend + 'static,
+        virtual_display: X11VirtualDisplay,
+    ) -> Self {
+        Self {
+            backend: Box::new(backend),
+            virtual_display: Some(Box::new(virtual_display)),
             stopped: false,
         }
     }
@@ -188,7 +247,11 @@ impl RunningCapture {
             return Ok(());
         }
         self.stopped = true;
-        self.backend.stop()
+        self.backend.stop()?;
+        if let Some(mut display) = self.virtual_display.take() {
+            display.stop()?;
+        }
+        Ok(())
     }
 }
 
