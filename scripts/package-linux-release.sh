@@ -76,6 +76,10 @@ if grep -F 'not found' "$output_dir/$archive.ldd.txt"; then
   exit 1
 fi
 grep -F "$extracted/lib/libavcodec.so" "$output_dir/$archive.ldd.txt"
+if grep -E 'lib(X11|xcb|Xfixes|Xrandr)' "$output_dir/$archive.ldd.txt"; then
+  echo "packaged executable unexpectedly depends on a native X11 client library" >&2
+  exit 1
+fi
 env -u LD_LIBRARY_PATH "$extracted/cast" --version
 env -u LD_LIBRARY_PATH "$extracted/cast" --help >/dev/null
 

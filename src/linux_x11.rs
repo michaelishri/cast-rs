@@ -260,6 +260,9 @@ struct ShmImage {
 
 impl ShmImage {
     fn create(connection: &RustConnection, length: usize) -> Result<Option<Self>> {
+        if env::var_os("CAST_X11_DISABLE_SHM").is_some() {
+            return Ok(None);
+        }
         if connection
             .extension_information(shm::X11_EXTENSION_NAME)
             .context("could not query the MIT-SHM extension")?
@@ -272,7 +275,7 @@ impl ShmImage {
             .context("could not query MIT-SHM version")?
             .reply()
             .context("could not read MIT-SHM version")?;
-        if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 2) {
+        if !supports_fd_shm(version.major_version, version.minor_version) {
             return Ok(None);
         }
         let length_u32 = u32::try_from(length).context("X11 frame is too large for MIT-SHM")?;
@@ -313,6 +316,10 @@ impl ShmImage {
         // after the synchronous GetImage reply has completed.
         unsafe { std::slice::from_raw_parts(self.address.as_ptr(), self.length) }
     }
+}
+
+const fn supports_fd_shm(major: u16, minor: u16) -> bool {
+    major > 1 || (major == 1 && minor >= 2)
 }
 
 impl Drop for ShmImage {
@@ -560,9 +567,13 @@ fn capture_cursor(display: &DisplayConnection, monitor: &Monitor) -> Result<Curs
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
+    use x11rb::{
+        COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
+        protocol::xproto::{ChangeWindowAttributesAux, CreateWindowAux, WindowClass},
+    };
 
     #[test]
     fn monitor_geometry_is_xrandr_compatible() {
@@ -601,12 +612,31 @@ mod tests {
         assert!(pixel_format(ImageOrder::LSB_FIRST, (0, 0, 0), 24).is_err());
     }
 
-    struct CountingSink(AtomicUsize);
+    struct CountingSink {
+        count: AtomicUsize,
+        first_checksum: AtomicU64,
+        changed: AtomicBool,
+    }
 
     impl FrameSink for CountingSink {
         fn submit(&self, frame: CapturedFrame) {
             assert_eq!(frame.data.len(), frame.stride * frame.height as usize);
-            self.0.fetch_add(1, Ordering::Relaxed);
+            let checksum = frame
+                .data
+                .chunks(frame.stride)
+                .take(64)
+                .flat_map(|row| row.iter().take(64 * 4))
+                .fold(0_u64, |sum, byte| {
+                    sum.wrapping_mul(16_777_619) ^ u64::from(*byte)
+                });
+            let first = self.first_checksum.load(Ordering::Relaxed);
+            if first == 0 {
+                self.first_checksum
+                    .store(checksum.max(1), Ordering::Relaxed);
+            } else if checksum != first {
+                self.changed.store(true, Ordering::Relaxed);
+            }
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -615,12 +645,78 @@ mod tests {
         if env::var_os("CAST_X11_INTEGRATION_TEST").is_none() {
             return;
         }
-        let sink = Arc::new(CountingSink(AtomicUsize::new(0)));
+        let display = DisplayConnection::connect().unwrap();
+        let monitor = display.select_monitor(None).unwrap();
+        let window = display.connection.generate_id().unwrap();
+        display
+            .connection
+            .create_window(
+                COPY_DEPTH_FROM_PARENT,
+                window,
+                display.root(),
+                monitor.x,
+                monitor.y,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                COPY_FROM_PARENT,
+                &CreateWindowAux::new()
+                    .override_redirect(1)
+                    .background_pixel(0x00ff0000),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        display
+            .connection
+            .map_window(window)
+            .unwrap()
+            .check()
+            .unwrap();
+        display.connection.flush().unwrap();
+        let sink = Arc::new(CountingSink {
+            count: AtomicUsize::new(0),
+            first_checksum: AtomicU64::new(0),
+            changed: AtomicBool::new(false),
+        });
         let erased: Arc<dyn FrameSink> = sink.clone();
         let mut capture = X11Capture::start(None, 10, erased, CaptureEpoch::new()).unwrap();
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(Duration::from_millis(250));
+        display
+            .connection
+            .change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().background_pixel(0x000000ff),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        display
+            .connection
+            .clear_area(false, window, 0, 0, 0, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        display.connection.flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
         capture.check().unwrap();
         capture.stop().unwrap();
-        assert!(sink.0.load(Ordering::Relaxed) >= 2);
+        display
+            .connection
+            .destroy_window(window)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(sink.count.load(Ordering::Relaxed) >= 4);
+        assert!(sink.changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mit_shm_fd_support_requires_protocol_1_2() {
+        assert!(!supports_fd_shm(0, 0));
+        assert!(!supports_fd_shm(1, 1));
+        assert!(supports_fd_shm(1, 2));
+        assert!(supports_fd_shm(2, 0));
     }
 }
