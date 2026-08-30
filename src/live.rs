@@ -43,11 +43,11 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
+    linux_capture::{CaptureEpoch, CapturedFrame, FrameSink, RunningCapture},
     linux_desktop::composite_cursor,
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
-    linux_pipewire::CaptureEpoch,
     media::H264Provider,
-    portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
+    portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
@@ -963,7 +963,7 @@ impl LivePipeline {
 
 #[cfg(target_os = "linux")]
 struct LiveCapture {
-    capture: Option<PipeWireCapture>,
+    capture: Option<RunningCapture>,
     cadence: Option<LinuxFrameCadence>,
     encoder_worker: Option<LatestFrameWorker<CapturedFrame>>,
     store: Arc<HlsStore>,
@@ -1010,9 +1010,11 @@ impl LiveCapture {
         let (sink, cadence) =
             LinuxFrameCadence::start(submitter, options.fps, Arc::clone(&failure))?;
         let sink: Arc<dyn FrameSink> = Arc::new(sink);
-        let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
+        let capture =
+            RunningCapture::new(PipeWireCapture::start_at(selection, sink, capture_epoch)?);
         println!(
-            "Capturing the selected portal source into {}x{}, {} fps HLS...",
+            "Capturing {} into {}x{}, {} fps HLS...",
+            capture.source_description(),
             even(options.width),
             even(options.height),
             options.fps
@@ -2143,9 +2145,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::{
         desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameWorker},
+        linux_capture::{CapturedFrame, FrameSink},
         linux_encoder::RawPixelFormat,
         media::H264Provider,
-        portal::{CapturedFrame, FrameSink},
     };
     use std::{
         collections::HashMap,

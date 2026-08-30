@@ -8,6 +8,8 @@ mod discovery;
 #[cfg(target_os = "linux")]
 mod linux_audio;
 #[cfg(target_os = "linux")]
+mod linux_capture;
+#[cfg(target_os = "linux")]
 mod linux_desktop;
 #[cfg(target_os = "linux")]
 mod linux_encoder;

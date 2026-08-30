@@ -14,9 +14,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
+    linux_capture::{CapturedFrame, CursorImage, FrameSink, RunningCapture},
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
-    portal::{CapturedFrame, CursorImage, FrameSink, PipeWireCapture, PortalSourceKind},
+    portal::{PipeWireCapture, PortalSourceKind},
 };
 
 pub(crate) struct CaptureOptions {
@@ -55,9 +56,10 @@ pub(crate) fn capture(options: CaptureOptions) -> Result<()> {
         "cast-linux-capture-encoder",
     )?;
     let sink: Arc<dyn FrameSink> = Arc::new(PortalFrameSubmitter { submitter });
-    let mut capture = PipeWireCapture::start(selection, sink)?;
+    let mut capture = RunningCapture::new(PipeWireCapture::start(selection, sink)?);
     println!(
-        "Capturing the selected portal source at up to {} fps for {}s...",
+        "Capturing {} at up to {} fps for {}s...",
+        capture.source_description(),
         options.fps,
         options.duration.as_secs()
     );
@@ -250,7 +252,7 @@ const fn even(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{linux_encoder::RawPixelFormat, portal::CursorPixelFormat};
+    use crate::{linux_capture::CursorPixelFormat, linux_encoder::RawPixelFormat};
 
     #[test]
     fn cursor_metadata_is_composited_and_clipped() {

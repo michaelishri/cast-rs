@@ -1,42 +1,7 @@
-use std::{
-    convert::TryFrom,
-    ptr::NonNull,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::ptr::NonNull;
 
 use pipewire as pw;
 use pw::spa;
-
-/// Monotonic epoch shared by every PipeWire stream in one desktop session.
-#[derive(Clone)]
-pub(crate) struct CaptureEpoch {
-    started: Arc<Instant>,
-}
-
-impl CaptureEpoch {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: Arc::new(Instant::now()),
-        }
-    }
-
-    pub(crate) fn ticks(&self, timescale: u64) -> u64 {
-        duration_ticks(self.started.elapsed(), timescale)
-    }
-
-    #[cfg(test)]
-    fn shares_origin_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.started, &other.started)
-    }
-}
-
-pub(crate) fn duration_ticks(elapsed: Duration, timescale: u64) -> u64 {
-    u64::try_from(elapsed.as_nanos())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(timescale)
-        / 1_000_000_000
-}
 
 /// A dequeued PipeWire buffer that is always returned to its originating stream.
 pub(crate) struct DequeuedBuffer<'a> {
@@ -96,22 +61,5 @@ impl Drop for DequeuedBuffer<'_> {
         // SAFETY: `raw` came from this stream's dequeue call and this guard
         // queues it exactly once.
         unsafe { self.stream.queue_raw_buffer(self.raw.as_ptr()) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_epoch_maps_audio_video_and_extended_sources_without_rebasing() {
-        assert_eq!(duration_ticks(Duration::from_millis(250), 90_000), 22_500);
-        assert_eq!(duration_ticks(Duration::from_millis(250), 48_000), 12_000);
-        assert_eq!(duration_ticks(Duration::from_secs(2), 90_000), 180_000);
-
-        let session = CaptureEpoch::new();
-        let extended_source = session.clone();
-        assert!(session.shares_origin_with(&extended_source));
-        assert!(!session.shares_origin_with(&CaptureEpoch::new()));
     }
 }

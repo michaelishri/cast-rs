@@ -61,13 +61,13 @@ use crate::synthetic::SyntheticFrameGenerator;
 use crate::virtual_display::VirtualDisplaySession;
 #[cfg(target_os = "linux")]
 use crate::{
+    linux_capture::{CaptureEpoch, CapturedFrame, FrameSink, RunningCapture},
     linux_desktop::composite_cursor,
     linux_encoder::{
         EncodingPriority, LinuxEncoderControl, LinuxVideoEncoder, RawPixelFormat, RawVideoFrame,
     },
-    linux_pipewire::CaptureEpoch,
     media::H264Provider,
-    portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
+    portal::{PipeWireCapture, PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
@@ -1382,14 +1382,10 @@ fn run_desktop(
                 Some(selection) => selection,
                 None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
             };
-            let source_description = format!(
-                "{:?} portal source (PipeWire node {}, compositor size {:?})",
-                selection.source_type(),
-                selection.node_id(),
-                selection.size()
-            );
             let sink: Arc<dyn FrameSink> = Arc::new(MirrorPortalSink { submitter });
-            let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
+            let capture =
+                RunningCapture::new(PipeWireCapture::start_at(selection, sink, capture_epoch)?);
+            let source_description = capture.source_description();
             match mode {
                 RunMode::Cast => println!(
                     "Mirroring {source_description} into {width}x{height}, {} fps, target delay {} ms...",
@@ -4162,7 +4158,7 @@ enum RunningInput {
     Screen(SCStream, EncoderWorker, Option<AudioWorker>),
     #[cfg(target_os = "linux")]
     Screen(
-        PipeWireCapture,
+        RunningCapture,
         EncoderWorker,
         Option<PipeWireAudioCapture>,
         Option<AudioWorker>,
