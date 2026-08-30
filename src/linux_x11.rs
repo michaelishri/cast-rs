@@ -1,11 +1,35 @@
-use std::env;
+use std::{
+    env,
+    os::fd::AsRawFd,
+    ptr::NonNull,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use x11rb::{
-    connection::Connection,
-    protocol::{randr::ConnectionExt as _, xproto::ConnectionExt as _},
+    connection::{Connection, RequestConnection},
+    protocol::{
+        randr::ConnectionExt as _,
+        shm::{self, ConnectionExt as _},
+        xfixes::ConnectionExt as _,
+        xproto::{ConnectionExt as _, ImageFormat, ImageOrder},
+    },
     rust_connection::RustConnection,
 };
+
+use crate::{
+    linux_capture::{
+        CaptureBackend, CaptureEpoch, CapturedFrame, CursorImage, CursorPixelFormat, FrameSink,
+    },
+    linux_encoder::RawPixelFormat,
+};
+
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum BackendPreference {
@@ -152,8 +176,392 @@ pub(crate) fn list_monitors() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelLayout {
+    format: RawPixelFormat,
+    bits_per_pixel: u8,
+    scanline_pad: u8,
+}
+
+impl PixelLayout {
+    fn stride(self, width: u16) -> Result<usize> {
+        let bits = usize::from(width)
+            .checked_mul(usize::from(self.bits_per_pixel))
+            .ok_or_else(|| anyhow!("X11 frame row size overflowed"))?;
+        let pad = usize::from(self.scanline_pad);
+        if pad == 0 || !pad.is_power_of_two() {
+            bail!("X11 reported invalid scanline padding {pad}");
+        }
+        Ok(bits.div_ceil(pad) * pad / 8)
+    }
+}
+
+fn pixel_layout(display: &DisplayConnection) -> Result<PixelLayout> {
+    let setup = display.connection.setup();
+    let screen = &setup.roots[display.screen_number];
+    let pixmap = setup
+        .pixmap_formats
+        .iter()
+        .find(|format| format.depth == screen.root_depth)
+        .ok_or_else(|| {
+            anyhow!(
+                "X11 has no pixmap format for root depth {}",
+                screen.root_depth
+            )
+        })?;
+    if pixmap.bits_per_pixel != 32 {
+        bail!(
+            "unsupported X11 root layout: depth {} uses {} bits per pixel (32 required)",
+            screen.root_depth,
+            pixmap.bits_per_pixel
+        );
+    }
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|depth| &depth.visuals)
+        .find(|visual| visual.visual_id == screen.root_visual)
+        .ok_or_else(|| anyhow!("X11 root visual {} was not described", screen.root_visual))?;
+    let masks = (visual.red_mask, visual.green_mask, visual.blue_mask);
+    let format = pixel_format(setup.image_byte_order, masks, pixmap.bits_per_pixel)?;
+    Ok(PixelLayout {
+        format,
+        bits_per_pixel: pixmap.bits_per_pixel,
+        scanline_pad: pixmap.scanline_pad,
+    })
+}
+
+fn pixel_format(
+    byte_order: ImageOrder,
+    masks: (u32, u32, u32),
+    bits_per_pixel: u8,
+) -> Result<RawPixelFormat> {
+    if bits_per_pixel != 32 {
+        bail!("unsupported X11 pixel size {bits_per_pixel}; 32 bits per pixel are required");
+    }
+    Ok(match (byte_order, masks) {
+        (ImageOrder::LSB_FIRST, (0x00ff0000, 0x0000ff00, 0x000000ff)) => RawPixelFormat::Bgrx,
+        (ImageOrder::LSB_FIRST, (0x000000ff, 0x0000ff00, 0x00ff0000)) => RawPixelFormat::Rgbx,
+        _ => bail!(
+            "unsupported X11 root visual masks {:#010x}/{:#010x}/{:#010x} with image byte order {:?}",
+            masks.0,
+            masks.1,
+            masks.2,
+            byte_order
+        ),
+    })
+}
+
+struct ShmImage {
+    segment: shm::Seg,
+    address: NonNull<u8>,
+    length: usize,
+}
+
+impl ShmImage {
+    fn create(connection: &RustConnection, length: usize) -> Result<Option<Self>> {
+        if connection
+            .extension_information(shm::X11_EXTENSION_NAME)
+            .context("could not query the MIT-SHM extension")?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let version = connection
+            .shm_query_version()
+            .context("could not query MIT-SHM version")?
+            .reply()
+            .context("could not read MIT-SHM version")?;
+        if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 2) {
+            return Ok(None);
+        }
+        let length_u32 = u32::try_from(length).context("X11 frame is too large for MIT-SHM")?;
+        let segment = connection.generate_id()?;
+        let reply = connection
+            .shm_create_segment(segment, length_u32, false)
+            .context("could not create an MIT-SHM segment")?
+            .reply()
+            .context("the X11 server could not create an MIT-SHM segment")?;
+        // SAFETY: The server returned a live descriptor for exactly `length`
+        // bytes. MAP_SHARED keeps the mapping valid after the descriptor closes.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                reply.shm_fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            if let Ok(cookie) = connection.shm_detach(segment) {
+                let _ = cookie.check();
+            }
+            bail!("could not map the MIT-SHM frame buffer");
+        }
+        Ok(Some(Self {
+            segment,
+            address: NonNull::new(mapped.cast())
+                .ok_or_else(|| anyhow!("MIT-SHM returned a null mapping"))?,
+            length,
+        }))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: The mapping remains live for Self's lifetime and is only read
+        // after the synchronous GetImage reply has completed.
+        unsafe { std::slice::from_raw_parts(self.address.as_ptr(), self.length) }
+    }
+}
+
+impl Drop for ShmImage {
+    fn drop(&mut self) {
+        // SAFETY: address and length are the exact successful mmap result.
+        unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
+    }
+}
+
+pub(crate) struct X11Capture {
+    stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+    thread: Option<JoinHandle<()>>,
+    source_description: String,
+}
+
+impl X11Capture {
+    pub(crate) fn start(
+        monitor_name: Option<String>,
+        fps: u32,
+        sink: Arc<dyn FrameSink>,
+        capture_epoch: CaptureEpoch,
+    ) -> Result<Self> {
+        if fps == 0 {
+            bail!("X11 capture fps must be greater than zero");
+        }
+        let display = DisplayConnection::connect()?;
+        let monitor = display.select_monitor(monitor_name.as_deref())?;
+        pixel_layout(&display)?;
+        let source_description = format!("X11 monitor {} ({})", monitor.name, monitor.geometry());
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let thread_stop = Arc::clone(&stop);
+        let thread_failure = Arc::clone(&failure);
+        let thread = thread::Builder::new()
+            .name("cast-x11-video".to_owned())
+            .spawn(move || {
+                if let Err(error) =
+                    run_capture(monitor.name, fps, sink, capture_epoch, &thread_stop)
+                    && let Ok(mut failure) = thread_failure.lock()
+                {
+                    *failure = Some(format!("{error:#}"));
+                }
+            })
+            .context("could not start the X11 capture thread")?;
+        Ok(Self {
+            stop,
+            failure,
+            thread: Some(thread),
+            source_description,
+        })
+    }
+}
+
+impl CaptureBackend for X11Capture {
+    fn source_description(&self) -> &str {
+        &self.source_description
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .map_err(|_| anyhow!("X11 capture failure lock was poisoned"))?
+            .as_ref()
+        {
+            bail!("X11 desktop capture failed: {error}");
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("X11 capture thread panicked"))?;
+        }
+        self.check()
+    }
+}
+
+impl Drop for X11Capture {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            log::warn!("could not stop X11 desktop capture: {error:#}");
+        }
+    }
+}
+
+fn run_capture(
+    monitor_name: String,
+    fps: u32,
+    sink: Arc<dyn FrameSink>,
+    capture_epoch: CaptureEpoch,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let display = DisplayConnection::connect()?;
+    let layout = pixel_layout(&display)?;
+    let mut monitor = display.select_monitor(Some(&monitor_name))?;
+    let mut stride = layout.stride(monitor.width)?;
+    let mut length = frame_length(stride, monitor.height)?;
+    let mut shm = match ShmImage::create(&display.connection, length) {
+        Ok(segment) => segment,
+        Err(error) => {
+            log::warn!("MIT-SHM setup failed ({error:#}); using slower core X11 GetImage capture");
+            None
+        }
+    };
+    if shm.is_none() {
+        log::warn!("MIT-SHM is unavailable; using slower core X11 GetImage capture");
+    }
+    let xfixes = display
+        .connection
+        .xfixes_query_version(5, 0)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some();
+    if !xfixes {
+        log::warn!("XFixes is unavailable; X11 cursor capture is disabled");
+    }
+    let interval = Duration::from_nanos(1_000_000_000_u64 / u64::from(fps));
+    let mut next_frame = Instant::now();
+    let mut geometry_check = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        if geometry_check.elapsed() >= Duration::from_secs(1) {
+            let updated = display.select_monitor(Some(&monitor_name))?;
+            if updated != monitor {
+                monitor = updated;
+                stride = layout.stride(monitor.width)?;
+                length = frame_length(stride, monitor.height)?;
+                if let Some(old) = shm.take() {
+                    display.connection.shm_detach(old.segment)?.check()?;
+                    drop(old);
+                }
+                shm = ShmImage::create(&display.connection, length).unwrap_or_else(|error| {
+                    log::warn!("MIT-SHM resize failed ({error:#}); using core X11 GetImage");
+                    None
+                });
+                log::info!("X11 monitor geometry changed to {}", monitor.geometry());
+            }
+            geometry_check = Instant::now();
+        }
+        let data = if let Some(segment) = &shm {
+            display
+                .connection
+                .shm_get_image(
+                    display.root(),
+                    monitor.x,
+                    monitor.y,
+                    monitor.width,
+                    monitor.height,
+                    u32::MAX,
+                    ImageFormat::Z_PIXMAP.into(),
+                    segment.segment,
+                    0,
+                )?
+                .reply()
+                .context("MIT-SHM GetImage failed")?;
+            segment.bytes().to_vec()
+        } else {
+            let reply = display
+                .connection
+                .get_image(
+                    ImageFormat::Z_PIXMAP,
+                    display.root(),
+                    monitor.x,
+                    monitor.y,
+                    monitor.width,
+                    monitor.height,
+                    u32::MAX,
+                )?
+                .reply()
+                .context("core X11 GetImage failed")?;
+            if reply.data.len() != length {
+                bail!(
+                    "X11 returned {} frame bytes, expected {length}",
+                    reply.data.len()
+                );
+            }
+            reply.data
+        };
+        let cursor = xfixes
+            .then(|| capture_cursor(&display, &monitor))
+            .transpose()?;
+        sink.submit(CapturedFrame {
+            data,
+            stride,
+            width: u32::from(monitor.width),
+            height: u32::from(monitor.height),
+            format: layout.format,
+            timestamp: capture_epoch.ticks(90_000),
+            cursor,
+        });
+        next_frame += interval;
+        thread::sleep(next_frame.saturating_duration_since(Instant::now()));
+        if next_frame < Instant::now() {
+            next_frame = Instant::now();
+        }
+    }
+    if let Some(segment) = shm {
+        display.connection.shm_detach(segment.segment)?.check()?;
+    }
+    Ok(())
+}
+
+fn frame_length(stride: usize, height: u16) -> Result<usize> {
+    let length = stride
+        .checked_mul(usize::from(height))
+        .ok_or_else(|| anyhow!("X11 frame size overflowed"))?;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        bail!("X11 frame size {length} is outside the supported range");
+    }
+    Ok(length)
+}
+
+fn capture_cursor(display: &DisplayConnection, monitor: &Monitor) -> Result<CursorImage> {
+    let reply = display
+        .connection
+        .xfixes_get_cursor_image()?
+        .reply()
+        .context("XFixes cursor capture failed")?;
+    let mut pixels = Vec::with_capacity(reply.cursor_image.len() * 4);
+    for pixel in reply.cursor_image {
+        pixels.extend_from_slice(&[
+            pixel as u8,
+            (pixel >> 8) as u8,
+            (pixel >> 16) as u8,
+            (pixel >> 24) as u8,
+        ]);
+    }
+    Ok(CursorImage {
+        position: (
+            i32::from(reply.x) - i32::from(monitor.x),
+            i32::from(reply.y) - i32::from(monitor.y),
+        ),
+        hotspot: (i32::from(reply.xhot), i32::from(reply.yhot)),
+        width: u32::from(reply.width),
+        height: u32::from(reply.height),
+        stride: usize::from(reply.width) * 4,
+        format: CursorPixelFormat::Bgra,
+        pixels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -167,5 +575,52 @@ mod tests {
             primary: false,
         };
         assert_eq!(monitor.geometry(), "1920x1080-1920+40");
+    }
+
+    #[test]
+    fn maps_common_little_endian_x11_visuals() {
+        assert_eq!(
+            pixel_format(
+                ImageOrder::LSB_FIRST,
+                (0x00ff0000, 0x0000ff00, 0x000000ff),
+                32
+            )
+            .unwrap(),
+            RawPixelFormat::Bgrx
+        );
+        assert_eq!(
+            pixel_format(
+                ImageOrder::LSB_FIRST,
+                (0x000000ff, 0x0000ff00, 0x00ff0000),
+                32
+            )
+            .unwrap(),
+            RawPixelFormat::Rgbx
+        );
+        assert!(pixel_format(ImageOrder::MSB_FIRST, (0, 0, 0), 32).is_err());
+        assert!(pixel_format(ImageOrder::LSB_FIRST, (0, 0, 0), 24).is_err());
+    }
+
+    struct CountingSink(AtomicUsize);
+
+    impl FrameSink for CountingSink {
+        fn submit(&self, frame: CapturedFrame) {
+            assert_eq!(frame.data.len(), frame.stride * frame.height as usize);
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn captures_live_x11_frames_when_integration_test_is_enabled() {
+        if env::var_os("CAST_X11_INTEGRATION_TEST").is_none() {
+            return;
+        }
+        let sink = Arc::new(CountingSink(AtomicUsize::new(0)));
+        let erased: Arc<dyn FrameSink> = sink.clone();
+        let mut capture = X11Capture::start(None, 10, erased, CaptureEpoch::new()).unwrap();
+        thread::sleep(Duration::from_millis(350));
+        capture.check().unwrap();
+        capture.stop().unwrap();
+        assert!(sink.0.load(Ordering::Relaxed) >= 2);
     }
 }
