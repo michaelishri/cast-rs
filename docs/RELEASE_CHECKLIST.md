@@ -23,7 +23,7 @@ patch release; do not move or replace a published tag.
 - [ ] Choose a semantic version and export the identifiers used below.
 
   ```sh
-  VERSION=0.3.2
+  VERSION=0.10.0
   UPSTREAM=michaelishri/cast-rs
   TAP=michaelishri/homebrew-tap
   ```
