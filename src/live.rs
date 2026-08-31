@@ -43,17 +43,17 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
+    linux_capture::{
+        CaptureEpoch, CapturedFrame, ExtendedDisplaySession, FrameSink, RunningCapture,
+        start_desktop_capture, validate_source_options,
+    },
     linux_desktop::composite_cursor,
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
-    linux_pipewire::CaptureEpoch,
     media::H264Provider,
-    portal::{CapturedFrame, FrameSink, PipeWireCapture, PortalSelection, PortalSourceKind},
 };
 
 #[cfg(target_os = "macos")]
 type ExtendedDisplaySession = VirtualDisplaySession;
-#[cfg(target_os = "linux")]
-type ExtendedDisplaySession = PortalSelection;
 
 const TIMESCALE: u64 = 90_000;
 const PLAYLIST_WINDOW_SEGMENTS: usize = 8;
@@ -75,6 +75,10 @@ pub struct LiveOptions {
     pub serve_only: bool,
     pub audio: bool,
     #[cfg(target_os = "linux")]
+    pub capture_backend: crate::linux_x11::BackendPreference,
+    #[cfg(target_os = "linux")]
+    pub display_name: Option<String>,
+    #[cfg(target_os = "linux")]
     pub select_source: bool,
     #[cfg(target_os = "linux")]
     pub provider: H264Provider,
@@ -91,6 +95,13 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
     }
     validate_cast_hosts(&options.cast_hosts)?;
     validate_serve_only(&options.cast_hosts, options.serve_only)?;
+    #[cfg(target_os = "linux")]
+    validate_source_options(
+        options.capture_backend,
+        options.display_name.as_deref(),
+        options.select_source,
+        options.extend,
+    )?;
     #[cfg(target_os = "linux")]
     LinuxVideoEncoder::preflight(
         options.provider,
@@ -126,7 +137,14 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
         for (index, host) in options.cast_hosts.iter().copied().enumerate() {
             let ordinal = u32::try_from(index + 1)
                 .context("the number of extended displays exceeded the supported ordinal range")?;
-            let session = start_extended_display(width, height, options.fps, ordinal)?;
+            let session = start_extended_display(
+                width,
+                height,
+                options.fps,
+                ordinal,
+                #[cfg(target_os = "linux")]
+                options.capture_backend,
+            )?;
             #[cfg(target_os = "macos")]
             println!(
                 "Mapped receiver {host} to temporary extended display {ordinal} (display {}).",
@@ -134,8 +152,8 @@ pub fn cast_desktop(options: LiveOptions) -> Result<()> {
             );
             #[cfg(target_os = "linux")]
             println!(
-                "Mapped receiver {host} to portal virtual source {ordinal} (PipeWire node {}).",
-                session.node_id()
+                "Mapped receiver {host} to extended source {ordinal} ({}).",
+                session.description()
             );
             virtual_displays.push((host, session));
         }
@@ -408,12 +426,13 @@ fn start_extended_display(
 
 #[cfg(target_os = "linux")]
 fn start_extended_display(
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     _fps: u32,
-    _ordinal: u32,
+    ordinal: u32,
+    backend: crate::linux_x11::BackendPreference,
 ) -> Result<ExtendedDisplaySession> {
-    crate::portal::select(PortalSourceKind::Virtual, true)
+    ExtendedDisplaySession::start(backend, width, height, ordinal)
 }
 
 struct HlsTarget {
@@ -963,7 +982,7 @@ impl LivePipeline {
 
 #[cfg(target_os = "linux")]
 struct LiveCapture {
-    capture: Option<PipeWireCapture>,
+    capture: Option<RunningCapture>,
     cadence: Option<LinuxFrameCadence>,
     encoder_worker: Option<LatestFrameWorker<CapturedFrame>>,
     store: Arc<HlsStore>,
@@ -979,10 +998,6 @@ impl LiveCapture {
         audio_submitter: Option<AudioSubmitter>,
         capture_epoch: CaptureEpoch,
     ) -> Result<Self> {
-        let selection = match extended_display {
-            Some(selection) => selection,
-            None => crate::portal::select(PortalSourceKind::Normal, options.select_source)?,
-        };
         let pipeline = LinuxLivePipeline {
             encoder: None,
             muxer: None,
@@ -1010,9 +1025,18 @@ impl LiveCapture {
         let (sink, cadence) =
             LinuxFrameCadence::start(submitter, options.fps, Arc::clone(&failure))?;
         let sink: Arc<dyn FrameSink> = Arc::new(sink);
-        let capture = PipeWireCapture::start_at(selection, sink, capture_epoch)?;
+        let capture = start_desktop_capture(
+            extended_display,
+            options.capture_backend,
+            options.display_name.clone(),
+            options.select_source,
+            options.fps,
+            sink,
+            capture_epoch,
+        )?;
         println!(
-            "Capturing the selected portal source into {}x{}, {} fps HLS...",
+            "Capturing {} into {}x{}, {} fps HLS...",
+            capture.source_description(),
             even(options.width),
             even(options.height),
             options.fps
@@ -2143,9 +2167,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::{
         desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameWorker},
+        linux_capture::{CapturedFrame, FrameSink},
         linux_encoder::RawPixelFormat,
         media::H264Provider,
-        portal::{CapturedFrame, FrameSink},
     };
     use std::{
         collections::HashMap,

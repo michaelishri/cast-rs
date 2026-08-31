@@ -22,7 +22,7 @@ use crate::desktop::{
     EncodedAudioFrame, LocalOutputBackend, LocalOutputControl,
     LocalOutputRedirect as SharedLocalOutputRedirect, OutputSnapshot,
 };
-use crate::linux_pipewire::CaptureEpoch;
+use crate::linux_capture::CaptureEpoch;
 
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNELS: u32 = 2;

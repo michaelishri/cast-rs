@@ -22,7 +22,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm pkg-config
+          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm pkg-config xvfb
 
       - name: Cache linked media libraries
         uses: actions/cache@v5
@@ -45,6 +45,11 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Test X11 capture with MIT-SHM and core GetImage
+        run: |
+          xvfb-run --auto-servernum env XDG_SESSION_TYPE=x11 CAST_X11_INTEGRATION_TEST=1 cargo test --locked linux_x11::tests::captures_live_x11_frames_when_integration_test_is_enabled
+          xvfb-run --auto-servernum env XDG_SESSION_TYPE=x11 CAST_X11_INTEGRATION_TEST=1 CAST_X11_DISABLE_SHM=1 cargo test --locked linux_x11::tests::captures_live_x11_frames_when_integration_test_is_enabled
 
       - name: Build release binary
         run: cargo build --locked --release
@@ -116,8 +121,10 @@ jobs:
           echo "PKG_CONFIG_PATH=$PWD/.build/ffmpeg-dist/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$PWD/.build/ffmpeg-dist/lib" >> "$GITHUB_ENV"
 
-      - name: Build release binary
-        run: cargo build --locked --release
+      - name: Strict lint and build release binary
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo build --locked --release
 
       - name: Package and smoke-test release archive
         run: ./scripts/package-linux-release.sh "${{ matrix.archive_arch }}"

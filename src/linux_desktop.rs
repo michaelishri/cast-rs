@@ -14,12 +14,14 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     desktop::{LatestFrameBackend, LatestFrameObserver, LatestFrameSubmitter, LatestFrameWorker},
+    linux_capture::{CaptureEpoch, CapturedFrame, CursorImage, FrameSink, start_desktop_capture},
     linux_encoder::{EncodingPriority, LinuxVideoEncoder, RawVideoFrame},
     media::H264Provider,
-    portal::{CapturedFrame, CursorImage, FrameSink, PipeWireCapture, PortalSourceKind},
 };
 
 pub(crate) struct CaptureOptions {
+    pub(crate) backend: crate::linux_x11::BackendPreference,
+    pub(crate) display: Option<String>,
     pub(crate) force_chooser: bool,
     pub(crate) duration: Duration,
     pub(crate) fps: u32,
@@ -29,7 +31,6 @@ pub(crate) struct CaptureOptions {
 }
 
 pub(crate) fn capture(options: CaptureOptions) -> Result<()> {
-    let selection = crate::portal::select(PortalSourceKind::Normal, options.force_chooser)?;
     let writer = BufWriter::new(
         File::create(&options.output)
             .with_context(|| format!("could not create {}", options.output.display()))?,
@@ -55,9 +56,18 @@ pub(crate) fn capture(options: CaptureOptions) -> Result<()> {
         "cast-linux-capture-encoder",
     )?;
     let sink: Arc<dyn FrameSink> = Arc::new(PortalFrameSubmitter { submitter });
-    let mut capture = PipeWireCapture::start(selection, sink)?;
+    let mut capture = start_desktop_capture(
+        None,
+        options.backend,
+        options.display,
+        options.force_chooser,
+        options.fps,
+        sink,
+        CaptureEpoch::new(),
+    )?;
     println!(
-        "Capturing the selected portal source at up to {} fps for {}s...",
+        "Capturing {} at up to {} fps for {}s...",
+        capture.source_description(),
         options.fps,
         options.duration.as_secs()
     );
@@ -250,7 +260,7 @@ const fn even(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{linux_encoder::RawPixelFormat, portal::CursorPixelFormat};
+    use crate::{linux_capture::CursorPixelFormat, linux_encoder::RawPixelFormat};
 
     #[test]
     fn cursor_metadata_is_composited_and_clipped() {

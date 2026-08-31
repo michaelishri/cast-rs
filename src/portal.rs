@@ -25,8 +25,11 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
+    linux_capture::{
+        CaptureBackend, CaptureEpoch, CapturedFrame, CursorImage, CursorPixelFormat, FrameSink,
+    },
     linux_encoder::RawPixelFormat,
-    linux_pipewire::{CaptureEpoch, DequeuedBuffer},
+    linux_pipewire::DequeuedBuffer,
 };
 
 const TOKEN_VERSION: u8 = 1;
@@ -450,59 +453,6 @@ const fn availability(value: bool) -> &'static str {
     if value { "available" } else { "unavailable" }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct CursorImage {
-    pub(crate) position: (i32, i32),
-    pub(crate) hotspot: (i32, i32),
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) stride: usize,
-    pub(crate) format: CursorPixelFormat,
-    pub(crate) pixels: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CursorPixelFormat {
-    Rgbx,
-    Bgrx,
-    Xrgb,
-    Xbgr,
-    Rgba,
-    Bgra,
-    Argb,
-    Abgr,
-}
-
-impl CursorPixelFormat {
-    pub(crate) fn rgba(self, pixel: &[u8]) -> (u8, u8, u8, u8) {
-        match self {
-            Self::Rgbx => (pixel[0], pixel[1], pixel[2], 255),
-            Self::Bgrx => (pixel[2], pixel[1], pixel[0], 255),
-            Self::Xrgb => (pixel[1], pixel[2], pixel[3], 255),
-            Self::Xbgr => (pixel[3], pixel[2], pixel[1], 255),
-            Self::Rgba => (pixel[0], pixel[1], pixel[2], pixel[3]),
-            Self::Bgra => (pixel[2], pixel[1], pixel[0], pixel[3]),
-            Self::Argb => (pixel[1], pixel[2], pixel[3], pixel[0]),
-            Self::Abgr => (pixel[3], pixel[2], pixel[1], pixel[0]),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CapturedFrame {
-    pub(crate) data: Vec<u8>,
-    pub(crate) stride: usize,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) format: RawPixelFormat,
-    pub(crate) timestamp: u64,
-    pub(crate) cursor: Option<CursorImage>,
-}
-
-pub(crate) trait FrameSink: Send + Sync + 'static {
-    fn submit(&self, frame: CapturedFrame);
-}
-
 struct PipeWireUserData {
     format: spa::param::video::VideoInfoRaw,
     sink: Arc<dyn FrameSink>,
@@ -525,18 +475,23 @@ pub(crate) struct PipeWireCapture {
     failure: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
     _selection: PortalSelection,
+    source_description: String,
 }
 
 impl PipeWireCapture {
-    pub(crate) fn start(selection: PortalSelection, sink: Arc<dyn FrameSink>) -> Result<Self> {
-        Self::start_at(selection, sink, CaptureEpoch::new())
-    }
-
     pub(crate) fn start_at(
         mut selection: PortalSelection,
         sink: Arc<dyn FrameSink>,
         capture_epoch: CaptureEpoch,
     ) -> Result<Self> {
+        let source_description = match (selection.source_type(), selection.size()) {
+            (Some(source_type), Some((width, height))) => {
+                format!("portal {source_type:?} ({width}x{height})")
+            }
+            (Some(source_type), None) => format!("portal {source_type:?}"),
+            (None, Some((width, height))) => format!("portal source ({width}x{height})"),
+            (None, None) => "portal source".to_owned(),
+        };
         let remote = selection.take_remote()?;
         let node_id = selection.node_id();
         let cursor_metadata = selection.cursor_mode() == CursorMode::Metadata;
@@ -571,6 +526,7 @@ impl PipeWireCapture {
             failure,
             thread: Some(thread),
             _selection: selection,
+            source_description,
         })
     }
 
@@ -594,6 +550,20 @@ impl PipeWireCapture {
                 .map_err(|_| anyhow!("PipeWire capture thread panicked"))?;
         }
         self.check()
+    }
+}
+
+impl CaptureBackend for PipeWireCapture {
+    fn source_description(&self) -> &str {
+        &self.source_description
+    }
+
+    fn check(&self) -> Result<()> {
+        Self::check(self)
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        Self::stop(self)
     }
 }
 
