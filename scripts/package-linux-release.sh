@@ -40,6 +40,8 @@ extract_root="$work_root/extracted"
 
 mkdir -p "$package_root/lib" "$extract_root" "$output_dir"
 install -m 0755 "$binary" "$package_root/cast"
+mkdir -p "$package_root/desktop"
+cp -a "$repo_root/desktop/cinnamon" "$package_root/desktop/"
 cp -a "$media_root/lib/libavcodec.so"* "$package_root/lib/"
 cp -a "$media_root/lib/libavformat.so"* "$package_root/lib/"
 cp -a "$media_root/lib/libavutil.so"* "$package_root/lib/"
@@ -82,6 +84,19 @@ if grep -E 'lib(X11|xcb|Xfixes|Xrandr)' "$output_dir/$archive.ldd.txt"; then
 fi
 env -u LD_LIBRARY_PATH "$extracted/cast" --version
 env -u LD_LIBRARY_PATH "$extracted/cast" --help >/dev/null
+
+test -x "$extracted/desktop/cinnamon/scripts/install.sh"
+test -f "$extracted/desktop/cinnamon/applet/cast@cast-rs/applet.js"
+test -f "$extracted/desktop/cinnamon/settings/cs_cast.py"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$extracted/desktop/cinnamon/settings" \
+  python3 -m unittest discover -s "$extracted/desktop/cinnamon/tests"
+glib-compile-schemas --strict --dry-run "$extracted/desktop/cinnamon/schemas"
+cinnamon_stage="$work_root/cinnamon-stage"
+DESTDIR="$cinnamon_stage" "$extracted/desktop/cinnamon/scripts/install.sh"
+test -f "$cinnamon_stage/usr/share/cinnamon/cinnamon-settings/modules/cs_cast.py"
+test -f "$cinnamon_stage/usr/share/cinnamon/applets/cast@cast-rs/applet.js"
+DESTDIR="$cinnamon_stage" "$extracted/desktop/cinnamon/scripts/uninstall.sh"
+test ! -e "$cinnamon_stage/usr/share/cinnamon/applets/cast@cast-rs"
 
 if tar -tzf "$archive_path" | grep -E '/(libopenh264\.so|libcuda\.so|libnvidia|libva\.so|dri/|libpipewire|libwireplumber|libc\.so)'; then
   echo "archive contains a host codec, GPU driver, desktop service, or glibc library" >&2

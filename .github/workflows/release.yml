@@ -106,7 +106,7 @@ jobs:
       - name: Install build and audit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
+          sudo apt-get install --yes build-essential libglib2.0-bin libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
 
       - name: Cache linked media libraries
         uses: actions/cache@v5

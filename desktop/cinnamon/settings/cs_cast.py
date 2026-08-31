@@ -7,7 +7,7 @@ import subprocess
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gio, Gtk
+from gi.repository import Gio, GLib, Gtk
 from SettingsWidgets import SidePage
 from xapp.GSettingsWidgets import *
 
@@ -61,7 +61,11 @@ class DiagnosticRow(SettingsWidget):
         except (OSError, subprocess.SubprocessError, IndexError):
             version = _("available")
 
-        self.label.set_markup(_("<b>Cast CLI:</b> {} ({})").format(version, executable))
+        self.label.set_markup(
+            _("<b>Cast CLI:</b> {} ({})").format(
+                GLib.markup_escape_text(version), GLib.markup_escape_text(executable)
+            )
+        )
         self.set_tooltip_text(executable)
 
 
@@ -162,7 +166,6 @@ class Module:
         video.add_row(GSettingsSpinButton(_("Target delay"), CAST_SCHEMA, "target-delay-ms", _("ms"), step=10, page=100))
         video.add_row(GSettingsSpinButton(_("Discovery timeout"), CAST_SCHEMA, "discovery-timeout", _("seconds")))
 
-        self.sidePage.show_all()
         self.loaded = True
 
     def _on_applet_setting_changed(self, *_args):

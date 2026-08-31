@@ -4,9 +4,36 @@ const GLib = imports.gi.GLib;
 const Main = imports.ui.main;
 const PopupMenu = imports.ui.popupMenu;
 const Util = imports.misc.util;
+const ByteArray = imports.byteArray;
 
 const CAST_SCHEMA = "io.github.michaelishri.cast";
 const SIGINT = 2;
+
+
+function loadCastSettings() {
+    let source = Gio.SettingsSchemaSource.get_default();
+    let schema = source.lookup(CAST_SCHEMA, true);
+    if (schema === null) {
+        source = Gio.SettingsSchemaSource.new_from_directory(
+            "/usr/share/glib-2.0/schemas", source, true
+        );
+        schema = source.lookup(CAST_SCHEMA, true);
+    }
+    if (schema === null)
+        throw new Error(`GSettings schema ${CAST_SCHEMA} is not installed`);
+    return Gio.Settings.new_full(schema, null, null);
+}
+
+
+function currentProcessId() {
+    let [ok, contents] = GLib.file_get_contents("/proc/self/stat");
+    if (!ok)
+        throw new Error("Could not read the Cinnamon process ID");
+    let processId = Number.parseInt(ByteArray.toString(contents).split(" ", 1)[0], 10);
+    if (!Number.isInteger(processId) || processId <= 0)
+        throw new Error("Cinnamon returned an invalid process ID");
+    return processId;
+}
 
 
 class CastApplet extends Applet.IconApplet {
@@ -16,7 +43,7 @@ class CastApplet extends Applet.IconApplet {
         this.metadata = metadata;
         imports.searchPath.unshift(metadata.path);
         this.Command = imports.command;
-        this._settings = new Gio.Settings({schema_id: CAST_SCHEMA});
+        this._settings = loadCastSettings();
         this._activeProcess = null;
         this._activeDevice = null;
         this._discoveryProcess = null;
@@ -207,7 +234,7 @@ class CastApplet extends Applet.IconApplet {
             return;
 
         let argv = this.Command.buildDesktopCommand(
-            this._castExecutable(), device, this._desktopOptions(mode), GLib.getpid()
+            this._castExecutable(), device, this._desktopOptions(mode), currentProcessId()
         );
         let generation = ++this._sessionGeneration;
         this._stopping = false;

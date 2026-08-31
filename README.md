@@ -33,6 +33,15 @@ cd cast-linux-x86_64
 
 `cast setup` asks before downloading, verifies a pinned checksum, and installs Cisco's OpenH264 2.3 module in the current user's XDG data directory. The module is not bundled in Cast's archive. Use `--yes` for an explicitly approved non-interactive install; `--check` never changes files.
 
+On Cinnamon, the Linux archive also includes a native **Cast** System Settings item and panel applet. Install them from the extracted archive, then enable the applet in **System Settings → Cast**:
+
+```sh
+sudo desktop/cinnamon/scripts/install.sh
+cinnamon-settings cast
+```
+
+If `cast` is not installed on the graphical session's `PATH`, set **Cast executable** to the absolute path of the extracted `cast` binary. The Cinnamon integration currently targets X11; Wayland desktop casting is not yet supported.
+
 ### Install a release archive manually
 
 Alternatively, download the archive that matches the Mac from the GitHub Releases page:
