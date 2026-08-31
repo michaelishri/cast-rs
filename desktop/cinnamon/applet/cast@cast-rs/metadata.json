@@ -1,0 +1,7 @@
+{
+  "uuid": "cast@cast-rs",
+  "name": "Cast",
+  "description": "Cast the desktop to Google Cast devices",
+  "icon": "cast-symbolic",
+  "max-instances": 1
+}
