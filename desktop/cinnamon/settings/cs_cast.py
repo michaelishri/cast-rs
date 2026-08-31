@@ -135,7 +135,7 @@ class Module:
                 _("Capture backend"),
                 CAST_SCHEMA,
                 "backend",
-                [("auto", _("Automatic")), ("x11", _("X11")), ("portal", _("Desktop portal"))],
+                [("auto", _("Automatic")), ("x11", _("X11"))],
                 valtype=str,
             )
         )

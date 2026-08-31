@@ -28,6 +28,7 @@ sudo desktop/cinnamon/scripts/uninstall.sh
 ```sh
 PYTHONPATH=desktop/cinnamon/settings python3 -m unittest discover -s desktop/cinnamon/tests
 python3 -m py_compile desktop/cinnamon/settings/*.py
+cjs desktop/cinnamon/tests/test_command.js desktop/cinnamon/applet/cast@cast-rs
 bash -n desktop/cinnamon/scripts/*.sh
 glib-compile-schemas --strict --dry-run desktop/cinnamon/schemas
 ```
