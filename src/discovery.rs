@@ -12,12 +12,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use serde::Serialize;
 
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const CAPABILITY_VIDEO_OUT: u32 = 1;
 const CAPABILITY_AUDIO_OUT: u32 = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeviceCapability {
     AudioOnly,
     Video,
@@ -48,7 +50,7 @@ impl DeviceCapability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CastService {
     pub name: String,
     pub model: String,
@@ -217,6 +219,27 @@ mod tests {
         assert_eq!(
             DeviceCapability::from_mdns(Some("5")),
             DeviceCapability::Video
+        );
+    }
+
+    #[test]
+    fn serializes_the_desktop_integration_contract() {
+        let service = CastService {
+            name: "Living Room".to_owned(),
+            model: "Google TV".to_owned(),
+            capability: DeviceCapability::Video,
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)),
+            port: 8009,
+        };
+        assert_eq!(
+            serde_json::to_value(service).unwrap(),
+            serde_json::json!({
+                "name": "Living Room",
+                "model": "Google TV",
+                "capability": "video",
+                "address": "192.0.2.8",
+                "port": 8009
+            })
         );
     }
 
