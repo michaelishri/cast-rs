@@ -3,6 +3,7 @@ import SwiftUI
 
 struct CastPopoverView: View {
   @EnvironmentObject private var model: CastAppModel
+  @EnvironmentObject private var preferences: CastPreferences
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -30,12 +31,7 @@ struct CastPopoverView: View {
         receiverList
       }
 
-      Toggle(
-        "Include system audio",
-        isOn: Binding(
-          get: { model.configuration.includeAudio },
-          set: { model.configuration.includeAudio = $0 }
-        ))
+      Toggle("Include system audio", isOn: $preferences.includeAudio)
 
       if let message = model.errorMessage {
         Text(message)

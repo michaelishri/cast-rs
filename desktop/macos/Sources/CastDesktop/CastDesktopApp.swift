@@ -13,12 +13,28 @@ final class CastAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct CastDesktopApp: App {
   @NSApplicationDelegateAdaptor(CastAppDelegate.self) private var delegate
-  @StateObject private var model = CastAppModel()
+  @StateObject private var preferences: CastPreferences
+  @StateObject private var permissions: ScreenRecordingController
+  @StateObject private var loginItem: LoginItemController
+  @StateObject private var diagnostics: CastDiagnostics
+  @StateObject private var model: CastAppModel
+
+  init() {
+    let preferences = CastPreferences()
+    let permissions = ScreenRecordingController()
+    _preferences = StateObject(wrappedValue: preferences)
+    _permissions = StateObject(wrappedValue: permissions)
+    _loginItem = StateObject(wrappedValue: LoginItemController())
+    _diagnostics = StateObject(wrappedValue: CastDiagnostics())
+    _model = StateObject(
+      wrappedValue: CastAppModel(preferences: preferences, permissions: permissions))
+  }
 
   var body: some Scene {
     MenuBarExtra {
       CastPopoverView()
         .environmentObject(model)
+        .environmentObject(preferences)
         .onAppear { delegate.model = model }
     } label: {
       Image(systemName: model.hasActiveCast ? "airplayvideo.circle.fill" : "airplayvideo")
@@ -27,12 +43,11 @@ struct CastDesktopApp: App {
     .menuBarExtraStyle(.window)
 
     Settings {
-      VStack(spacing: 10) {
-        Image(systemName: "airplayvideo").font(.largeTitle)
-        Text("Cast settings are installed with the next integration component.")
-      }
-      .padding(30)
-      .frame(width: 460, height: 220)
+      CastSettingsView()
+        .environmentObject(preferences)
+        .environmentObject(permissions)
+        .environmentObject(loginItem)
+        .environmentObject(diagnostics)
     }
   }
 }

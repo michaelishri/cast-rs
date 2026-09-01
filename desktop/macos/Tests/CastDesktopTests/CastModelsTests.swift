@@ -72,3 +72,45 @@ import Testing
     try CastExecutable.resolve(environment: ["CAST_CLI_PATH": "/definitely/missing/cast"])
   }
 }
+
+@MainActor
+@Test func preferenceDefaultsMatchTheProductDefaults() {
+  let suite = "CastDesktopTests.defaults.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let preferences = CastPreferences(defaults: defaults)
+
+  #expect(preferences.configuration == CastConfiguration())
+}
+
+@MainActor
+@Test func preferencesPersistAndNormalizeInvalidValues() {
+  let suite = "CastDesktopTests.normalize.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defer { defaults.removePersistentDomain(forName: suite) }
+  defaults.set("invalid", forKey: CastPreferences.Key.transport)
+  defaults.set(9_999, forKey: CastPreferences.Key.width)
+  defaults.set(719, forKey: CastPreferences.Key.height)
+  defaults.set(0, forKey: CastPreferences.Key.framesPerSecond)
+  defaults.set(-1, forKey: CastPreferences.Key.bitrate)
+  defaults.set(99, forKey: CastPreferences.Key.discoveryTimeoutSeconds)
+
+  let preferences = CastPreferences(defaults: defaults)
+  #expect(preferences.transport == .mirror)
+  #expect(preferences.width == 3840)
+  #expect(preferences.height == 718)
+  #expect(preferences.framesPerSecond == 1)
+  #expect(preferences.bitrate == 100_000)
+  #expect(preferences.discoveryTimeoutSeconds == 30)
+
+  preferences.includeAudio = true
+  #expect(CastPreferences(defaults: defaults).includeAudio)
+}
+
+@Test func mapsEveryLaunchAtLoginStatus() {
+  #expect(LoginItemState.map(.enabled) == .enabled)
+  #expect(LoginItemState.map(.notRegistered) == .disabled)
+  #expect(LoginItemState.map(.requiresApproval) == .requiresApproval)
+  #expect(
+    LoginItemState.map(.notFound) == .unavailable("Cast.app must be installed in Applications"))
+}
