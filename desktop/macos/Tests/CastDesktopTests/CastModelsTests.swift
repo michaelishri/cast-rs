@@ -1,5 +1,6 @@
 import Foundation
 import ServiceManagement
+import SwiftUI
 import Testing
 
 @testable import CastDesktop
@@ -308,6 +309,19 @@ import Testing
   #expect(ActiveCastState.restarting.label == "Restarting…")
   #expect(ActiveCastState.restarting.isBusy)
   #expect(ActiveCastState.stopping.label == "Stopping…")
+}
+
+@MainActor
+@Test func castIconUsesNativeMenuDimensions() throws {
+  #expect(CastIcon.menuBarPointSize == 16)
+  #expect(CastIcon.menuItemPointSize == 14)
+
+  let menuBarImage = try #require(
+    ImageRenderer(content: CastGlyph(pointSize: CastIcon.menuBarPointSize)).nsImage)
+  let menuItemImage = try #require(
+    ImageRenderer(content: CastGlyph(pointSize: CastIcon.menuItemPointSize)).nsImage)
+  #expect(menuBarImage.size == NSSize(width: 16, height: 16))
+  #expect(menuItemImage.size == NSSize(width: 14, height: 14))
 }
 
 private final class LoginItemServiceStub: LoginItemServicing {
