@@ -25,10 +25,7 @@ struct CastMenuView: View {
       }
       .disabled(model.isDiscovering)
 
-      Button("Settings…") {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        NSApp.activate(ignoringOtherApps: true)
-      }
+      CastSettingsMenuItem()
 
       Divider()
       Button("Quit Cast") {
@@ -134,5 +131,20 @@ struct CastMenuView: View {
   private func refresh() {
     model.refreshDisplays()
     model.refreshDevices()
+  }
+}
+
+private struct CastSettingsMenuItem: View {
+  var body: some View {
+    if #available(macOS 14.0, *) {
+      SettingsLink {
+        Text("Settings…")
+      }
+    } else {
+      Button("Settings…") {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+      }
+    }
   }
 }
