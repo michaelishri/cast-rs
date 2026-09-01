@@ -125,7 +125,7 @@ struct CastMenuView: View {
       .disabled(active.state == .stopping)
     } label: {
       HStack {
-        CastGlyph(pointSize: CastIcon.menuItemPointSize)
+        CastGlyph(image: CastIcon.menuItemImage)
         Text("Casting to \(active.device.name)")
       }
     }

@@ -315,11 +315,13 @@ import Testing
 @Test func castIconUsesNativeMenuDimensions() throws {
   #expect(CastIcon.menuBarPointSize == 16)
   #expect(CastIcon.menuItemPointSize == 14)
+  #expect(CastIcon.menuBarImage.size == NSSize(width: 16, height: 16))
+  #expect(CastIcon.menuItemImage.size == NSSize(width: 14, height: 14))
 
   let menuBarImage = try #require(
-    ImageRenderer(content: CastGlyph(pointSize: CastIcon.menuBarPointSize)).nsImage)
+    ImageRenderer(content: CastGlyph(image: CastIcon.menuBarImage)).nsImage)
   let menuItemImage = try #require(
-    ImageRenderer(content: CastGlyph(pointSize: CastIcon.menuItemPointSize)).nsImage)
+    ImageRenderer(content: CastGlyph(image: CastIcon.menuItemImage)).nsImage)
   #expect(menuBarImage.size == NSSize(width: 16, height: 16))
   #expect(menuItemImage.size == NSSize(width: 14, height: 14))
 }
