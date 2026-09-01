@@ -35,7 +35,9 @@ enum LoginItemState: Equatable {
   case requiresApproval
   case unavailable(String)
 
-  var isEnabled: Bool { self == .enabled }
+  var isRegistered: Bool {
+    self == .enabled || self == .requiresApproval
+  }
 
   var label: String {
     switch self {
@@ -51,20 +53,28 @@ enum LoginItemState: Equatable {
     case .enabled: .enabled
     case .notRegistered: .disabled
     case .requiresApproval: .requiresApproval
-    case .notFound: .unavailable("Cast.app must be installed in Applications")
+    case .notFound: .disabled
     @unknown default: .unavailable("Unknown login item status")
     }
   }
 }
+
+protocol LoginItemServicing: AnyObject {
+  var status: SMAppService.Status { get }
+  func register() throws
+  func unregister() throws
+}
+
+extension SMAppService: LoginItemServicing {}
 
 @MainActor
 final class LoginItemController: ObservableObject {
   @Published private(set) var state: LoginItemState
   @Published private(set) var isChanging = false
 
-  private let service: SMAppService
+  private let service: any LoginItemServicing
 
-  init(service: SMAppService = .mainApp) {
+  init(service: any LoginItemServicing = SMAppService.mainApp) {
     self.service = service
     state = LoginItemState.map(service.status)
   }
@@ -78,7 +88,9 @@ final class LoginItemController: ObservableObject {
     defer { isChanging = false }
     do {
       if enabled {
-        if service.status == .notRegistered { try service.register() }
+        if service.status != .enabled && service.status != .requiresApproval {
+          try service.register()
+        }
       } else if service.status == .enabled || service.status == .requiresApproval {
         try service.unregister()
       }

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct CastSettingsView: View {
@@ -22,6 +23,11 @@ struct CastSettingsView: View {
       loginItem.refresh()
       diagnostics.refresh()
     }
+    .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))
+    {
+      _ in
+      loginItem.refresh()
+    }
   }
 
   private var general: some View {
@@ -29,7 +35,7 @@ struct CastSettingsView: View {
       Toggle(
         "Launch Cast at login",
         isOn: Binding(
-          get: { loginItem.state.isEnabled },
+          get: { loginItem.state.isRegistered },
           set: { loginItem.setEnabled($0) }
         )
       )

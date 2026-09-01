@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 import Testing
 
 @testable import CastDesktop
@@ -259,8 +260,35 @@ import Testing
   #expect(LoginItemState.map(.enabled) == .enabled)
   #expect(LoginItemState.map(.notRegistered) == .disabled)
   #expect(LoginItemState.map(.requiresApproval) == .requiresApproval)
-  #expect(
-    LoginItemState.map(.notFound) == .unavailable("Cast.app must be installed in Applications"))
+  #expect(LoginItemState.map(.notFound) == .disabled)
+  #expect(LoginItemState.enabled.isRegistered)
+  #expect(LoginItemState.requiresApproval.isRegistered)
+  #expect(!LoginItemState.disabled.isRegistered)
+  #expect(!LoginItemState.unavailable("Unavailable").isRegistered)
+}
+
+@MainActor
+@Test func firstLoginItemRegistrationHandlesNotFoundStatus() {
+  let service = LoginItemServiceStub(status: .notFound)
+  let controller = LoginItemController(service: service)
+
+  #expect(controller.state == .disabled)
+  controller.setEnabled(true)
+
+  #expect(service.registerCallCount == 1)
+  #expect(controller.state == .enabled)
+}
+
+@MainActor
+@Test func loginItemPendingApprovalRemainsSelectedAndCanBeDisabled() {
+  let service = LoginItemServiceStub(status: .requiresApproval)
+  let controller = LoginItemController(service: service)
+
+  #expect(controller.state.isRegistered)
+  controller.setEnabled(false)
+
+  #expect(service.unregisterCallCount == 1)
+  #expect(controller.state == .disabled)
 }
 
 @Test func resolutionPresetsMatchConfiguration() {
@@ -280,4 +308,24 @@ import Testing
   #expect(ActiveCastState.restarting.label == "Restarting…")
   #expect(ActiveCastState.restarting.isBusy)
   #expect(ActiveCastState.stopping.label == "Stopping…")
+}
+
+private final class LoginItemServiceStub: LoginItemServicing {
+  var status: SMAppService.Status
+  private(set) var registerCallCount = 0
+  private(set) var unregisterCallCount = 0
+
+  init(status: SMAppService.Status) {
+    self.status = status
+  }
+
+  func register() throws {
+    registerCallCount += 1
+    status = .enabled
+  }
+
+  func unregister() throws {
+    unregisterCallCount += 1
+    status = .notRegistered
+  }
 }
