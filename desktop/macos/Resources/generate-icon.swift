@@ -20,7 +20,21 @@ let background = NSBezierPath(
 NSColor(calibratedRed: 0.08, green: 0.42, blue: 0.88, alpha: 1).setFill()
 background.fill()
 
-let glyphRect = NSRect(x: 132, y: 132, width: 760, height: 760)
+let glyphBounds = NSRect(x: 132, y: 132, width: 760, height: 760)
+let glyphScale = min(
+  glyphBounds.width / glyph.size.width,
+  glyphBounds.height / glyph.size.height
+)
+let glyphSize = NSSize(
+  width: glyph.size.width * glyphScale,
+  height: glyph.size.height * glyphScale
+)
+let glyphRect = NSRect(
+  x: glyphBounds.midX - (glyphSize.width / 2),
+  y: glyphBounds.midY - (glyphSize.height / 2),
+  width: glyphSize.width,
+  height: glyphSize.height
+)
 let tintedGlyph = NSImage(size: size)
 tintedGlyph.lockFocus()
 glyph.draw(in: glyphRect)
