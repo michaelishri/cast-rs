@@ -51,24 +51,13 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
-      - name: Package release archive and checksum
-        shell: bash
+      - name: Check and test macOS app
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive_root="cast-${version}-macos-${{ matrix.arch }}"
-          mkdir -p "package/$archive_root" dist
-          cp target/release/cast "package/$archive_root/"
-          mkdir -p "package/$archive_root/lib"
-          cp -R .build/ffmpeg-dist/lib/*.dylib "package/$archive_root/lib/"
-          cp README.md "package/$archive_root/"
-          cp LICENSE "package/$archive_root/"
-          cp THIRD_PARTY_NOTICES.md "package/$archive_root/"
-          cp .build/ffmpeg-8.0.1/COPYING.LGPLv2.1 "package/$archive_root/FFMPEG-LICENSE-LGPL-2.1.txt"
-          tar -C package -czf "dist/${archive_root}.tar.gz" "$archive_root"
-          (
-            cd dist
-            shasum -a 256 "${archive_root}.tar.gz" > "${archive_root}.tar.gz.sha256"
-          )
+          swift format lint --strict --recursive desktop/macos/Sources desktop/macos/Tests
+          swift test --package-path desktop/macos
+
+      - name: Package and validate release archive
+        run: ./scripts/package-macos-release.sh "${{ matrix.arch }}"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7
@@ -106,7 +95,7 @@ jobs:
       - name: Install build and audit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
+          sudo apt-get install --yes build-essential libglib2.0-bin libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
 
       - name: Cache linked media libraries
         uses: actions/cache@v5

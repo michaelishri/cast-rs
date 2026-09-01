@@ -106,7 +106,7 @@ jobs:
       - name: Install build and audit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
+          sudo apt-get install --yes build-essential libglib2.0-bin libpipewire-0.3-dev libva-dev nasm patchelf pkg-config
 
       - name: Cache linked media libraries
         uses: actions/cache@v5
@@ -170,5 +170,21 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Check and test macOS app
+        run: |
+          swift format lint --strict --recursive desktop/macos/Sources desktop/macos/Tests
+          swift test --package-path desktop/macos
+
       - name: Build release binary
         run: cargo build --locked --release
+
+      - name: Package and validate Cast.app
+        run: ./scripts/package-macos-release.sh arm64
+
+      - name: Upload macOS validation artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,5 +1,7 @@
 /target
 /.build
+/desktop/macos/.build
+/dist
 /vendor/*
 !/vendor/libspa/
 !/vendor/libspa/**

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.michaelishri.cast" path="/io/github/michaelishri/cast/">
+    <key name="applet-enabled" type="b">
+      <default>false</default>
+      <summary>Show the Cast panel applet</summary>
+    </key>
+    <key name="cast-command" type="s">
+      <default>'cast'</default>
+      <summary>Cast CLI command or absolute path</summary>
+    </key>
+    <key name="default-mode" type="s">
+      <default>'mirror'</default>
+      <summary>Default desktop casting mode</summary>
+    </key>
+    <key name="audio" type="b">
+      <default>true</default>
+      <summary>Include audio when casting</summary>
+    </key>
+    <key name="transport" type="s">
+      <default>'mirror'</default>
+      <summary>Desktop streaming transport</summary>
+    </key>
+    <key name="backend" type="s">
+      <default>'auto'</default>
+      <summary>Desktop capture backend</summary>
+    </key>
+    <key name="encoder" type="s">
+      <default>'auto'</default>
+      <summary>Video encoder</summary>
+    </key>
+    <key name="width" type="i">
+      <range min="2" max="3840"/>
+      <default>1280</default>
+      <summary>Output width</summary>
+    </key>
+    <key name="height" type="i">
+      <range min="2" max="2160"/>
+      <default>720</default>
+      <summary>Output height</summary>
+    </key>
+    <key name="fps" type="i">
+      <range min="1" max="60"/>
+      <default>30</default>
+      <summary>Output frame rate</summary>
+    </key>
+    <key name="bitrate" type="i">
+      <range min="100000" max="50000000"/>
+      <default>6000000</default>
+      <summary>Video bitrate in bits per second</summary>
+    </key>
+    <key name="target-delay-ms" type="i">
+      <range min="1" max="5000"/>
+      <default>200</default>
+      <summary>Target mirror delay in milliseconds</summary>
+    </key>
+    <key name="discovery-timeout" type="i">
+      <range min="1" max="30"/>
+      <default>3</default>
+      <summary>Device discovery timeout in seconds</summary>
+    </key>
+  </schema>
+</schemalist>

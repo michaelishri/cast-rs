@@ -1,6 +1,6 @@
 [package]
 name = "cast"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Cast local video and a desktop to Google Cast devices"
@@ -47,6 +47,7 @@ x11rb = { version = "0.14", default-features = false, features = ["image", "rand
 libspa = { path = "vendor/libspa" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 screencapturekit = { version = "8.0", features = ["macos_13_0"] }
 videotoolbox = { version = "0.18", features = ["compression"] }
 

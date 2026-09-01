@@ -10,6 +10,8 @@ mod linux_audio;
 #[cfg(target_os = "linux")]
 mod linux_capture;
 #[cfg(target_os = "linux")]
+mod linux_controller;
+#[cfg(target_os = "linux")]
 mod linux_desktop;
 #[cfg(target_os = "linux")]
 mod linux_encoder;
@@ -18,6 +20,8 @@ mod linux_pipewire;
 #[cfg(target_os = "linux")]
 mod linux_x11;
 mod live;
+#[cfg(target_os = "macos")]
+mod macos_controller;
 mod media;
 mod media_server;
 mod mirror;
@@ -68,6 +72,9 @@ enum Command {
     Devices {
         #[arg(long, default_value_t = 3)]
         timeout: u64,
+        /// Emit a stable JSON array for desktop integrations and scripts.
+        #[arg(long)]
+        json: bool,
     },
     #[cfg(target_os = "linux")]
     /// Install or check the optional Cisco OpenH264 runtime module.
@@ -357,6 +364,9 @@ enum Command {
         /// Start capture and HLS serving without contacting the sole receiver (HLS only).
         #[arg(long)]
         serve_only: bool,
+        /// Stop cleanly if the desktop integration process exits.
+        #[arg(long, hide = true)]
+        controller_pid: Option<u32>,
     },
     #[cfg(target_os = "linux")]
     /// Capture a portal-selected desktop source and cast it to Google Cast receivers.
@@ -406,6 +416,9 @@ enum Command {
         seconds: Option<u64>,
         #[arg(long)]
         serve_only: bool,
+        /// Stop cleanly if the desktop integration process exits.
+        #[arg(long, hide = true)]
+        controller_pid: Option<u32>,
     },
     #[cfg(target_os = "macos")]
     /// Internal owner process for a temporary virtual display.
@@ -490,9 +503,12 @@ fn main() -> Result<()> {
         log_capture.as_ref().map(tui::LogCapture::writer),
     );
     match cli.command {
-        Command::Devices { timeout } => {
+        Command::Devices { timeout, json } => {
             let devices = discovery::discover(Duration::from_secs(timeout))?;
-            if devices.is_empty() {
+            if json {
+                serde_json::to_writer(io::stdout().lock(), &devices)?;
+                println!();
+            } else if devices.is_empty() {
                 println!("No Cast devices found.");
             } else {
                 print_devices(&devices);
@@ -745,51 +761,55 @@ fn main() -> Result<()> {
             quality_priority,
             seconds,
             serve_only,
-        } => match transport {
-            DesktopTransport::Mirror => {
-                if serve_only {
-                    anyhow::bail!("--serve-only is available only with --transport hls");
+            controller_pid,
+        } => {
+            let _controller_watch = macos_controller::ControllerWatch::start(controller_pid)?;
+            match transport {
+                DesktopTransport::Mirror => {
+                    if serve_only {
+                        anyhow::bail!("--serve-only is available only with --transport hls");
+                    }
+                    mirror::cast_desktop(mirror::MirrorOptions {
+                        cast_hosts: host,
+                        cast_port,
+                        display_id: display,
+                        extend,
+                        fps,
+                        width,
+                        height,
+                        bitrate,
+                        target_delay: Duration::from_millis(target_delay_ms),
+                        duration: seconds.map(Duration::from_secs),
+                        synthetic: false,
+                        max_frame_age: max_frame_age_ms.map(Duration::from_millis),
+                        adaptive_bitrate: !fixed_bitrate,
+                        prioritize_encoding_speed: !quality_priority,
+                        audio,
+                    })?;
                 }
-                mirror::cast_desktop(mirror::MirrorOptions {
-                    cast_hosts: host,
-                    cast_port,
-                    display_id: display,
-                    extend,
-                    fps,
-                    width,
-                    height,
-                    bitrate,
-                    target_delay: Duration::from_millis(target_delay_ms),
-                    duration: seconds.map(Duration::from_secs),
-                    synthetic: false,
-                    max_frame_age: max_frame_age_ms.map(Duration::from_millis),
-                    adaptive_bitrate: !fixed_bitrate,
-                    prioritize_encoding_speed: !quality_priority,
-                    audio,
-                })?;
-            }
-            DesktopTransport::Hls => {
-                if max_frame_age_ms.is_some() || fixed_bitrate || quality_priority {
-                    anyhow::bail!(
-                        "--max-frame-age-ms, --fixed-bitrate, and --quality-priority apply only to --transport mirror"
-                    );
+                DesktopTransport::Hls => {
+                    if max_frame_age_ms.is_some() || fixed_bitrate || quality_priority {
+                        anyhow::bail!(
+                            "--max-frame-age-ms, --fixed-bitrate, and --quality-priority apply only to --transport mirror"
+                        );
+                    }
+                    live::cast_desktop(live::LiveOptions {
+                        cast_hosts: host,
+                        cast_port,
+                        display_id: display,
+                        extend,
+                        http_port,
+                        fps,
+                        width,
+                        height,
+                        bitrate,
+                        duration: seconds.map(Duration::from_secs),
+                        serve_only,
+                        audio,
+                    })?;
                 }
-                live::cast_desktop(live::LiveOptions {
-                    cast_hosts: host,
-                    cast_port,
-                    display_id: display,
-                    extend,
-                    http_port,
-                    fps,
-                    width,
-                    height,
-                    bitrate,
-                    duration: seconds.map(Duration::from_secs),
-                    serve_only,
-                    audio,
-                })?;
             }
-        },
+        }
         #[cfg(target_os = "linux")]
         Command::Desktop {
             host,
@@ -812,59 +832,63 @@ fn main() -> Result<()> {
             quality_priority,
             seconds,
             serve_only,
-        } => match transport {
-            DesktopTransport::Mirror => {
-                if serve_only {
-                    anyhow::bail!("--serve-only is available only with --transport hls");
+            controller_pid,
+        } => {
+            let _controller_watch = linux_controller::ControllerWatch::start(controller_pid)?;
+            match transport {
+                DesktopTransport::Mirror => {
+                    if serve_only {
+                        anyhow::bail!("--serve-only is available only with --transport hls");
+                    }
+                    mirror::cast_desktop(mirror::MirrorOptions {
+                        cast_hosts: host,
+                        cast_port,
+                        display_id: None,
+                        extend,
+                        fps,
+                        width,
+                        height,
+                        bitrate,
+                        target_delay: Duration::from_millis(target_delay_ms),
+                        duration: seconds.map(Duration::from_secs),
+                        synthetic: false,
+                        max_frame_age: max_frame_age_ms.map(Duration::from_millis),
+                        adaptive_bitrate: !fixed_bitrate,
+                        prioritize_encoding_speed: !quality_priority,
+                        audio,
+                        capture_backend: backend,
+                        display_name: display.clone(),
+                        select_source,
+                        provider: encoder.into(),
+                    })?;
                 }
-                mirror::cast_desktop(mirror::MirrorOptions {
-                    cast_hosts: host,
-                    cast_port,
-                    display_id: None,
-                    extend,
-                    fps,
-                    width,
-                    height,
-                    bitrate,
-                    target_delay: Duration::from_millis(target_delay_ms),
-                    duration: seconds.map(Duration::from_secs),
-                    synthetic: false,
-                    max_frame_age: max_frame_age_ms.map(Duration::from_millis),
-                    adaptive_bitrate: !fixed_bitrate,
-                    prioritize_encoding_speed: !quality_priority,
-                    audio,
-                    capture_backend: backend,
-                    display_name: display.clone(),
-                    select_source,
-                    provider: encoder.into(),
-                })?;
-            }
-            DesktopTransport::Hls => {
-                if max_frame_age_ms.is_some() || fixed_bitrate || quality_priority {
-                    anyhow::bail!(
-                        "--max-frame-age-ms, --fixed-bitrate, and --quality-priority apply only to --transport mirror"
-                    );
+                DesktopTransport::Hls => {
+                    if max_frame_age_ms.is_some() || fixed_bitrate || quality_priority {
+                        anyhow::bail!(
+                            "--max-frame-age-ms, --fixed-bitrate, and --quality-priority apply only to --transport mirror"
+                        );
+                    }
+                    live::cast_desktop(live::LiveOptions {
+                        cast_hosts: host,
+                        cast_port,
+                        display_id: None,
+                        extend,
+                        http_port,
+                        fps,
+                        width,
+                        height,
+                        bitrate,
+                        duration: seconds.map(Duration::from_secs),
+                        serve_only,
+                        audio,
+                        capture_backend: backend,
+                        display_name: display,
+                        select_source,
+                        provider: encoder.into(),
+                    })?;
                 }
-                live::cast_desktop(live::LiveOptions {
-                    cast_hosts: host,
-                    cast_port,
-                    display_id: None,
-                    extend,
-                    http_port,
-                    fps,
-                    width,
-                    height,
-                    bitrate,
-                    duration: seconds.map(Duration::from_secs),
-                    serve_only,
-                    audio,
-                    capture_backend: backend,
-                    display_name: display,
-                    select_source,
-                    provider: encoder.into(),
-                })?;
             }
-        },
+        }
         #[cfg(target_os = "macos")]
         Command::VirtualDisplayHelper {
             width,
@@ -1018,6 +1042,18 @@ mod tests {
     }
 
     #[test]
+    fn devices_accepts_machine_readable_output() {
+        let cli = Cli::try_parse_from(["cast", "devices", "--timeout", "1", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Devices {
+                timeout: 1,
+                json: true
+            }
+        ));
+    }
+
+    #[test]
     #[cfg(not(target_os = "macos"))]
     fn linux_portal_diagnostics_are_exposed_without_macos_options() {
         let displays = Cli::try_parse_from(["cast", "displays", "--select-source"]).unwrap();
@@ -1122,6 +1158,8 @@ mod tests {
             "x11",
             "--display",
             "DP-1",
+            "--controller-pid",
+            "4242",
         ])
         .unwrap();
         assert!(matches!(
@@ -1129,6 +1167,7 @@ mod tests {
             Command::Desktop {
                 backend: crate::linux_x11::BackendPreference::X11,
                 display: Some(ref name),
+                controller_pid: Some(4242),
                 ..
             } if name == "DP-1"
         ));
@@ -1170,6 +1209,27 @@ mod tests {
         let cli =
             Cli::try_parse_from(["cast", "desktop", "--host", "192.0.2.1", "--extend"]).unwrap();
         assert!(matches!(cli.command, Command::Desktop { extend: true, .. }));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn desktop_accepts_a_hidden_controller_pid() {
+        let cli = Cli::try_parse_from([
+            "cast",
+            "desktop",
+            "--host",
+            "192.0.2.1",
+            "--controller-pid",
+            "4242",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Desktop {
+                controller_pid: Some(4242),
+                ..
+            }
+        ));
     }
 
     #[test]
