@@ -124,7 +124,11 @@ struct CastMenuView: View {
       }
       .disabled(active.state == .stopping)
     } label: {
-      Label("Casting to \(active.device.name)", systemImage: "airplayvideo.circle.fill")
+      HStack {
+        Image(nsImage: CastIcon.image)
+          .renderingMode(.template)
+        Text("Casting to \(active.device.name)")
+      }
     }
   }
 

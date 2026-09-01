@@ -60,6 +60,7 @@ cp -a "$media_root"/lib/*.dylib "$runtime/lib/"
 cp "$repo_root/README.md" "$repo_root/LICENSE" "$repo_root/THIRD_PARTY_NOTICES.md" "$package_root/"
 cp "$ffmpeg_source/COPYING.LGPLv2.1" "$package_root/FFMPEG-LICENSE-LGPL-2.1.txt"
 cp "$repo_root/desktop/macos/Resources/Info.plist" "$contents/Info.plist"
+cp "$repo_root/desktop/cinnamon/icons/cast-symbolic.svg" "$contents/Resources/cast-symbolic.svg"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$contents/Info.plist"
 
@@ -67,7 +68,9 @@ icon_work="$work_root/AppIcon.iconset"
 mkdir -p "$icon_work"
 icon_generator="$work_root/generate-icon"
 xcrun swiftc "$repo_root/desktop/macos/Resources/generate-icon.swift" -o "$icon_generator"
-"$icon_generator" "$work_root/AppIcon-1024.png"
+"$icon_generator" \
+  "$repo_root/desktop/cinnamon/icons/cast-symbolic.svg" \
+  "$work_root/AppIcon-1024.png"
 for size in 16 32 128 256 512; do
   double=$((size * 2))
   sips -z "$size" "$size" "$work_root/AppIcon-1024.png" --out "$icon_work/icon_${size}x${size}.png" >/dev/null
@@ -122,6 +125,7 @@ codesign --force --deep --sign - "$app"
 plutil -lint "$contents/Info.plist"
 test "$(plutil -extract CFBundleIdentifier raw "$contents/Info.plist")" = "io.github.michaelishri.cast"
 test "$(plutil -extract LSUIElement raw "$contents/Info.plist")" = "true"
+cmp "$repo_root/desktop/cinnamon/icons/cast-symbolic.svg" "$contents/Resources/cast-symbolic.svg"
 codesign --verify --deep --strict --verbose=2 "$app"
 
 audit_file="$output_dir/$archive_root.otool.txt"

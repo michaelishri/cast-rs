@@ -36,8 +36,7 @@ struct CastDesktopApp: App {
         .environmentObject(model)
         .onAppear { delegate.model = model }
     } label: {
-      Image(systemName: model.hasActiveCast ? "airplayvideo.circle.fill" : "airplayvideo")
-        .accessibilityLabel("Cast")
+      CastMenuBarIcon(isActive: model.hasActiveCast)
     }
     .menuBarExtraStyle(.menu)
 
