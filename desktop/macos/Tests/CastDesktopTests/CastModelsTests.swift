@@ -210,3 +210,22 @@ import Testing
   #expect(
     LoginItemState.map(.notFound) == .unavailable("Cast.app must be installed in Applications"))
 }
+
+@Test func resolutionPresetsMatchConfiguration() {
+  var configuration = CastConfiguration()
+  #expect(CastResolution.presets[1].matches(configuration))
+  #expect(configuration.resolutionLabel == "1280 × 720")
+
+  configuration.width = 1920
+  configuration.height = 1080
+  #expect(CastResolution.presets[2].matches(configuration))
+  #expect(!CastResolution.presets[1].matches(configuration))
+}
+
+@Test func activeCastReportsRestartAndStopStates() {
+  #expect(ActiveCastState.casting.label == nil)
+  #expect(!ActiveCastState.casting.isBusy)
+  #expect(ActiveCastState.restarting.label == "Restarting…")
+  #expect(ActiveCastState.restarting.isBusy)
+  #expect(ActiveCastState.stopping.label == "Stopping…")
+}

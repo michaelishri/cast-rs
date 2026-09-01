@@ -1,62 +1,41 @@
 import AppKit
 import SwiftUI
 
-struct CastPopoverView: View {
+struct CastMenuView: View {
   @EnvironmentObject private var model: CastAppModel
-  @EnvironmentObject private var preferences: CastPreferences
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      HStack {
-        Text("Cast")
-          .font(.headline)
-        Spacer()
-        if model.isDiscovering {
-          ProgressView().controlSize(.small)
-        }
-        Button {
-          model.refreshDisplays()
-          model.refreshDevices()
-        } label: {
-          Image(systemName: "arrow.clockwise")
-        }
-        .buttonStyle(.borderless)
-        .disabled(model.isDiscovering)
-        .help("Refresh devices")
-      }
-
+    Group {
       if let active = model.activeCast {
-        activeCastView(active)
-      } else {
-        receiverList
+        activeCastMenu(active)
+        Divider()
       }
 
-      Toggle("Include system audio", isOn: $preferences.includeAudio)
+      receiverList
 
       if let message = model.errorMessage {
-        Text(message)
-          .font(.caption)
-          .foregroundStyle(.red)
-          .textSelection(.enabled)
+        Divider()
+        Button(message) {}
+          .disabled(true)
       }
 
       Divider()
-      HStack {
-        Button("Settings…") {
-          NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-          NSApp.activate(ignoringOtherApps: true)
-        }
-        .buttonStyle(.borderless)
-        Spacer()
-        Button("Quit Cast") {
-          model.shutdown()
-          NSApp.terminate(nil)
-        }
-        .buttonStyle(.borderless)
+      Button(model.isDiscovering ? "Searching…" : "Refresh Receivers") {
+        refresh()
+      }
+      .disabled(model.isDiscovering)
+
+      Button("Settings…") {
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+      }
+
+      Divider()
+      Button("Quit Cast") {
+        model.shutdown()
+        NSApp.terminate(nil)
       }
     }
-    .padding(14)
-    .frame(width: 360)
     .onAppear {
       model.refreshDisplays()
       if model.devices.isEmpty && !model.isDiscovering {
@@ -68,61 +47,92 @@ struct CastPopoverView: View {
   @ViewBuilder
   private var receiverList: some View {
     if model.isDiscovering && model.devices.isEmpty {
-      Text("Searching for Cast devices…")
-        .foregroundStyle(.secondary)
+      Button("Searching for Cast devices…") {}
+        .disabled(true)
     } else if model.devices.isEmpty {
-      Text("No Cast devices found")
-        .foregroundStyle(.secondary)
+      Button("No Cast devices found") {}
+        .disabled(true)
     } else {
       ForEach(model.devices) { device in
         Menu {
           if device.capability.supportsDesktop {
+            Button("Extended Desktop") {
+              model.startCasting(to: device, mode: .extend)
+            }
+            .disabled(model.hasActiveCast)
+
             if model.displays.isEmpty {
-              Text("No displays available")
+              Button("No displays available") {}
+                .disabled(true)
             } else {
               ForEach(model.displays) { display in
                 Button("Mirror \(display.menuLabel)") {
                   model.startCasting(to: device, mode: .mirror(display))
                 }
+                .disabled(model.hasActiveCast)
               }
-            }
-            Divider()
-            Button("Extended Desktop (Experimental)") {
-              model.startCasting(to: device, mode: .extend)
             }
           } else {
-            Text("Audio-only receiver")
+            Button("Audio-only receiver") {}
+              .disabled(true)
           }
         } label: {
-          HStack {
-            Image(systemName: device.capability.supportsDesktop ? "tv" : "hifispeaker")
-            VStack(alignment: .leading) {
-              Text(device.name)
-              if !device.model.isEmpty {
-                Text(device.model).font(.caption).foregroundStyle(.secondary)
-              }
-            }
-            Spacer()
-          }
+          Label(
+            device.name,
+            systemImage: device.capability.supportsDesktop ? "tv" : "hifispeaker"
+          )
         }
-        .disabled(!device.capability.supportsDesktop || model.hasActiveCast)
       }
     }
   }
 
-  private func activeCastView(_ active: ActiveCast) -> some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Label("Casting to \(active.device.name)", systemImage: "airplayvideo")
-        .font(.headline)
-      Text(active.mode.label)
-        .foregroundStyle(.secondary)
-      Button(active.isStopping ? "Stopping…" : "Stop Casting", role: .destructive) {
+  private func activeCastMenu(_ active: ActiveCast) -> some View {
+    Menu {
+      Button(active.mode.label) {}
+        .disabled(true)
+
+      if let state = active.state.label {
+        Button(state) {}
+          .disabled(true)
+      }
+
+      Divider()
+      Section("Resolution") {
+        ForEach(CastResolution.presets) { resolution in
+          Button {
+            model.setActiveResolution(resolution)
+          } label: {
+            if resolution.matches(active.configuration) {
+              Label(resolution.label, systemImage: "checkmark")
+            } else {
+              Text(resolution.label)
+            }
+          }
+          .disabled(active.state.isBusy || resolution.matches(active.configuration))
+        }
+      }
+
+      Toggle(
+        "Cast Audio",
+        isOn: Binding(
+          get: { active.configuration.includeAudio },
+          set: { model.setActiveAudio($0) }
+        )
+      )
+      .disabled(active.state.isBusy)
+
+      Divider()
+      Button("Stop Casting", role: .destructive) {
         model.stopCasting()
       }
-      .disabled(active.isStopping)
+      .disabled(active.state == .stopping)
+    } label: {
+      Label("Casting to \(active.device.name)", systemImage: "airplayvideo.circle.fill")
     }
-    .padding(10)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func refresh() {
+    model.refreshDisplays()
+    model.refreshDevices()
   }
 }

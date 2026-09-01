@@ -72,6 +72,28 @@ struct CastConfiguration: Equatable, Sendable {
   var bitrate = 6_000_000
   var targetDelayMilliseconds = 200
   var discoveryTimeoutSeconds = 3
+
+  var resolutionLabel: String { "\(width) × \(height)" }
+}
+
+struct CastResolution: Identifiable, Equatable, Sendable {
+  static let presets = [
+    CastResolution(width: 854, height: 480),
+    CastResolution(width: 1280, height: 720),
+    CastResolution(width: 1920, height: 1080),
+    CastResolution(width: 2560, height: 1440),
+    CastResolution(width: 3840, height: 2160),
+  ]
+
+  let width: Int
+  let height: Int
+
+  var id: String { "\(width)x\(height)" }
+  var label: String { "\(width) × \(height)" }
+
+  func matches(_ configuration: CastConfiguration) -> Bool {
+    width == configuration.width && height == configuration.height
+  }
 }
 
 enum CastMode: Equatable, Sendable {
@@ -89,5 +111,22 @@ enum CastMode: Equatable, Sendable {
 struct ActiveCast: Equatable, Sendable {
   let device: CastDevice
   let mode: CastMode
-  var isStopping: Bool
+  var configuration: CastConfiguration
+  var state: ActiveCastState
+}
+
+enum ActiveCastState: Equatable, Sendable {
+  case casting
+  case restarting
+  case stopping
+
+  var label: String? {
+    switch self {
+    case .casting: nil
+    case .restarting: "Restarting…"
+    case .stopping: "Stopping…"
+    }
+  }
+
+  var isBusy: Bool { self != .casting }
 }

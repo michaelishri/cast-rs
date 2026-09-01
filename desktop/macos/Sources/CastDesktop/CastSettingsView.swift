@@ -59,11 +59,9 @@ struct CastSettingsView: View {
   private var videoQuality: some View {
     Form {
       Picker("Resolution", selection: resolutionBinding) {
-        Text("854 × 480").tag("854x480")
-        Text("1280 × 720").tag("1280x720")
-        Text("1920 × 1080").tag("1920x1080")
-        Text("2560 × 1440").tag("2560x1440")
-        Text("3840 × 2160").tag("3840x2160")
+        ForEach(CastResolution.presets) { resolution in
+          Text(resolution.label).tag(resolution.id)
+        }
       }
       Stepper(
         "Frame rate: \(preferences.framesPerSecond) fps",

@@ -32,15 +32,14 @@ struct CastDesktopApp: App {
 
   var body: some Scene {
     MenuBarExtra {
-      CastPopoverView()
+      CastMenuView()
         .environmentObject(model)
-        .environmentObject(preferences)
         .onAppear { delegate.model = model }
     } label: {
       Image(systemName: model.hasActiveCast ? "airplayvideo.circle.fill" : "airplayvideo")
         .accessibilityLabel("Cast")
     }
-    .menuBarExtraStyle(.window)
+    .menuBarExtraStyle(.menu)
 
     Settings {
       CastSettingsView()
