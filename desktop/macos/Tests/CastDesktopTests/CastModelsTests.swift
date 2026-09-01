@@ -74,6 +74,102 @@ import Testing
 }
 
 @MainActor
+@Test func discoveryAcceptsAnEmptyReceiverList() throws {
+  let result = CastProcessController.decodeDevices(
+    ProcessOutput(stdout: Data("[]".utf8), stderr: Data(), status: 0))
+  #expect(try result.get().isEmpty)
+}
+
+@MainActor
+@Test func discoveryRejectsMalformedOutput() {
+  let result = CastProcessController.decodeDevices(
+    ProcessOutput(stdout: Data("not json".utf8), stderr: Data(), status: 0))
+  #expect(throws: CastProcessError.self) { try result.get() }
+}
+
+@MainActor
+@Test func discoveryReportsReceiverCommandFailure() {
+  let result = CastProcessController.decodeDevices(
+    ProcessOutput(stdout: Data(), stderr: Data("receiver unavailable".utf8), status: 7))
+  do {
+    _ = try result.get()
+    Issue.record("Expected receiver command failure")
+  } catch let error as CastProcessError {
+    #expect(error.errorDescription == "receiver unavailable")
+  } catch {
+    Issue.record("Unexpected error: \(error)")
+  }
+}
+
+@MainActor
+@Test func sessionProcessTracksNormalTermination() async throws {
+  let controller = CastProcessController()
+  let result: Result<Void, Error> = await withCheckedContinuation { continuation in
+    do {
+      try controller.startSession(executable: URL(fileURLWithPath: "/usr/bin/true"), arguments: [])
+      {
+        continuation.resume(returning: $0)
+      }
+    } catch {
+      continuation.resume(returning: .failure(error))
+    }
+  }
+
+  try result.get()
+  #expect(controller.sessionProcess == nil)
+}
+
+@MainActor
+@Test func sessionProcessInterruptsAndClearsItsState() async throws {
+  let controller = CastProcessController()
+  let result: Result<Void, Error> = await withCheckedContinuation { continuation in
+    do {
+      try controller.startSession(
+        executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"]
+      ) {
+        continuation.resume(returning: $0)
+      }
+      #expect(controller.sessionProcess?.isRunning == true)
+      controller.stopSession()
+    } catch {
+      continuation.resume(returning: .failure(error))
+    }
+  }
+
+  #expect(throws: CastProcessError.self) { try result.get() }
+  #expect(controller.sessionProcess == nil)
+}
+
+@MainActor
+@Test func repeatedDiscoverySupersedesTheEarlierRefresh() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  let executable = directory.appendingPathComponent("fake-cast")
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  try Data("#!/bin/sh\nsleep 0.2\nprintf '[]'\n".utf8).write(to: executable)
+  try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+  let controller = CastProcessController()
+  var supersededCallbackRan = false
+  try controller.discover(executable: executable, timeout: 1) { _ in
+    supersededCallbackRan = true
+  }
+  let result: Result<[CastDevice], Error> = await withCheckedContinuation { continuation in
+    do {
+      try controller.discover(executable: executable, timeout: 1) {
+        continuation.resume(returning: $0)
+      }
+    } catch {
+      continuation.resume(returning: .failure(error))
+    }
+  }
+
+  #expect(try result.get().isEmpty)
+  #expect(!supersededCallbackRan)
+  #expect(controller.discoveryProcess == nil)
+}
+
+@MainActor
 @Test func preferenceDefaultsMatchTheProductDefaults() {
   let suite = "CastDesktopTests.defaults.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suite)!

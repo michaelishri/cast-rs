@@ -146,9 +146,9 @@ patch release; do not move or replace a published tag.
   gh run watch "$RELEASE_RUN" --repo "$UPSTREAM" --exit-status --interval 10
   ```
 
-- [ ] Verify the non-draft, non-prerelease GitHub release has all ten expected assets: macOS
-      `arm64`/`x86_64` and Linux `aarch64`/`x86_64` archives, one checksum per archive, and an
-      `ldd` audit for each Linux archive.
+- [ ] Verify the non-draft, non-prerelease GitHub release has all twelve expected assets: macOS
+      `arm64`/`x86_64` and Linux `aarch64`/`x86_64` archives, one checksum per archive, an `otool`
+      audit for each macOS archive, and an `ldd` audit for each Linux archive.
 
   ```sh
   gh release view "v${VERSION}" --repo "$UPSTREAM" \
@@ -167,6 +167,9 @@ patch release; do not move or replace a published tag.
   ARCH=$(uname -m)
   tar -xzf "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}.tar.gz" -C "$RELEASE_DIR"
   "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}/cast" --version
+  codesign --verify --deep --strict \
+    "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}/Cast.app"
+  plutil -lint "$RELEASE_DIR/cast-${VERSION}-macos-${ARCH}/Cast.app/Contents/Info.plist"
   ```
 
 - [ ] Complete [the Linux release matrix](LINUX_VALIDATION.md) on the tagged archives. The release

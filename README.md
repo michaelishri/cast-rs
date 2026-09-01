@@ -56,6 +56,12 @@ tar -xzf cast-<version>-macos-arm64.tar.gz
 cd cast-<version>-macos-arm64
 ```
 
+Drag `Cast.app` into **Applications**, then open it to add Cast to the menu bar. The app asks for
+Local Network access when it discovers receivers and Screen Recording access when desktop casting
+starts. If Screen Recording is enabled while Cast is open, quit and reopen the app before casting.
+Launch at Login can be enabled from **Cast → Settings → General**; macOS may require approval in
+**System Settings → General → Login Items**.
+
 Verify the download before running it when a `.sha256` file is provided:
 
 ```sh
@@ -63,11 +69,15 @@ shasum -a 256 -c cast-<version>-macos-arm64.tar.gz.sha256
 ./cast --version
 ```
 
-Releases are not yet Developer-ID signed or notarized. After verifying the checksum, remove quarantine if macOS blocks the downloaded app:
+Release archives are ad-hoc signed, but they are not Developer-ID signed or notarized. After
+verifying the checksum, remove quarantine if macOS blocks the downloaded app:
 
 ```sh
 xattr -dr com.apple.quarantine .
 ```
+
+The archive keeps the standalone `cast` CLI and `lib` directory alongside `Cast.app` for scripts
+and backward compatibility.
 
 The examples below assume `cast` is on `PATH`. Use `./cast` when running from an extracted archive.
 

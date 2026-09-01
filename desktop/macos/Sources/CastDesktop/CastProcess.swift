@@ -183,7 +183,7 @@ final class CastProcessController {
     process.interrupt()
   }
 
-  private static func decodeDevices(_ output: ProcessOutput) -> Result<[CastDevice], Error> {
+  static func decodeDevices(_ output: ProcessOutput) -> Result<[CastDevice], Error> {
     guard output.status == 0 else {
       let error = String(decoding: output.stderr, as: UTF8.self).trimmingCharacters(
         in: .whitespacesAndNewlines)
