@@ -23,37 +23,61 @@ final class CastPreferences: ObservableObject {
   }
   @Published var width: Int {
     didSet {
-      width = Self.normalizedEven(width, range: 2...3840)
+      let normalized = Self.normalizedEven(width, range: 2...3840)
+      if width != normalized {
+        width = normalized
+        return
+      }
       defaults.set(width, forKey: Key.width)
     }
   }
   @Published var height: Int {
     didSet {
-      height = Self.normalizedEven(height, range: 2...2160)
+      let normalized = Self.normalizedEven(height, range: 2...2160)
+      if height != normalized {
+        height = normalized
+        return
+      }
       defaults.set(height, forKey: Key.height)
     }
   }
   @Published var framesPerSecond: Int {
     didSet {
-      framesPerSecond = min(max(framesPerSecond, 1), 60)
+      let normalized = min(max(framesPerSecond, 1), 60)
+      if framesPerSecond != normalized {
+        framesPerSecond = normalized
+        return
+      }
       defaults.set(framesPerSecond, forKey: Key.framesPerSecond)
     }
   }
   @Published var bitrate: Int {
     didSet {
-      bitrate = min(max(bitrate, 100_000), 50_000_000)
+      let normalized = min(max(bitrate, 100_000), 50_000_000)
+      if bitrate != normalized {
+        bitrate = normalized
+        return
+      }
       defaults.set(bitrate, forKey: Key.bitrate)
     }
   }
   @Published var targetDelayMilliseconds: Int {
     didSet {
-      targetDelayMilliseconds = min(max(targetDelayMilliseconds, 1), 5_000)
+      let normalized = min(max(targetDelayMilliseconds, 1), 5_000)
+      if targetDelayMilliseconds != normalized {
+        targetDelayMilliseconds = normalized
+        return
+      }
       defaults.set(targetDelayMilliseconds, forKey: Key.targetDelayMilliseconds)
     }
   }
   @Published var discoveryTimeoutSeconds: Int {
     didSet {
-      discoveryTimeoutSeconds = min(max(discoveryTimeoutSeconds, 1), 30)
+      let normalized = min(max(discoveryTimeoutSeconds, 1), 30)
+      if discoveryTimeoutSeconds != normalized {
+        discoveryTimeoutSeconds = normalized
+        return
+      }
       defaults.set(discoveryTimeoutSeconds, forKey: Key.discoveryTimeoutSeconds)
     }
   }

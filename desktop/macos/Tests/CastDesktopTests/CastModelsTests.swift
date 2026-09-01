@@ -203,6 +203,58 @@ import Testing
   #expect(CastPreferences(defaults: defaults).includeAudio)
 }
 
+@MainActor
+@Test func preferencesCanBeChangedAfterInitialization() {
+  let suite = "CastDesktopTests.changed.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let preferences = CastPreferences(defaults: defaults)
+
+  preferences.width = 1920
+  preferences.height = 1080
+  preferences.framesPerSecond = 60
+  preferences.bitrate = 8_000_000
+  preferences.targetDelayMilliseconds = 300
+  preferences.discoveryTimeoutSeconds = 5
+
+  #expect(preferences.width == 1920)
+  #expect(preferences.height == 1080)
+  #expect(preferences.framesPerSecond == 60)
+  #expect(preferences.bitrate == 8_000_000)
+  #expect(preferences.targetDelayMilliseconds == 300)
+  #expect(preferences.discoveryTimeoutSeconds == 5)
+  #expect(defaults.integer(forKey: CastPreferences.Key.width) == 1920)
+  #expect(defaults.integer(forKey: CastPreferences.Key.height) == 1080)
+}
+
+@MainActor
+@Test func changedPreferencesNormalizeAndPersistInvalidValues() {
+  let suite = "CastDesktopTests.changed-normalize.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let preferences = CastPreferences(defaults: defaults)
+
+  preferences.width = 9_999
+  preferences.height = 719
+  preferences.framesPerSecond = 0
+  preferences.bitrate = -1
+  preferences.targetDelayMilliseconds = 8_000
+  preferences.discoveryTimeoutSeconds = 99
+
+  #expect(preferences.width == 3840)
+  #expect(preferences.height == 718)
+  #expect(preferences.framesPerSecond == 1)
+  #expect(preferences.bitrate == 100_000)
+  #expect(preferences.targetDelayMilliseconds == 5_000)
+  #expect(preferences.discoveryTimeoutSeconds == 30)
+  #expect(defaults.integer(forKey: CastPreferences.Key.width) == 3840)
+  #expect(defaults.integer(forKey: CastPreferences.Key.height) == 718)
+  #expect(defaults.integer(forKey: CastPreferences.Key.framesPerSecond) == 1)
+  #expect(defaults.integer(forKey: CastPreferences.Key.bitrate) == 100_000)
+  #expect(defaults.integer(forKey: CastPreferences.Key.targetDelayMilliseconds) == 5_000)
+  #expect(defaults.integer(forKey: CastPreferences.Key.discoveryTimeoutSeconds) == 30)
+}
+
 @Test func mapsEveryLaunchAtLoginStatus() {
   #expect(LoginItemState.map(.enabled) == .enabled)
   #expect(LoginItemState.map(.notRegistered) == .disabled)
