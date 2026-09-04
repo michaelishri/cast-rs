@@ -1,6 +1,8 @@
 # PLAN: `cast receive` — turn the CLI into a Google Cast receiver
 
-Status: draft for review. On approval, these phases become Kaneo tickets.
+Status: approved (2026-09-04). Implementation tracked as Kaneo tickets CAST #82
+(protocol skeleton), #84 (media playback), #85 (hardening/tests/docs), and
+#86 (daemon mode); #84 blocks #85 and #86, #82 blocks #84.
 
 ## Goal
 
