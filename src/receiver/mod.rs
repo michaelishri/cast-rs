@@ -1,14 +1,18 @@
 pub mod advertise;
 pub mod auth;
+pub mod clock;
+pub mod decode;
+pub mod fetch;
 pub mod platform;
 pub mod server;
+pub mod window;
 
 use std::collections::HashSet;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -82,6 +86,16 @@ pub enum ReceiverEvent {
     LoadRejected {
         sender: String,
     },
+    VideoWindow,
+    MediaLoading {
+        title: String,
+    },
+    MediaEnded {
+        title: String,
+    },
+    MediaFailed {
+        detail: String,
+    },
     Shutdown,
 }
 
@@ -126,14 +140,36 @@ pub fn run(options: ReceiveOptions) -> Result<()> {
     })?;
 
     let (events, event_rx) = std::sync::mpsc::channel();
+    let mut event_rx = Some(event_rx);
+    let window_enabled = capability == DeviceCapability::Video && !options.no_window;
+    let video_slot: decode::FrameSlot = Arc::new(Mutex::new(None));
+
+    // The winit event loop must own the main thread. Without a reachable
+    // window system the receiver falls back to audio-only playback.
+    let event_loop = if window_enabled {
+        match winit::event_loop::EventLoop::<window::FrameReady>::with_user_event().build() {
+            Ok(event_loop) => Some(event_loop),
+            Err(error) => {
+                log::info!(
+                    "no window system is reachable ({error}); running without a video window"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let core = Arc::new(ReceiverCore::new(platform::CoreConfig {
         name: friendly_name.clone(),
         model: model.clone(),
         capability,
         events: events.clone(),
+        video: Some(Arc::clone(&video_slot)),
+        window_enabled,
     }));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let interrupt = install_interrupt_handler()?;
+    let interrupt = install_interrupt_handler(Arc::clone(&shutdown))?;
 
     let server = server::Server::start(
         listener,
@@ -155,24 +191,61 @@ pub fn run(options: ReceiveOptions) -> Result<()> {
     let deadline = options
         .seconds
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
-    loop {
-        if shutdown.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
-            break;
+    if let Some(event_loop) = event_loop {
+        let _ = events.send(ReceiverEvent::VideoWindow);
+        *event_rx
+            .as_mut()
+            .expect("events are handed over exactly once") = window::run(
+            window::WindowConfig {
+                title: friendly_name,
+                slot: video_slot,
+                core: Arc::clone(&core),
+                events: event_rx
+                    .take()
+                    .expect("events are handed to the window once"),
+                json: options.json,
+                stop: Arc::clone(&shutdown),
+                deadline,
+            },
+            event_loop,
+        );
+    } else {
+        let event_rx = event_rx
+            .take()
+            .expect("events are handed to the poll loop once");
+        loop {
+            if shutdown.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
+                break;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            drain_events(&event_rx, options.json, false);
+            std::thread::sleep(INTERRUPT_POLL_INTERVAL);
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        drain_events(&event_rx, options.json, false);
-        std::thread::sleep(INTERRUPT_POLL_INTERVAL);
     }
 
     server.stop();
     drop(server);
     advertisement.stop();
-    drain_events(&event_rx, options.json, true);
     let _ = events.send(ReceiverEvent::Shutdown);
-    drain_events(&event_rx, options.json, false);
+    if let Some(event_rx) = event_rx {
+        drain_events(&event_rx, options.json, true);
+    }
     Ok(())
+}
+
+/// Prints one receiver event, either as JSON on stdout or as a log line.
+pub fn emit_event(event: &ReceiverEvent, json: bool) {
+    if json {
+        let mut line = serde_json::to_string(event).expect("events serialize to JSON");
+        line.push('\n');
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(line.as_bytes()).ok();
+        stdout.flush().ok();
+    } else {
+        log::info!("{event:?}");
+    }
 }
 
 fn drain_events(event_rx: &std::sync::mpsc::Receiver<ReceiverEvent>, json: bool, blocking: bool) {
@@ -195,11 +268,17 @@ fn drain_events(event_rx: &std::sync::mpsc::Receiver<ReceiverEvent>, json: bool,
     }
 }
 
-fn install_interrupt_handler() -> Result<Arc<AtomicBool>> {
+fn install_interrupt_handler(shutdown: Arc<AtomicBool>) -> Result<Arc<AtomicBool>> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&interrupted);
-    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
-        .context("could not install Ctrl-C handler")?;
+    let shutdown_signal = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        signal.store(true, Ordering::SeqCst);
+        // The windowed event loop only watches the shutdown flag; both sides
+        // observe a single Ctrl-C.
+        shutdown_signal.store(true, Ordering::SeqCst);
+    })
+    .context("could not install Ctrl-C handler")?;
     Ok(interrupted)
 }
 

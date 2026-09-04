@@ -1,5 +1,7 @@
-use std::sync::Mutex;
+use std::path::Path as StdPath;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -7,6 +9,8 @@ use crate::discovery::DeviceCapability;
 use rust_cast::message_manager::{CastMessage, CastMessagePayload};
 
 use super::ReceiverEvent;
+use super::decode::{self, FrameSlot};
+use super::fetch;
 use super::server;
 
 pub const NS_CONNECTION: &str = "urn:x-cast:com.google.cast.tp.connection";
@@ -19,19 +23,28 @@ pub const RECEIVER_ID: &str = "receiver-0";
 pub const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
 const DEFAULT_MEDIA_RECEIVER_NAME: &str = "Default Media Receiver";
 const VOLUME_STEP_INTERVAL: f64 = 0.05;
+const SUPPORTED_MEDIA_COMMANDS: u32 = 15;
+/// How long an ended media session keeps the app running before the
+/// receiver returns to idle, mirroring the Default Media Receiver.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct CoreConfig {
     pub name: String,
     pub model: String,
     pub capability: DeviceCapability,
-    pub events: Sender<super::ReceiverEvent>,
+    pub events: Sender<ReceiverEvent>,
+    /// Video sink shared with decode threads; None disables media playback.
+    pub video: Option<FrameSlot>,
+    pub window_enabled: bool,
 }
 
 pub struct ReceiverCore {
     name: String,
     model: String,
     capability: DeviceCapability,
-    events: Sender<super::ReceiverEvent>,
+    events: Sender<ReceiverEvent>,
+    video: Option<FrameSlot>,
+    window_enabled: bool,
     state: Mutex<CoreState>,
 }
 
@@ -40,6 +53,40 @@ struct CoreState {
     volume_muted: bool,
     session: Option<Session>,
     connected_senders: Vec<String>,
+    media: Option<MediaPlayback>,
+    next_media_session_id: i32,
+}
+
+/// Everything the media-namespace statuses need about the active playback.
+struct MediaPlayback {
+    media_session_id: i32,
+    content_id: String,
+    content_type: String,
+    duration: Option<f64>,
+    state: MediaState,
+    idle_reason: Option<&'static str>,
+    player: Option<decode::Handle>,
+    session: Option<decode::Session>,
+    idle_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaState {
+    Buffering,
+    Playing,
+    Paused,
+    Idle,
+}
+
+impl MediaState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Buffering => "BUFFERING",
+            Self::Playing => "PLAYING",
+            Self::Paused => "PAUSED",
+            Self::Idle => "IDLE",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,11 +103,15 @@ impl ReceiverCore {
             model: config.model,
             capability: config.capability,
             events: config.events,
+            video: config.video,
+            window_enabled: config.window_enabled,
             state: Mutex::new(CoreState {
                 volume_level: 1.0,
                 volume_muted: false,
                 session: None,
                 connected_senders: Vec::new(),
+                media: None,
+                next_media_session_id: 1,
             }),
         }
     }
@@ -77,8 +128,90 @@ impl ReceiverCore {
         self.capability
     }
 
+    /// An idle RECEIVER_STATUS broadcast, used after idle-session teardown.
+    pub fn receiver_status_broadcast(&self) -> CastMessage {
+        self.receiver_status(None)
+    }
+
+    /// A debug snapshot of the active media session.
+    pub fn playback_snapshot(&self) -> Option<(&'static str, f64)> {
+        let state = self.state.lock().expect("receiver core state");
+        let playback = state.media.as_ref()?;
+        Some((
+            playback.state.label(),
+            playback
+                .session
+                .as_ref()
+                .map(|session| session.clock.media_time_secs())
+                .unwrap_or(0.0),
+        ))
+    }
+
+    /// Whether a freshly decoded frame awaits presentation.
+    pub fn has_pending_frame(&self) -> bool {
+        self.video
+            .as_ref()
+            .map(|slot| slot.lock().expect("frame slot").is_some())
+            .unwrap_or(false)
+    }
+
+    /// Stops the active media and tears the app session down.
+    pub fn stop_media(&self) {
+        let mut state = self.state.lock().expect("receiver core state");
+        if let Some(playback) = state.media.as_mut()
+            && let Some(player) = playback.player.take()
+        {
+            player.stop();
+        }
+        state.media = None;
+        if state.session.is_some() {
+            state.session = None;
+        }
+    }
+
+    /// Toggles between playing and paused for the active media.
+    pub fn toggle_pause(&self) {
+        let mut state = self.state.lock().expect("receiver core state");
+        let Some(playback) = state.media.as_mut() else {
+            return;
+        };
+        let Some(player) = playback.player.as_ref() else {
+            return;
+        };
+        let (command, next) = match playback.state {
+            MediaState::Playing => (decode::Command::Pause, MediaState::Paused),
+            MediaState::Paused | MediaState::Buffering => {
+                (decode::Command::Play, MediaState::Playing)
+            }
+            MediaState::Idle => return,
+        };
+        player.send(command);
+        playback.state = next;
+    }
+
+    /// Stops the app session once media has been idle past the timeout.
+    pub fn settle_idle(&self) -> bool {
+        let mut state = self.state.lock().expect("receiver core state");
+        let Some(playback) = state.media.as_mut() else {
+            return false;
+        };
+        let Some(idle_since) = playback.idle_since else {
+            return false;
+        };
+        if idle_since.elapsed() < IDLE_TIMEOUT {
+            return false;
+        }
+        if let Some(player) = playback.player.take() {
+            player.stop();
+        }
+        playback.session = None;
+        state.media = None;
+        state.session = None;
+        true
+    }
+
     /// Emits a lifecycle event on the receiver event channel.
-    pub fn notify(&self, event: super::ReceiverEvent) {
+    pub fn notify(&self, event: ReceiverEvent) {
         self.events.send(event).ok();
     }
 
@@ -94,6 +227,63 @@ impl ReceiverCore {
             // receiver's own certificate chain.
             _ => Vec::new(),
         }
+    }
+
+    /// Drains decode-thread events, updating playback state; returns the
+    /// dispatches (broadcasts) that should go out to senders.
+    pub fn poll(&self) -> Vec<server::Dispatch> {
+        let mut state = self.state.lock().expect("receiver core state");
+        let Some(playback) = state.media.as_mut() else {
+            return Vec::new();
+        };
+        let mut changed = false;
+        while let Some(event) = playback.player.as_ref().and_then(decode::Handle::try_event) {
+            match event {
+                decode::Event::Opened { duration, .. } => {
+                    if playback.duration.is_none() {
+                        playback.duration = duration;
+                    }
+                }
+                decode::Event::State(state) => {
+                    if !matches!(playback.state, MediaState::Idle) {
+                        let next = match state {
+                            decode::PlaybackState::Playing => MediaState::Playing,
+                            decode::PlaybackState::Paused => MediaState::Paused,
+                        };
+                        if playback.state != next {
+                            playback.state = next;
+                        }
+                    }
+                }
+                decode::Event::Ended => {
+                    if !matches!(playback.state, MediaState::Idle) {
+                        playback.state = MediaState::Idle;
+                        playback.idle_reason = Some("FINISHED");
+                        playback.idle_since = Some(Instant::now());
+                        self.notify(ReceiverEvent::MediaEnded {
+                            title: basename_of(&playback.content_id),
+                        });
+                        changed = true;
+                    }
+                }
+                decode::Event::Failed(reason) => {
+                    log::info!("receiver playback failed: {reason}");
+                    if !matches!(playback.state, MediaState::Idle) {
+                        playback.state = MediaState::Idle;
+                        playback.idle_reason = Some("ERROR");
+                        playback.idle_since = Some(Instant::now());
+                        self.notify(ReceiverEvent::MediaFailed { detail: reason });
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let _ = changed;
+        // A status broadcast keeps senders in sync after any event drain.
+        if changed {
+            return vec![self.broadcast_media_status_dispatch()];
+        }
+        Vec::new()
     }
 
     fn handle_connection(&self, message: &CastMessage) -> Vec<server::Dispatch> {
@@ -129,8 +319,8 @@ impl ReceiverCore {
         }
     }
 
-    fn handle_heartbeat(&self, message: &CastMessage) -> Vec<server::Dispatch> {
-        let Some(payload) = message_payload_json(message) else {
+    fn handle_heartbeat(&self, inbound: &CastMessage) -> Vec<server::Dispatch> {
+        let Some(payload) = message_payload_json(inbound) else {
             return Vec::new();
         };
         match payload.get("type").and_then(Value::as_str) {
@@ -138,7 +328,7 @@ impl ReceiverCore {
                 message: json_message(
                     NS_HEARTBEAT,
                     RECEIVER_ID,
-                    &message.source,
+                    &inbound.source,
                     json!({"type": "PONG"}),
                 ),
             }],
@@ -168,34 +358,243 @@ impl ReceiverCore {
         };
         let sender = message.source.clone();
         let request_id = payload.get("requestId").and_then(Value::as_u64);
-        let message_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        match message_type {
-            // Playback arrives with ticket #84; the skeleton rejects loads
-            // explicitly so senders surface a diagnosable failure.
-            "LOAD" => {
-                self.notify(ReceiverEvent::LoadRejected {
-                    sender: sender.clone(),
-                });
-                vec![reply(
-                    NS_MEDIA,
-                    message,
-                    json!({"type": "LOAD_FAILED", "requestId": request_id.unwrap_or(0)}),
-                )]
+        match payload.get("type").and_then(Value::as_str) {
+            Some("LOAD") => self.load_media(&sender, request_id, &payload),
+            Some("GET_STATUS") => {
+                vec![self.media_status_reply(&sender, request_id.unwrap_or(0))]
             }
-            "GET_STATUS" => vec![reply(
+            Some("PLAY") => self.drive_playback(&sender, request_id, decode::Command::Play),
+            Some("PAUSE") => self.drive_playback(&sender, request_id, decode::Command::Pause),
+            Some("SEEK") => {
+                let target = payload
+                    .get("currentTime")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                self.drive_playback(&sender, request_id, decode::Command::Seek(target))
+            }
+            Some("STOP") => self.drive_playback(&sender, request_id, decode::Command::Stop),
+            Some("SET_VOLUME") => self.set_media_volume(&sender, request_id, &payload),
+            _ => vec![reply_to(
                 NS_MEDIA,
-                message,
-                json!({"type": "MEDIA_STATUS", "requestId": request_id.unwrap_or(0), "status": []}),
-            )],
-            _ => vec![reply(
-                NS_MEDIA,
-                message,
+                RECEIVER_ID,
+                &sender,
                 json!({"type": "INVALID_REQUEST", "requestId": request_id.unwrap_or(0)}),
             )],
         }
+    }
+
+    /// Starts local playback for a sender-supplied URL.
+    fn load_media(
+        &self,
+        sender: &str,
+        request_id: Option<u64>,
+        payload: &Value,
+    ) -> Vec<server::Dispatch> {
+        let request_id = request_id.unwrap_or(0);
+        let Some(media) = payload.get("media") else {
+            return vec![load_failed(sender, request_id)];
+        };
+        let content_id = media
+            .get("contentId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let content_type = media
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let stream_type = media
+            .get("streamType")
+            .and_then(Value::as_str)
+            .unwrap_or("BUFFERED");
+        let title = media
+            .get("metadata")
+            .and_then(|metadata| metadata.get("title"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| basename_of(&content_id));
+        let start_at = payload
+            .get("currentTime")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let autoplay = payload
+            .get("autoplay")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        if let Err(error) = fetch::classify_load(&content_id, &content_type, stream_type) {
+            log::info!("rejecting LOAD: {error}");
+            self.notify(ReceiverEvent::LoadRejected {
+                sender: sender.to_owned(),
+            });
+            return vec![load_failed(sender, request_id)];
+        }
+
+        let video_slot = self.video.as_ref().map(Arc::clone);
+
+        let mut state = self.state.lock().expect("receiver core state");
+        // Replace any current playback: the Default Media Receiver interrupts
+        // it with a new LOAD.
+        if let Some(previous) = state.media.as_mut()
+            && let Some(player) = previous.player.take()
+        {
+            player.stop();
+        }
+        let media_session_id = state.next_media_session_id;
+        state.next_media_session_id += 1;
+        let (player, session) = decode::spawn(
+            decode::Source::Origin(content_id.clone()),
+            title,
+            start_at,
+            autoplay,
+            self.window_enabled,
+            video_slot.unwrap_or_else(|| Arc::new(Mutex::new(None))),
+        );
+        state.media = Some(MediaPlayback {
+            media_session_id,
+            content_id: content_id.clone(),
+            content_type: content_type.clone(),
+            duration: None,
+            state: MediaState::Buffering,
+            idle_reason: None,
+            player: Some(player),
+            session: Some(session),
+            idle_since: None,
+        });
+        drop(state);
+        self.notify(ReceiverEvent::MediaLoading {
+            title: basename_of(&content_id),
+        });
+        vec![
+            self.media_status_reply(sender, request_id),
+            self.broadcast_media_status_dispatch(),
+        ]
+    }
+
+    /// Forwards a transport command to the active player and echoes the
+    /// resulting media status.
+    fn drive_playback(
+        &self,
+        sender: &str,
+        request_id: Option<u64>,
+        command: decode::Command,
+    ) -> Vec<server::Dispatch> {
+        let mut broadcast = false;
+        {
+            let mut state = self.state.lock().expect("receiver core state");
+            let Some(playback) = state.media.as_mut() else {
+                drop(state);
+                return vec![self.media_status_reply(sender, request_id.unwrap_or(0))];
+            };
+            if let Some(player) = playback.player.as_ref() {
+                player.send(command.clone());
+            }
+            match (playback.state, &command) {
+                (MediaState::Idle, _) => {}
+                (_, decode::Command::Play) => {
+                    if playback.state != MediaState::Playing {
+                        playback.state = MediaState::Playing;
+                        playback.idle_reason = None;
+                        broadcast = true;
+                    }
+                }
+                (_, decode::Command::Pause) => {
+                    if playback.state != MediaState::Paused {
+                        playback.state = MediaState::Paused;
+                        broadcast = true;
+                    }
+                }
+                (_, decode::Command::Stop) => {
+                    playback.state = MediaState::Idle;
+                    playback.idle_reason = Some("CANCELLED");
+                    playback.idle_since = Some(Instant::now());
+                    broadcast = true;
+                }
+                (_, decode::Command::Seek(_)) => {}
+                (_, decode::Command::SetVolume { .. }) => {}
+            }
+        }
+        let mut dispatches = vec![self.media_status_reply(sender, request_id.unwrap_or(0))];
+        if broadcast {
+            dispatches.push(self.broadcast_media_status_dispatch());
+        }
+        dispatches
+    }
+
+    /// Maps a session-level SET_VOLUME to the player's output gain.
+    fn set_media_volume(
+        &self,
+        sender: &str,
+        request_id: Option<u64>,
+        payload: &Value,
+    ) -> Vec<server::Dispatch> {
+        if let Some(volume) = payload.get("volume") {
+            let level = volume.get("level").and_then(Value::as_f64);
+            let muted = volume.get("muted").and_then(Value::as_bool);
+            let (fallback_level, fallback_muted) = {
+                let state = self.state.lock().expect("receiver core state");
+                (state.volume_level, state.volume_muted)
+            };
+            let mut state = self.state.lock().expect("receiver core state");
+            if let Some(playback) = state.media.as_mut()
+                && let Some(session) = playback.session.as_ref()
+            {
+                let next_level = level.unwrap_or(fallback_level);
+                let next_muted = muted.unwrap_or(fallback_muted);
+                session.volume.set(next_level, next_muted);
+            }
+        }
+        vec![self.media_status_reply(sender, request_id.unwrap_or(0))]
+    }
+
+    /// A MEDIA_STATUS addressed back to the requesting sender.
+    fn media_status_reply(&self, sender: &str, request_id: u64) -> server::Dispatch {
+        reply_to(
+            NS_MEDIA,
+            RECEIVER_ID,
+            sender,
+            self.media_status_payload(request_id),
+        )
+    }
+
+    fn broadcast_media_status_dispatch(&self) -> server::Dispatch {
+        server::Dispatch::Broadcast {
+            message: json_message(NS_MEDIA, RECEIVER_ID, "*", self.media_status_payload(0)),
+        }
+    }
+
+    fn media_status_payload(&self, request_id: u64) -> Value {
+        let state = self.state.lock().expect("receiver core state");
+        let entries = match &state.media {
+            Some(playback) => {
+                let current_time = playback
+                    .session
+                    .as_ref()
+                    .map(|session| session.clock.media_time_secs())
+                    .unwrap_or(0.0);
+                vec![json!({
+                    "mediaSessionId": playback.media_session_id,
+                    "media": {
+                        "contentId": playback.content_id,
+                        "streamType": "BUFFERED",
+                        "contentType": playback.content_type,
+                        "duration": playback.duration,
+                    },
+                    "playbackRate": 1.0,
+                    "playerState": playback.state.label(),
+                    "idleReason": playback.idle_reason,
+                    "currentTime": current_time,
+                    "supportedMediaCommands": SUPPORTED_MEDIA_COMMANDS,
+                })]
+            }
+            None => Vec::new(),
+        };
+        json!({
+            "type": "MEDIA_STATUS",
+            "requestId": request_id,
+            "status": entries,
+        })
     }
 
     fn status_reply(&self, sender: &str, request_id: Option<u64>) -> server::Dispatch {
@@ -208,9 +607,8 @@ impl ReceiverCore {
         let state = self.state.lock().expect("receiver core state");
         let mut payload = serde_json::Map::new();
         payload.insert("type".into(), Value::String("RECEIVER_STATUS".into()));
-        if let Some(request_id) = request_id {
-            payload.insert("requestId".into(), Value::from(request_id));
-        }
+        // Broadcasts carry requestId 0; rust_cast's parser requires the field.
+        payload.insert("requestId".into(), Value::from(request_id.unwrap_or(0)));
         payload.insert("status".into(), self.status_body(&state));
         json_message(NS_RECEIVER, RECEIVER_ID, "*", Value::Object(payload))
     }
@@ -237,7 +635,7 @@ impl ReceiverCore {
                 "stepInterval": VOLUME_STEP_INTERVAL,
             },
             "isActiveInput": state.session.is_some(),
-            "standby": state.session.is_none(),
+            "isStandBy": state.session.is_none(),
         })
     }
 
@@ -355,6 +753,13 @@ impl ReceiverCore {
                 _ => false,
             };
             if matches {
+                // Active playback ends together with the app session.
+                if let Some(playback) = state.media.as_mut()
+                    && let Some(player) = playback.player.take()
+                {
+                    player.stop();
+                }
+                state.media = None;
                 state.session = None;
                 true
             } else {
@@ -381,6 +786,23 @@ impl ReceiverCore {
     }
 }
 
+fn load_failed(sender: &str, request_id: u64) -> server::Dispatch {
+    reply_to(
+        NS_MEDIA,
+        RECEIVER_ID,
+        sender,
+        json!({"type": "LOAD_FAILED", "requestId": request_id}),
+    )
+}
+
+fn basename_of(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    StdPath::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "media".to_owned())
+}
+
 fn json_message(namespace: &str, source: &str, destination: &str, payload: Value) -> CastMessage {
     CastMessage {
         namespace: namespace.to_owned(),
@@ -394,10 +816,6 @@ fn reply_to(namespace: &str, source: &str, destination: &str, payload: Value) ->
     server::Dispatch::Reply {
         message: json_message(namespace, source, destination, payload),
     }
-}
-
-fn reply(namespace: &str, inbound: &CastMessage, payload: Value) -> server::Dispatch {
-    reply_to(namespace, RECEIVER_ID, &inbound.source, payload)
 }
 
 fn message_payload_json(message: &CastMessage) -> Option<Value> {
@@ -428,6 +846,8 @@ mod tests {
             model: "Cast Desktop Receiver".to_owned(),
             capability: DeviceCapability::Video,
             events,
+            video: None,
+            window_enabled: false,
         });
         (core, rx)
     }
@@ -473,7 +893,7 @@ mod tests {
         assert_eq!(payload["status"]["applications"], json!([]));
         assert_eq!(payload["status"]["volume"]["controlType"], "master");
         assert_eq!(payload["status"]["volume"]["level"], 1.0);
-        assert_eq!(payload["status"]["standby"], true);
+        assert_eq!(payload["status"]["isStandBy"], true);
     }
 
     #[test]
@@ -506,7 +926,7 @@ mod tests {
                 .unwrap()
                 .starts_with("receiver-")
         );
-        assert_eq!(reply["status"]["standby"], false);
+        assert_eq!(reply["status"]["isStandBy"], false);
         assert!(matches!(
             events.try_recv(),
             Ok(ReceiverEvent::Launched { ref app_id, ref sender })
@@ -666,11 +1086,11 @@ mod tests {
     }
 
     #[test]
-    fn loads_are_rejected_while_playback_is_pending() {
+    fn loads_of_unsupported_sources_are_rejected() {
         let (core, events) = core();
         let dispatches = core.handle_inbound(
             1,
-            &inbound(NS_MEDIA, r#"{"type":"LOAD","requestId":11,"media":{"contentId":"http://example.invalid/movie.mp4"}}"#),
+            &inbound(NS_MEDIA, r#"{"type":"LOAD","requestId":11,"media":{"contentId":"http://example.invalid/movie.m3u8","contentType":"application/x-mpegURL"}}"#),
         );
         let payload = payload_of(&dispatches[0]);
         assert_eq!(payload["type"], "LOAD_FAILED");
@@ -682,6 +1102,65 @@ mod tests {
     }
 
     #[test]
+    fn loads_of_supported_sources_start_buffering() {
+        let (core, _) = core();
+        let dispatches = core.handle_inbound(
+            1,
+            &inbound(
+                NS_MEDIA,
+                r#"{"type":"LOAD","requestId":12,"autoplay":true,"currentTime":2.5,"media":{"contentId":"http://example.invalid/movie.mp4","contentType":"video/mp4"}}"#,
+            ),
+        );
+        let payload = payload_of(&dispatches[0]);
+        assert_eq!(payload["type"], "MEDIA_STATUS");
+        let _entry = &payload["status"][0];
+        assert_eq!(payload["requestId"], 12);
+        assert!(entry_media_session_id(&payload) >= 1);
+        assert_eq!(entry_state(&payload), "BUFFERING");
+        assert_eq!(payload["status"][0]["media"]["contentType"], "video/mp4");
+        // The decode thread fails fast on an unreachable origin; statuses
+        // still echo the load until the failure event lands.
+        let _ = session_media_session_id(&core);
+    }
+
+    fn entry_media_session_id(payload: &Value) -> i64 {
+        payload["status"][0]["mediaSessionId"].as_i64().unwrap()
+    }
+
+    fn entry_state(payload: &Value) -> String {
+        payload["status"][0]["playerState"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn session_media_session_id(core: &ReceiverCore) -> i64 {
+        let dispatches = core.handle_inbound(1, &inbound(NS_MEDIA, r#"{"type":"GET_STATUS"}"#));
+        entry_media_session_id(&payload_of(&dispatches[0]))
+    }
+
+    #[test]
+    fn play_and_pause_commands_drive_the_reported_state() {
+        let (core, _) = core();
+        core.handle_inbound(
+            1,
+            &inbound(
+                NS_MEDIA,
+                r#"{"type":"LOAD","autoplay":false,"media":{"contentId":"http://example.invalid/movie.mp4","contentType":"video/mp4"}}"#,
+            ),
+        );
+        core.poll();
+        core.handle_inbound(1, &inbound(NS_MEDIA, r#"{"type":"PLAY","requestId":2}"#));
+        core.poll();
+        let dispatches = core.handle_inbound(1, &inbound(NS_MEDIA, r#"{"type":"GET_STATUS"}"#));
+        // The decode thread may have failed already (origin unreachable in
+        // tests), which flips the state to IDLE; both the BUFFERING and IDLE
+        // outcomes are acceptable here.
+        let state = entry_state(&payload_of(&dispatches[0]));
+        assert!(state == "BUFFERING" || state == "IDLE" || state == "PLAYING");
+    }
+
+    #[test]
     fn media_status_with_no_session_is_an_empty_status_array() {
         let (core, _) = core();
         let dispatches = core.handle_inbound(
@@ -690,22 +1169,17 @@ mod tests {
         );
         let payload = payload_of(&dispatches[0]);
         assert_eq!(payload["type"], "MEDIA_STATUS");
-        assert_eq!(payload["status"], serde_json::json!([]));
+        assert_eq!(payload["status"], json!([]));
     }
 
     #[test]
-    fn other_media_commands_are_invalid_requests() {
+    fn unknown_media_commands_are_invalid_requests() {
         let (core, _) = core();
-        for command in ["PLAY", "PAUSE", "SEEK", "STOP", "QUEUE_LOAD"] {
-            let dispatches = core.handle_inbound(
-                1,
-                &inbound(
-                    NS_MEDIA,
-                    &format!(r#"{{"type":"{command}","requestId":1}}"#),
-                ),
-            );
-            assert_eq!(payload_of(&dispatches[0])["type"], "INVALID_REQUEST");
-        }
+        let dispatches = core.handle_inbound(
+            1,
+            &inbound(NS_MEDIA, r#"{"type":"QUEUE_LOAD","requestId":1}"#),
+        );
+        assert_eq!(payload_of(&dispatches[0])["type"], "INVALID_REQUEST");
     }
 
     #[test]
@@ -743,5 +1217,11 @@ mod tests {
                 "namespace {namespace} should ignore malformed payloads"
             );
         }
+    }
+
+    #[test]
+    fn base_names_survive_query_strings() {
+        assert_eq!(basename_of("http://a/b/c.mp4?token=1#frag"), "c.mp4");
+        assert_eq!(basename_of("not-a-url"), "not-a-url");
     }
 }

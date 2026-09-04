@@ -63,6 +63,7 @@ impl Server {
                 .try_clone()
                 .context("could not clone the listener for the accept worker")?;
             let registry = Arc::clone(&registry);
+            let core = Arc::clone(&core);
             let shutdown = Arc::clone(&shutdown);
             workers.push(
                 std::thread::Builder::new()
@@ -83,12 +84,13 @@ impl Server {
         }
         {
             let registry = Arc::clone(&registry);
+            let core = Arc::clone(&core);
             let shutdown = Arc::clone(&shutdown);
             workers.push(
                 std::thread::Builder::new()
                     .name("cast-receiver-janitor".to_owned())
                     .spawn(move || {
-                        janitor_loop(registry, shutdown);
+                        housekeeper_loop(registry, core, shutdown);
                     })
                     .context("could not start the receiver heartbeat janitor")?,
             );
@@ -171,6 +173,14 @@ impl ConnectionRegistry {
         let connections = self.connections.lock().expect("connection registry");
         for entry in connections.values() {
             entry.outbound.send(message.clone()).ok();
+        }
+    }
+
+    fn broadcast_dispatches(&self, dispatches: &[Dispatch]) {
+        for dispatch in dispatches {
+            if let Dispatch::Broadcast { message } = dispatch {
+                self.broadcast(message);
+            }
         }
     }
 
@@ -418,41 +428,62 @@ fn run_connection(
     }
 }
 
-fn janitor_loop(registry: Arc<ConnectionRegistry>, shutdown: Arc<AtomicBool>) {
+/// The housekeeper drives heartbeats, player-event polling, and idle-session
+/// teardown in one background loop.
+fn housekeeper_loop(
+    registry: Arc<ConnectionRegistry>,
+    core: Arc<ReceiverCore>,
+    shutdown: Arc<AtomicBool>,
+) {
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(JANITOR_INTERVAL);
-        let now = Instant::now();
-        let silent: Vec<u64> = {
-            let connections = registry.connections.lock().expect("connection registry");
-            connections
-                .iter()
-                .filter_map(|(conn, entry)| {
-                    let last_seen = *entry.last_seen.lock().expect("last seen");
-                    if now.saturating_duration_since(last_seen) > HEARTBEAT_TIMEOUT {
+        // Apply any playback state changes as status broadcasts.
+        let dispatches = core.poll();
+        if !dispatches.is_empty() {
+            registry.broadcast_dispatches(&dispatches);
+        }
+        if core.settle_idle() {
+            registry.broadcast(&core.receiver_status_broadcast());
+        }
+        if let Some((state, position)) = core.playback_snapshot() {
+            log::trace!("receiver playback: state={state} position={position:.2}s");
+        }
+        janitor_sweep(&registry);
+    }
+}
+
+fn janitor_sweep(registry: &Arc<ConnectionRegistry>) {
+    let now = Instant::now();
+    let silent: Vec<u64> = {
+        let connections = registry.connections.lock().expect("connection registry");
+        connections
+            .iter()
+            .filter_map(|(conn, entry)| {
+                let last_seen = *entry.last_seen.lock().expect("last seen");
+                if now.saturating_duration_since(last_seen) > HEARTBEAT_TIMEOUT {
+                    return Some(*conn);
+                }
+                let mut last_ping = entry.last_ping.lock().expect("last ping");
+                let last_ping_value = *last_ping;
+                if now.saturating_duration_since(last_ping_value) >= HEARTBEAT_INTERVAL {
+                    *last_ping = now;
+                    let ping = CastMessage {
+                        namespace: NS_HEARTBEAT.to_owned(),
+                        source: RECEIVER_ID.to_owned(),
+                        destination: "*".to_owned(),
+                        payload: CastMessagePayload::String(r#"{"type":"PING"}"#.to_owned()),
+                    };
+                    if entry.outbound.send(ping).is_err() {
                         return Some(*conn);
                     }
-                    let mut last_ping = entry.last_ping.lock().expect("last ping");
-                    let last_ping_value = *last_ping;
-                    if now.saturating_duration_since(last_ping_value) >= HEARTBEAT_INTERVAL {
-                        *last_ping = now;
-                        let ping = CastMessage {
-                            namespace: NS_HEARTBEAT.to_owned(),
-                            source: RECEIVER_ID.to_owned(),
-                            destination: "*".to_owned(),
-                            payload: CastMessagePayload::String(r#"{"type":"PING"}"#.to_owned()),
-                        };
-                        if entry.outbound.send(ping).is_err() {
-                            return Some(*conn);
-                        }
-                    }
-                    None
-                })
-                .collect()
-        };
-        for conn in silent {
-            log::debug!("closing silent sender connection {conn}");
-            registry.stop(conn);
-        }
+                }
+                None
+            })
+            .collect()
+    };
+    for conn in silent {
+        log::debug!("closing silent sender connection {conn}");
+        registry.stop(conn);
     }
 }
 
