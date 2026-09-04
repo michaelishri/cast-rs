@@ -30,6 +30,7 @@ mod playback;
 mod player_controls;
 #[cfg(target_os = "linux")]
 mod portal;
+mod receiver;
 #[cfg(target_os = "linux")]
 mod setup;
 #[cfg(target_os = "macos")]
@@ -174,6 +175,36 @@ enum Command {
         /// Deliver transcoded media incrementally or after a complete MP4 is ready.
         #[arg(long, value_enum, default_value_t = TranscodeDeliveryMode::Incremental)]
         transcode_delivery: TranscodeDeliveryMode,
+    },
+    /// Receive casts from senders on the local network.
+    Receive {
+        /// Advertised friendly name; defaults to "<hostname> Cast".
+        #[arg(long)]
+        name: Option<String>,
+        /// Advertised model name.
+        #[arg(long, default_value = "Cast Desktop Receiver")]
+        model: String,
+        /// Cast protocol port.
+        #[arg(long, default_value_t = 8009)]
+        port: u16,
+        /// Advertised capability; auto prefers video with a display attached.
+        #[arg(long, value_enum, default_value_t = ReceiveCapability::Auto)]
+        capabilities: ReceiveCapability,
+        /// Interface to bind; defaults to all interfaces.
+        #[arg(long)]
+        bind: Option<IpAddr>,
+        /// Only accept senders at this address; repeat to allow more.
+        #[arg(long, action = ArgAction::Append)]
+        accept: Vec<IpAddr>,
+        /// Never open a video window when media arrives.
+        #[arg(long)]
+        no_window: bool,
+        /// Emit machine-readable one-line JSON status events.
+        #[arg(long)]
+        json: bool,
+        /// Exit after this many seconds; otherwise run until interrupted.
+        #[arg(long)]
+        seconds: Option<u64>,
     },
     #[cfg(target_os = "macos")]
     /// Capture and hardware-encode a short H.264/AVCC diagnostic sample.
@@ -438,6 +469,23 @@ enum Command {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum ReceiveCapability {
+    Auto,
+    Video,
+    Audio,
+}
+
+impl From<ReceiveCapability> for receiver::CapabilityPreference {
+    fn from(value: ReceiveCapability) -> Self {
+        match value {
+            ReceiveCapability::Auto => Self::Auto,
+            ReceiveCapability::Video => Self::Video,
+            ReceiveCapability::Audio => Self::AudioOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum StreamKind {
     Live,
     Buffered,
@@ -627,6 +675,27 @@ fn main() -> Result<()> {
                     .receiver,
             )?
         }
+        Command::Receive {
+            name,
+            model,
+            port,
+            capabilities,
+            bind,
+            accept,
+            no_window,
+            json,
+            seconds,
+        } => receiver::run(receiver::ReceiveOptions {
+            name,
+            model,
+            port,
+            capabilities: capabilities.into(),
+            bind,
+            accept,
+            no_window,
+            json,
+            seconds,
+        })?,
         #[cfg(target_os = "macos")]
         Command::Capture {
             display,
