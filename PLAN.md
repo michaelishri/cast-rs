@@ -71,7 +71,9 @@ receiver port, host name `<friendly-name>.local.`, with TXT records:
 - `md` — model string, e.g. `Cast Desktop Receiver` (pychromecast maps this
   to a cast type; an unknown model is fine).
 - `ca` — capability bitmask: `5` (video) or `4` (audio-only), matching
-  `discovery.rs` (`1` = video out, `4` = audio out).
+  `discovery.rs` (`1` = video out, `4` = audio out). Resolved per plan review:
+  the default is auto-detected — video when a display is attached, audio-only
+  on headless machines; `--capabilities` overrides the detection.
 - `ve` — `02`; plus harmless plausibility records `st=0`, `rm=`, `bs=` (random
   per session), `cd=` (stable hash of `id`), `ic=` (empty).
 - `--capabilities audio` also omits video rendering UI paths.
@@ -133,7 +135,7 @@ The `contentId` URL usually points at the sender's HTTP server (our own
 `cast video` serves range-capable MP4 this way; CATT/VLC serve HTTP as well).
 
 - **Primary path — local range proxy (VOD).** A localhost-only HTTP server
-  (tiny_http or hand-rolled on top of std) that serves the remote origin:
+  built on `tiny_http` (decided at plan review) that serves the remote origin:
   ffmpeg is opened on `http://127.0.0.1:<ephemeral>/<id>` while the proxy
   satisfies ffmpeg's range requests by fetching upstream ranges with `ureq`.
   This preserves seeking, works for non-faststart MP4, and needs no full-file
@@ -171,10 +173,11 @@ A self-contained local AV player, driven by the media session:
 ```
 cast receive [OPTIONS]
 
-  --name <friendly-name>     advertised name (default: hostname, e.g. "michael-macbook")
+  --name <friendly-name>     advertised name (default: "<hostname> Cast")
   --model <model>            advertised model (default: "Cast Desktop Receiver")
   --port <port>              Cast protocol port (default: 8009)
-  --capabilities <video|audio>  advertised capability (default: video)
+  --capabilities <video|audio|auto>  advertised capability (default: auto:
+                             video with a display attached, audio-only headless)
   --bind <ip>                interface to bind (default: any private address)
   --accept <ip>              optional sender allowlist (repeatable; default: accept LAN)
   --no-window                never open a video window (audio only)
@@ -185,6 +188,12 @@ cast receive [OPTIONS]
 Runs until Ctrl-C: registers mDNS, logs connections/loads, unregisters and
 shuts down cleanly. `--json` mirrors the desktop-integration conventions used
 by `devices --json`.
+
+Per plan review, daemon/background operation is in scope: `cast receive` gains
+a headless daemon path that follows the existing desktop-integration patterns
+(hidden `--controller-pid` supervision and `--json` status events on stdout),
+so the macOS menu bar app and Cinnamon applet can spawn, monitor, and stop a
+receiver without a foreground terminal. Details are ticketed as Phase 4 below.
 
 ## Module layout
 
@@ -236,6 +245,16 @@ dependencies beyond what the platforms ship).
 - Acceptance: quality gate passes (`fmt`, `clippy -D warnings`, `test`,
   release build) on macOS and Ubuntu CI.
 
+### Phase 4 — Daemon/background operation (per plan review decision)
+- Headless `--json` status stream + hidden `--controller-pid` supervision for
+  `cast receive`, matching the `cast desktop` controller pattern.
+- Hook-up so the existing desktop integrations can start/stop a receiver in
+  the background and observe session state (follow-on tickets per desktop
+  integration may be needed there).
+- Acceptance: `cast receive --json --controller-pid <pid>` runs detached,
+  emits valid one-line JSON events, and shuts down cleanly when the
+  controller exits; quality gate still passes.
+
 ## Testing strategy
 
 - **Unit:** frame codec round-trips, namespace state machines as pure logic,
@@ -269,12 +288,10 @@ dependencies beyond what the platforms ship).
 | Chrome tab/screen cast | Yes + WebRTC mirroring | Out of scope (non-goal) |
 | Google Home / Android system sender | Yes | Likely "unverified"; unsupported in v1 |
 
-## Open questions (for plan review)
+## Resolved decisions (plan review)
 
-1. Default friendly name: bare hostname, or `"<hostname> Cast"`?
-2. Should `receive` also offer audio-only profile by default on machines with
-   no display (e.g. `--capabilities audio` auto-detected)?
-3. Is a `cast receive` daemon mode (background via the existing desktop
-   integrations) worth pulling forward, or deferred to a later feature?
-4. For the origin fetch proxy: `tiny_http` vs hand-rolled minimal HTTP/1.1 on
-   std (fewer deps, but more code)?
+1. Default friendly name: `"<hostname> Cast"`.
+2. Audio-only auto-detection on machines with no display: yes —
+   `--capabilities` defaults to `auto`.
+3. Daemon/background mode via the desktop integrations: in scope (Phase 4).
+4. Origin fetch proxy: `tiny_http`.
